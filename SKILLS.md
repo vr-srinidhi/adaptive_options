@@ -252,6 +252,32 @@ This is why IV Rank drives strategy selection — you want to sell premium when 
 
 ---
 
+## Test Coverage Summary
+
+| Layer | Runner | Count | Scope |
+|-------|--------|-------|-------|
+| Backend | pytest | 142 | Simulation engine, regime detection, position sizing, router helpers |
+| Frontend | Vitest + RTL | 30 | Badge components, MetricCard, TopNav, PnlChart, API module, all 3 pages |
+
+Run backend: `cd backend && python -m pytest tests/ -v`
+Run frontend: `cd frontend && npm test`
+
+---
+
+## Deployment
+
+The platform is hosted on **Railway** (free tier):
+
+| Service | Railway type | Key env var |
+|---------|-------------|-------------|
+| Backend (FastAPI) | Docker service | `DATABASE_URL` (auto), `PORT` (auto) |
+| Frontend (nginx+React) | Docker service | `VITE_API_URL` (manual → backend URL), `PORT` (auto) |
+| Database | PostgreSQL plugin | — auto-wired to backend |
+
+CI/CD is handled by GitHub Actions (`.github/workflows/ci.yml`): tests gate every branch; Railway deployment runs on push to `main` only.
+
+---
+
 ## Lot Sizes & Tick Sizes (NSE)
 
 | Index | Lot Size | Tick Size | ATM strike spacing |

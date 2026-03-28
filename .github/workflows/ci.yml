@@ -1,4 +1,4 @@
-name: CI
+name: CI / CD
 
 on:
   push:
@@ -13,6 +13,7 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # ── Backend Tests ──────────────────────────────────────────────────────────
   backend-tests:
     name: Backend Tests
     runs-on: ubuntu-latest
@@ -42,6 +43,7 @@ jobs:
       - name: Run backend tests
         run: pytest tests -q
 
+  # ── Frontend Tests ─────────────────────────────────────────────────────────
   frontend-tests:
     name: Frontend Tests
     runs-on: ubuntu-latest
@@ -66,3 +68,58 @@ jobs:
 
       - name: Run frontend tests
         run: npm test
+
+  # ── Deploy Backend → Railway ───────────────────────────────────────────────
+  # Runs only on push to main after both test jobs pass.
+  # Required secrets / variables (set in GitHub repo settings):
+  #   Secrets : RAILWAY_TOKEN
+  #   Variables: RAILWAY_PROJECT_ID, RAILWAY_BACKEND_SERVICE_ID
+  deploy-backend:
+    name: Deploy Backend → Railway
+    needs: [backend-tests, frontend-tests]
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+
+    defaults:
+      run:
+        working-directory: backend
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Railway CLI
+        run: npm install -g @railway/cli
+
+      - name: Deploy backend service
+        run: railway up --service ${{ vars.RAILWAY_BACKEND_SERVICE_ID }} --detach
+        env:
+          RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
+          RAILWAY_PROJECT_ID: ${{ vars.RAILWAY_PROJECT_ID }}
+
+  # ── Deploy Frontend → Railway ──────────────────────────────────────────────
+  # Runs only after the backend is deployed (sequential so the backend URL
+  # is always live before the frontend rebuild starts).
+  # Required variables: RAILWAY_FRONTEND_SERVICE_ID  (same token + project)
+  deploy-frontend:
+    name: Deploy Frontend → Railway
+    needs: deploy-backend
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+
+    defaults:
+      run:
+        working-directory: frontend
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Railway CLI
+        run: npm install -g @railway/cli
+
+      - name: Deploy frontend service
+        run: railway up --service ${{ vars.RAILWAY_FRONTEND_SERVICE_ID }} --detach
+        env:
+          RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
+          RAILWAY_PROJECT_ID: ${{ vars.RAILWAY_PROJECT_ID }}

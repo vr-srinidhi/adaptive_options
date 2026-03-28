@@ -1,7 +1,9 @@
 import axios from 'axios'
 
+// In Railway the frontend calls the backend's public URL directly (VITE_API_URL).
+// Locally, nginx proxies /api/ to the backend container (no env var needed).
 const api = axios.create({
-  baseURL: '/api',
+  baseURL: import.meta.env.VITE_API_URL || '/api',
   timeout: 120000,
 })
 
