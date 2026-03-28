@@ -19,6 +19,9 @@ A production-quality options strategy backtesting engine for Nifty 50 and Bank N
 - [Strategy Logic](#strategy-logic)
 - [Configuration](#configuration)
 - [Development Setup](#development-setup)
+- [Testing](#testing)
+- [Railway Cloud Deployment](#railway-cloud-deployment)
+- [CI/CD Pipeline](#cicd-pipeline)
 
 ---
 
@@ -585,6 +588,153 @@ npm run dev          # Vite dev server on :5173, proxies /api → localhost:8000
 FastAPI auto-generates interactive docs:
 - Swagger UI: http://localhost:8000/docs
 - ReDoc: http://localhost:8000/redoc
+
+---
+
+## Testing
+
+### Backend (pytest)
+
+```bash
+cd backend
+pip install -r requirements.txt -r requirements-test.txt
+python -m pytest tests/ -v
+```
+
+| File | Tests | Coverage |
+|------|-------|---------|
+| `tests/test_simulator.py` | 56 | `_seed`, `generate_candles`, `compute_ema`, `compute_rsi`, `get_iv_rank`, `price_option`, `_idx_to_time`, `run_day_simulation` |
+| `tests/test_strategy.py` | 40 | `select_strategy` (all PRD §7.3 matrix cells + RSI/EMA boundaries), `build_legs` |
+| `tests/test_position_sizer.py` | 16 | `size_position` (PRD §7.6 worked example, 2% rule, minimum-1-lot floor) |
+| `tests/test_router_helpers.py` | 30 | `_trading_days`, `_to_dict` (full vs summary mode, None-field handling) |
+
+### Frontend (Vitest + React Testing Library)
+
+```bash
+cd frontend
+npm ci
+npm test          # run once
+npm run test:watch  # watch mode
+```
+
+| File | Tests | Coverage |
+|------|-------|---------|
+| `RegimeBadge.test.jsx` | 2 | All 4 badge components, fallback colours |
+| `MetricCard.test.jsx` | 2 | Render, click handler, optional props |
+| `TopNav.test.jsx` | 8 | Brand, nav links, active state, extra-link guard |
+| `PnlChart.test.jsx` | 3 | Empty guard, Y-axis domain, cumulative sort |
+| `api/index.test.js` | 6 | Exports, `VITE_API_URL` fallback, timeout contract |
+| `Backtest.test.jsx` | 2 | Successful run flow, API error state |
+| `Dashboard.test.jsx` | 4 | Data render, navigation, empty state, API error |
+| `TradeBook.test.jsx` | 3 | Full session render, empty legs/min_data, API error |
+
+---
+
+## Railway Cloud Deployment
+
+The app is deployed on [Railway](https://railway.app) as three services: **backend**, **frontend**, and a managed **PostgreSQL** plugin.
+
+### Architecture on Railway
+
+```
+Internet
+   │
+   ├─▶ Frontend service  (nginx, public URL)
+   │     │  VITE_API_URL points to backend public URL
+   │     │  (no nginx proxy needed in cloud)
+   │
+   └─▶ Backend service   (FastAPI, public URL)
+         │  DATABASE_URL  injected by Railway PostgreSQL plugin
+         ▼
+       PostgreSQL plugin  (managed, private)
+```
+
+### One-time Setup
+
+1. **Create a Railway project** at [railway.app](https://railway.app)
+
+2. **Add PostgreSQL plugin** — Railway auto-sets `DATABASE_URL` on the backend service.
+
+3. **Create the Backend service**
+   - Source: this GitHub repo, root directory `backend/`
+   - Railway picks up `backend/railway.toml` automatically
+   - No extra env vars needed (Railway injects `PORT` and `DATABASE_URL`)
+
+4. **Create the Frontend service**
+   - Source: this GitHub repo, root directory `frontend/`
+   - Railway picks up `frontend/railway.toml` automatically
+   - Set one environment variable:
+     ```
+     VITE_API_URL = https://<your-backend-service>.up.railway.app
+     ```
+   - Railway injects `PORT` so nginx listens on the correct port
+
+5. **Test the deployment**
+   ```bash
+   curl https://<backend-service>.up.railway.app/health
+   # → {"status":"ok"}
+   ```
+
+### Environment Variables Reference
+
+| Service | Variable | Where set | Description |
+|---------|----------|-----------|-------------|
+| Backend | `DATABASE_URL` | Auto (Railway plugin) | `postgresql://...` — scheme is normalised to `postgresql+asyncpg://` automatically |
+| Backend | `PORT` | Auto (Railway) | Uvicorn binds to this port |
+| Frontend | `VITE_API_URL` | Manual (Railway dashboard) | Backend public URL, baked into JS bundle at build time |
+| Frontend | `PORT` | Auto (Railway) | nginx listens on this port via `envsubst` |
+
+### Local vs Railway Behaviour
+
+| Aspect | Local Docker Compose | Railway |
+|--------|---------------------|---------|
+| API calls | nginx proxies `/api/` → `backend:8000` | React calls `VITE_API_URL` directly |
+| DB URL scheme | `postgresql+asyncpg://` (explicit) | `postgresql://` (converted automatically) |
+| Port binding | Hardcoded 8000 / 80 | `$PORT` (injected per service) |
+
+---
+
+## CI/CD Pipeline
+
+The GitHub Actions workflow at `.github/workflows/ci.yml` runs on every push and PR.
+
+### Pipeline Stages
+
+```
+push / PR
+    │
+    ├─▶ backend-tests   (pytest, Python 3.11)
+    │
+    └─▶ frontend-tests  (vitest, Node 20)
+            │
+            │  only on push to main ↓
+            ▼
+    deploy-backend  (railway up → backend service)
+            │
+            ▼
+    deploy-frontend (railway up → frontend service)
+```
+
+### Setting Up Secrets and Variables
+
+In your GitHub repository → **Settings → Secrets and variables → Actions**:
+
+| Type | Name | Value |
+|------|------|-------|
+| Secret | `RAILWAY_TOKEN` | Railway personal token (Account → API Tokens) |
+| Variable | `RAILWAY_PROJECT_ID` | Found in Railway project settings |
+| Variable | `RAILWAY_BACKEND_SERVICE_ID` | Railway backend service ID |
+| Variable | `RAILWAY_FRONTEND_SERVICE_ID` | Railway frontend service ID |
+
+### What Triggers What
+
+| Event | Backend Tests | Frontend Tests | Deploy |
+|-------|--------------|----------------|--------|
+| Push to any branch | ✅ | ✅ | ❌ |
+| PR to any branch | ✅ | ✅ | ❌ |
+| Push to `main` | ✅ | ✅ | ✅ |
+
+Deploy jobs are sequential (backend first, then frontend) so the backend URL is always live before the frontend is rebuilt.
 
 ---
 

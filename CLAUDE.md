@@ -14,6 +14,8 @@ Scope: **backtest only** — no live broker, no real order placement.
 
 ## Running the App
 
+### Local (Docker Compose)
+
 ```bash
 cd Adaptive_options/
 docker compose up -d          # start all 3 containers
@@ -29,6 +31,39 @@ docker compose down -v        # stop + wipe DB
 | Database (PostgreSQL 15) | 5432 | adaptive_options_db |
 
 Health check: `curl http://localhost:8000/health`
+
+### Cloud (Railway)
+
+The app runs on Railway with 3 services: **backend**, **frontend**, and a **PostgreSQL plugin**.
+
+Key env vars:
+- Backend: `DATABASE_URL` (auto-injected by Railway plugin, scheme is normalised), `PORT` (auto by Railway)
+- Frontend: `VITE_API_URL` = backend public URL (set manually once); `PORT` (auto by Railway)
+
+See README § Railway Cloud Deployment for full setup steps.
+
+---
+
+## CI/CD
+
+GitHub Actions workflow: `.github/workflows/ci.yml`
+
+- **Every push/PR**: runs backend tests (pytest) + frontend tests (vitest)
+- **Push to `main` only**: deploys backend → then frontend to Railway
+
+Required GitHub secrets/variables: `RAILWAY_TOKEN` (secret), `RAILWAY_PROJECT_ID`, `RAILWAY_BACKEND_SERVICE_ID`, `RAILWAY_FRONTEND_SERVICE_ID` (variables).
+
+## Unit Tests
+
+### Backend
+```bash
+cd backend && python -m pytest tests/ -v   # 142 tests
+```
+
+### Frontend
+```bash
+cd frontend && npm test                    # 30 tests
+```
 
 ---
 
