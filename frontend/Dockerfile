@@ -14,12 +14,6 @@ RUN npm run build
 
 FROM nginx:1.25-alpine
 COPY --from=builder /app/dist /usr/share/nginx/html
-# Treat nginx.conf as a template so $PORT can be injected at container start
-COPY nginx.conf /etc/nginx/conf.d/default.conf.template
+COPY nginx.conf /etc/nginx/conf.d/default.conf
 EXPOSE 80
-# envsubst replaces only $PORT; nginx variables ($uri, $host, etc.) are left intact
-CMD ["/bin/sh", "-c", \
-  "export PORT=${PORT:-80} && \
-   envsubst '$PORT' < /etc/nginx/conf.d/default.conf.template \
-     > /etc/nginx/conf.d/default.conf && \
-   nginx -g 'daemon off;'"]
+CMD ["nginx", "-g", "daemon off;"]
