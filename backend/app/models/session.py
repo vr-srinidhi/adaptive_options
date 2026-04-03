@@ -4,6 +4,7 @@ from sqlalchemy.dialects.postgresql import UUID, JSONB
 from app.database import Base
 
 
+
 class BacktestSession(Base):
     __tablename__ = "backtest_sessions"
 
@@ -30,4 +31,7 @@ class BacktestSession(Base):
     rsi14 = Column(Numeric(6, 2))
     legs = Column(JSONB)
     min_data = Column(JSONB)
+    no_trade_reason = Column(String(30))
+    expiry_date = Column(Date)
+    data_source = Column(String(20))
     created_at = Column(TIMESTAMP(timezone=True), server_default=func.now())
