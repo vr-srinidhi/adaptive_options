@@ -31,3 +31,10 @@ async def init_db():
     from app.models import session as _  # noqa
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+        # Idempotent migrations for new columns added post-initial-deploy
+        for stmt in [
+            "ALTER TABLE backtest_sessions ADD COLUMN IF NOT EXISTS no_trade_reason VARCHAR(30)",
+            "ALTER TABLE backtest_sessions ADD COLUMN IF NOT EXISTS expiry_date DATE",
+            "ALTER TABLE backtest_sessions ADD COLUMN IF NOT EXISTS data_source VARCHAR(20)",
+        ]:
+            await conn.execute(__import__("sqlalchemy").text(stmt))

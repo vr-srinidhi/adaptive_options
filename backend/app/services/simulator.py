@@ -37,6 +37,82 @@ def _seed(trade_date: date, instrument: str) -> int:
     return int(hashlib.md5(key.encode()).hexdigest()[:8], 16)
 
 
+# ── Zerodha real candle fetch ─────────────────────────────────────────────────
+
+def _candles_from_zerodha(trade_date: date, instrument: str) -> Tuple[np.ndarray, float]:
+    """
+    Fetch real underlying 1-min candles from Zerodha for *instrument* on *trade_date*.
+    Returns (candles shape (375,4), daily_vol).
+    Raises DataUnavailableError or RuntimeError if unavailable/unauthenticated.
+    """
+    from app.services import zerodha_client
+    from app.services.option_resolver import UNDERLYING_TOKENS
+    from datetime import time as dtime
+
+    token = UNDERLYING_TOKENS[instrument]
+    records = zerodha_client.fetch_candles(token, trade_date)
+
+    session_start = dtime(9, 15)
+    session_end = dtime(15, 29)
+    filtered = [r for r in records if session_start <= r["date"].time() <= session_end]
+
+    if len(filtered) < int(CANDLES_PER_DAY * 0.8):
+        raise zerodha_client.DataUnavailableError(
+            f"Insufficient candles for {instrument} on {trade_date}: got {len(filtered)}"
+        )
+
+    candles = np.full((CANDLES_PER_DAY, 4), np.nan)
+    for r in filtered:
+        t = r["date"].time()
+        idx = (t.hour - 9) * 60 + t.minute - 15
+        if 0 <= idx < CANDLES_PER_DAY:
+            candles[idx] = [r["open"], r["high"], r["low"], r["close"]]
+
+    # Forward-fill any NaN gaps
+    if not np.isnan(candles[0, 3]):
+        for i in range(1, CANDLES_PER_DAY):
+            if np.isnan(candles[i, 3]):
+                candles[i] = candles[i - 1]
+
+    closes = candles[:, 3]
+    valid = closes[~np.isnan(closes) & (closes > 0)]
+    if len(valid) > 10:
+        log_ret = np.diff(np.log(valid))
+        daily_vol = float(np.clip(np.std(log_ret) * math.sqrt(CANDLES_PER_DAY), 0.007, 0.020))
+    else:
+        daily_vol = 0.013
+
+    return candles, daily_vol
+
+
+def _get_candles_and_source(
+    trade_date: date, instrument: str
+) -> Tuple[np.ndarray, float, str]:
+    """Try Zerodha first; fall back to synthetic. Returns (candles, daily_vol, data_source)."""
+    try:
+        candles, daily_vol = _candles_from_zerodha(trade_date, instrument)
+        return candles, daily_vol, "ZERODHA"
+    except Exception:
+        candles, daily_vol = generate_candles(trade_date, instrument)
+        return candles, daily_vol, "SYNTHETIC"
+
+
+def _iv_rank_from_vol(daily_vol: float) -> int:
+    """Map realized daily vol to IV rank 0–100 using typical NIFTY/BANKNIFTY vol range."""
+    lo, hi = 0.007, 0.020
+    return int(max(0, min(100, round((daily_vol - lo) / (hi - lo) * 100.0))))
+
+
+def _fetch_option_price_map(token: int, trade_date: date) -> Dict[str, float]:
+    """Return {HH:MM → close_price} for the option contract on trade_date."""
+    from app.services import zerodha_client
+    records = zerodha_client.fetch_candles(token, trade_date)
+    return {
+        f"{r['date'].hour:02d}:{r['date'].minute:02d}": float(r["close"])
+        for r in records
+    }
+
+
 # ── Base price (tries yfinance, falls back to synthetic) ─────────────────────
 def _base_price(trade_date: date, instrument: str) -> float:
     try:
@@ -216,13 +292,18 @@ def run_day_simulation(trade_date: date, instrument: str, capital: float) -> Dic
     tick_size = cfg["tick_size"]
     lot_size = cfg["lot_size"]
 
-    candles, daily_vol = generate_candles(trade_date, instrument)
+    candles, daily_vol, data_source = _get_candles_and_source(trade_date, instrument)
     closes = candles[:, 3]
 
     ema5 = compute_ema(closes, 5)
     ema20 = compute_ema(closes, 20)
     rsi = compute_rsi(closes, 14)
-    iv_rank = get_iv_rank(trade_date, instrument)
+
+    iv_rank = (
+        _iv_rank_from_vol(daily_vol)
+        if data_source == "ZERODHA"
+        else get_iv_rank(trade_date, instrument)
+    )
 
     # Regime assessed at candle index 15 (09:30) — PRD §7.2
     e5 = float(ema5[ENTRY_CANDLE_IDX])
@@ -233,11 +314,16 @@ def run_day_simulation(trade_date: date, instrument: str, capital: float) -> Dic
     regime, strategy = select_strategy(e5, e20, rsi_val, iv_rank)
 
     if strategy == "NO_TRADE":
-        return _no_trade_result(trade_date, instrument, capital,
-                                regime, iv_rank, spot_in, e5, e20, rsi_val)
+        return _no_trade_result(
+            trade_date, instrument, capital,
+            regime, iv_rank, spot_in, e5, e20, rsi_val,
+            no_trade_reason="NO_SIGNAL", data_source=data_source,
+        )
 
     remaining_at_entry = CANDLES_PER_DAY - ENTRY_CANDLE_IDX
     legs = build_legs(spot_in, instrument, strategy, daily_vol, remaining_at_entry)
+    # Make legs mutable for possible entry price updates
+    legs = [dict(leg) for leg in legs]
 
     lots, max_profit_per_lot, max_loss_per_lot = size_position(
         capital, legs, lot_size, tick_size
@@ -250,7 +336,33 @@ def run_day_simulation(trade_date: date, instrument: str, capital: float) -> Dic
     profit_target = max_profit * profit_mult
     hard_stop = -max_loss * 0.75
 
-    # Candle-by-candle P&L loop
+    # ── Resolve real option prices if Zerodha is available ────────────────────
+    expiry_date = None
+    option_price_maps: Dict[int, Dict[str, float]] = {}  # leg_idx → {HH:MM: price}
+
+    if data_source == "ZERODHA":
+        try:
+            from app.services import zerodha_client
+            from app.services import option_resolver
+            instruments_master = zerodha_client.get_instruments("NFO")
+            resolved, expiry_date = option_resolver.resolve_all_legs(
+                instrument, trade_date, legs, instruments_master
+            )
+            entry_time_str = _idx_to_time(ENTRY_CANDLE_IDX)
+            for li, (token, _exp) in enumerate(resolved):
+                if token is not None:
+                    try:
+                        pmap = _fetch_option_price_map(token, trade_date)
+                        option_price_maps[li] = pmap
+                        # Update entry price with real market price
+                        if entry_time_str in pmap:
+                            legs[li]["ep"] = pmap[entry_time_str]
+                    except Exception:
+                        pass  # fall back to BS price for this leg
+        except Exception:
+            pass  # fall back entirely to BS pricing
+
+    # ── Candle-by-candle P&L loop ─────────────────────────────────────────────
     min_data: List[Dict] = []
     exit_idx = ENTRY_CANDLE_IDX
     exit_reason = "END_OF_DAY"
@@ -259,20 +371,20 @@ def run_day_simulation(trade_date: date, instrument: str, capital: float) -> Dic
     for i in range(ENTRY_CANDLE_IDX, min(EOD_CANDLE_IDX + 1, CANDLES_PER_DAY)):
         spot = float(closes[i])
         remaining = CANDLES_PER_DAY - i
+        time_str = _idx_to_time(i)
 
         current_pnl = 0.0
-        for leg in legs:
-            px = price_option(spot, leg["strike"], daily_vol, remaining, leg["typ"])
+        for li, leg in enumerate(legs):
+            if li in option_price_maps and time_str in option_price_maps[li]:
+                px = option_price_maps[li][time_str]
+            else:
+                px = price_option(spot, leg["strike"], daily_vol, remaining, leg["typ"])
             if leg["act"] == "SELL":
                 current_pnl += (leg["ep"] - px) * lots * lot_size
             else:
                 current_pnl += (px - leg["ep"]) * lots * lot_size
 
-        min_data.append({
-            "time": _idx_to_time(i),
-            "spot": round(spot, 2),
-            "pnl": round(current_pnl, 2),
-        })
+        min_data.append({"time": time_str, "spot": round(spot, 2), "pnl": round(current_pnl, 2)})
         exit_idx = i
 
         if current_pnl >= profit_target:
@@ -282,21 +394,25 @@ def run_day_simulation(trade_date: date, instrument: str, capital: float) -> Dic
             exit_reason = "HARD_EXIT"
             break
 
-    # Build final leg detail with exit prices
+    # ── Build final leg detail with exit prices ───────────────────────────────
     spot_out = float(closes[exit_idx])
     remaining_at_exit = CANDLES_PER_DAY - exit_idx
+    exit_time_str = _idx_to_time(exit_idx)
 
     final_legs = []
     total_pnl = 0.0
-    for idx, leg in enumerate(legs):
-        exit_px = price_option(spot_out, leg["strike"], daily_vol, remaining_at_exit, leg["typ"])
+    for li, leg in enumerate(legs):
+        if li in option_price_maps and exit_time_str in option_price_maps[li]:
+            exit_px = option_price_maps[li][exit_time_str]
+        else:
+            exit_px = price_option(spot_out, leg["strike"], daily_vol, remaining_at_exit, leg["typ"])
         if leg["act"] == "SELL":
             leg_pnl = (leg["ep"] - exit_px) * lots * lot_size
         else:
             leg_pnl = (exit_px - leg["ep"]) * lots * lot_size
         total_pnl += leg_pnl
         final_legs.append({
-            "id": idx + 1,
+            "id": li + 1,
             "act": leg["act"],
             "typ": leg["typ"],
             "strike": leg["strike"],
@@ -308,13 +424,7 @@ def run_day_simulation(trade_date: date, instrument: str, capital: float) -> Dic
         })
 
     pnl_pct = total_pnl / float(capital) * 100.0
-
-    if total_pnl > 0:
-        wl = "WIN"
-    elif total_pnl < 0:
-        wl = "LOSS"
-    else:
-        wl = "BREAK_EVEN"
+    wl = "WIN" if total_pnl > 0 else ("LOSS" if total_pnl < 0 else "BREAK_EVEN")
 
     return {
         "instrument": instrument,
@@ -339,11 +449,18 @@ def run_day_simulation(trade_date: date, instrument: str, capital: float) -> Dic
         "rsi14": round(rsi_val, 2),
         "legs": final_legs,
         "min_data": min_data,
+        "no_trade_reason": None,
+        "expiry_date": expiry_date,
+        "data_source": data_source,
     }
 
 
-def _no_trade_result(trade_date, instrument, capital,
-                     regime, iv_rank, spot, e5, e20, rsi_val) -> Dict:
+def _no_trade_result(
+    trade_date, instrument, capital,
+    regime, iv_rank, spot, e5, e20, rsi_val,
+    no_trade_reason: str = "NO_SIGNAL",
+    data_source: str = "SYNTHETIC",
+) -> Dict:
     return {
         "instrument": instrument,
         "session_date": trade_date,
@@ -353,18 +470,21 @@ def _no_trade_result(trade_date, instrument, capital,
         "strategy": "NO_TRADE",
         "entry_time": None,
         "exit_time": None,
-        "exit_reason": "NO_SIGNAL",
-        "spot_in": round(spot, 2),
-        "spot_out": round(spot, 2),
+        "exit_reason": no_trade_reason,
+        "spot_in": round(spot, 2) if spot else None,
+        "spot_out": round(spot, 2) if spot else None,
         "lots": 0,
         "max_profit": 0.0,
         "max_loss": 0.0,
         "pnl": 0.0,
         "pnl_pct": 0.0,
         "wl": "NO_TRADE",
-        "ema5": round(e5, 2),
-        "ema20": round(e20, 2),
-        "rsi14": round(rsi_val, 2),
+        "ema5": round(e5, 2) if e5 else None,
+        "ema20": round(e20, 2) if e20 else None,
+        "rsi14": round(rsi_val, 2) if rsi_val else None,
         "legs": [],
         "min_data": [],
+        "no_trade_reason": no_trade_reason,
+        "expiry_date": None,
+        "data_source": data_source,
     }
