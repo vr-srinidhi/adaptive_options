@@ -2,7 +2,7 @@ import { useEffect, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { getResults, getSummary, clearResults } from '../api'
 import MetricCard from '../components/MetricCard'
-import { RegimeBadge, WLBadge } from '../components/RegimeBadge'
+import { RegimeBadge, RegimeDetailBadge, WLBadge, SignalBadge, ScoreBadge } from '../components/RegimeBadge'
 import { CumulativePnlChart } from '../components/PnlChart'
 
 const fmtINR = (v) =>
@@ -147,7 +147,7 @@ export default function Dashboard() {
             <table className="w-full text-xs">
               <thead>
                 <tr style={{ borderBottom: '1px solid var(--border)', background: 'var(--surface-tertiary)' }}>
-                  {['Date', 'Instrument', 'Regime', 'Strategy', 'Lots', 'Spot In', 'Spot Out', 'P&L', 'P&L %', 'Exit Reason', 'Result'].map(h => (
+                  {['Date', 'Instrument', 'Regime', 'Signal', 'Score', 'Strategy', 'Lots', 'Spot In', 'P&L', 'P&L %', 'R-Mult', 'Result'].map(h => (
                     <th key={h} className="text-left px-3 py-2.5 font-medium uppercase tracking-wider"
                       style={{ color: 'var(--text-secondary)' }}>
                       {h}
@@ -173,7 +173,13 @@ export default function Dashboard() {
                         {s.instrument}
                       </td>
                       <td className="px-3 py-2.5">
-                        <RegimeBadge regime={s.regime} />
+                        <RegimeDetailBadge regime={s.regime_detail} />
+                      </td>
+                      <td className="px-3 py-2.5">
+                        <SignalBadge signal={s.signal_type} />
+                      </td>
+                      <td className="px-3 py-2.5">
+                        <ScoreBadge score={isNoTrade ? null : s.signal_score} />
                       </td>
                       <td className="px-3 py-2.5" style={{ color: 'var(--text-primary)' }}>
                         {s.strategy?.replace(/_/g, ' ')}
@@ -184,9 +190,6 @@ export default function Dashboard() {
                       <td className="px-3 py-2.5" style={{ color: 'var(--text-secondary)' }}>
                         {s.spot_in ? s.spot_in.toLocaleString('en-IN') : '—'}
                       </td>
-                      <td className="px-3 py-2.5" style={{ color: 'var(--text-secondary)' }}>
-                        {s.spot_out ? s.spot_out.toLocaleString('en-IN') : '—'}
-                      </td>
                       <td className="px-3 py-2.5 font-medium" style={{ color: pnl >= 0 ? '#22c55e' : '#ef4444' }}>
                         {isNoTrade ? '—' : fmtINR(pnl)}
                       </td>
@@ -194,7 +197,7 @@ export default function Dashboard() {
                         {isNoTrade ? '—' : `${(s.pnl_pct ?? 0).toFixed(2)}%`}
                       </td>
                       <td className="px-3 py-2.5" style={{ color: 'var(--text-secondary)' }}>
-                        {EXIT_LABELS[s.exit_reason] ?? s.exit_reason}
+                        {isNoTrade ? '—' : (s.r_multiple != null ? `${s.r_multiple.toFixed(2)}R` : '—')}
                       </td>
                       <td className="px-3 py-2.5">
                         <WLBadge wl={s.wl} />

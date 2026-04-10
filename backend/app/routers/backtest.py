@@ -15,6 +15,17 @@ from app.models.session import BacktestSession
 from app.services.calendar import HOLIDAY, TRADING_DAY, WEEKEND, get_trading_days
 from app.services.simulator import run_day_simulation
 
+
+def _trading_days(start: date, end: date) -> list:
+    """Compatibility shim: weekday-only days (no holiday check). Used by tests."""
+    from datetime import timedelta
+    days, current = [], start
+    while current <= end:
+        if current.weekday() < 5:
+            days.append(current)
+        current += timedelta(days=1)
+    return days
+
 router = APIRouter()
 
 
@@ -52,6 +63,11 @@ def _to_dict(s: BacktestSession, full: bool = True) -> dict:
         "no_trade_reason": s.no_trade_reason,
         "expiry_date": str(s.expiry_date) if s.expiry_date else None,
         "data_source": s.data_source,
+        "regime_detail": s.regime_detail,
+        "signal_type": s.signal_type,
+        "signal_score": s.signal_score,
+        "atr14": float(s.atr14) if s.atr14 is not None else None,
+        "r_multiple": float(s.r_multiple) if s.r_multiple is not None else None,
         "created_at": str(s.created_at) if s.created_at else None,
     }
     if full:
@@ -187,6 +203,11 @@ async def run_backtest(req: RunBacktestRequest, db: AsyncSession = Depends(get_d
             no_trade_reason=result.get("no_trade_reason"),
             expiry_date=result.get("expiry_date"),
             data_source=result.get("data_source"),
+            regime_detail=result.get("regime_detail"),
+            signal_type=result.get("signal_type"),
+            signal_score=result.get("signal_score"),
+            atr14=result.get("atr14"),
+            r_multiple=result.get("r_multiple"),
         )
         db.add(obj)
         sessions.append(obj)

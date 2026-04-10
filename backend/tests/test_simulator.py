@@ -17,6 +17,7 @@ from app.services.simulator import (
     _idx_to_time,
     _idx_to_time_obj,
     _seed,
+    compute_atr,
     compute_ema,
     compute_rsi,
     generate_candles,
@@ -170,6 +171,33 @@ class TestComputeRsi:
         assert isinstance(compute_rsi(prices), np.ndarray)
 
 
+# ── compute_atr ───────────────────────────────────────────────────────────────
+
+class TestComputeAtr:
+    def test_output_length_matches_input(self):
+        n = 50
+        h = np.random.RandomState(1).uniform(100, 110, n)
+        l = h - np.random.RandomState(2).uniform(1, 3, n)
+        c = (h + l) / 2
+        atr = compute_atr(h, l, c, 14)
+        assert len(atr) == n
+
+    def test_values_positive(self):
+        h = np.full(30, 110.0)
+        l = np.full(30, 100.0)
+        c = np.full(30, 105.0)
+        atr = compute_atr(h, l, c, 14)
+        assert np.all(atr > 0)
+
+    def test_higher_range_gives_higher_atr(self):
+        n = 50
+        h_narrow = np.full(n, 101.0); l_narrow = np.full(n, 100.0); c_narrow = np.full(n, 100.5)
+        h_wide   = np.full(n, 110.0); l_wide   = np.full(n, 100.0); c_wide   = np.full(n, 105.0)
+        atr_n = compute_atr(h_narrow, l_narrow, c_narrow, 14)
+        atr_w = compute_atr(h_wide,   l_wide,   c_wide,   14)
+        assert atr_w[-1] > atr_n[-1]
+
+
 # ── get_iv_rank ───────────────────────────────────────────────────────────────
 
 class TestGetIvRank:
@@ -303,6 +331,8 @@ class TestRunDaySimulation:
             "spot_in", "spot_out", "lots", "max_profit", "max_loss",
             "pnl", "pnl_pct", "wl", "ema5", "ema20", "rsi14",
             "legs", "min_data",
+            # v2 fields
+            "regime_detail", "signal_type", "signal_score", "atr14", "r_multiple",
         }
         assert required.issubset(result.keys())
 
@@ -326,12 +356,15 @@ class TestRunDaySimulation:
 
     def test_exit_reason_is_valid(self):
         result = run_day_simulation(DATE_A, "NIFTY", self.CAPITAL)
-        assert result["exit_reason"] in ("PROFIT_TARGET", "HARD_EXIT", "END_OF_DAY", "NO_SIGNAL")
+        assert result["exit_reason"] in (
+            "PROFIT_TARGET", "HARD_EXIT", "END_OF_DAY", "NO_SIGNAL",
+            "DATA_UNAVAILABLE", "HOLIDAY", "WEEKEND",
+        )
 
     def test_no_trade_has_empty_legs(self, mocker):
         mocker.patch(
-            "app.services.strategy.select_strategy",
-            return_value=("NEUTRAL", "NO_TRADE"),
+            "app.services.strategy.select_strategy_v2",
+            return_value=("NEUTRAL", "NO_TRADE", "NO_SIGNAL", 0),
         )
         result = run_day_simulation(DATE_A, "NIFTY", self.CAPITAL)
         assert result["strategy"] == "NO_TRADE"

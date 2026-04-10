@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react'
 import { useParams, useNavigate } from 'react-router-dom'
 import { getSession } from '../api'
-import { RegimeBadge, WLBadge, ActionBadge, TypeBadge } from '../components/RegimeBadge'
+import { RegimeBadge, RegimeDetailBadge, WLBadge, ActionBadge, TypeBadge, SignalBadge, ScoreBadge } from '../components/RegimeBadge'
 import { PnlProgressionChart } from '../components/PnlChart'
 
 const fmtINR = (v) =>
@@ -80,6 +80,9 @@ export default function TradeBook() {
           </h1>
           <div className="flex items-center gap-2 mt-2">
             <RegimeBadge regime={session.regime} />
+            {session.regime_detail && session.regime_detail !== session.regime && (
+              <RegimeDetailBadge regime={session.regime_detail} />
+            )}
             <span className="text-xs px-2 py-0.5 rounded font-medium"
               style={{ background: 'var(--surface-tertiary)', color: 'var(--text-primary)' }}>
               {session.strategy?.replace(/_/g, ' ')}
@@ -106,9 +109,10 @@ export default function TradeBook() {
           <div className="text-xs uppercase tracking-widest mb-3" style={{ color: 'var(--text-secondary)' }}>
             Market State at Entry
           </div>
-          <KV label="EMA 5" value={fmtNum(session.ema5)} />
-          <KV label="EMA 20" value={fmtNum(session.ema20)} />
+          <KV label="EMA 9" value={fmtNum(session.ema5)} />
+          <KV label="EMA 21" value={fmtNum(session.ema20)} />
           <KV label="RSI (14)" value={fmtNum(session.rsi14)} />
+          <KV label="ATR (14)" value={fmtNum(session.atr14)} />
           <KV label="IV Rank" value={`${session.iv_rank}%`} />
           <KV label="Spot In" value={fmtNum(session.spot_in)} />
           <KV label="Spot Out" value={fmtNum(session.spot_out)} />
@@ -123,10 +127,46 @@ export default function TradeBook() {
           <KV label="Capital" value={fmtINR(session.capital)} />
           <KV label="Max Profit" value={fmtINR(session.max_profit)} valueColor="#22c55e" />
           <KV label="Max Loss" value={fmtINR(session.max_loss)} valueColor="#ef4444" />
+          <KV label="R-Multiple" value={session.r_multiple != null ? `${fmtNum(session.r_multiple)}R` : '—'}
+            valueColor={session.r_multiple >= 1 ? '#22c55e' : session.r_multiple != null ? '#f59e0b' : null} />
           <KV label="Entry" value={session.entry_time ?? '—'} />
           <KV label="Exit" value={session.exit_time ?? '—'} />
         </div>
       </div>
+
+      {/* Signal Analysis */}
+      {session.signal_type && session.signal_type !== 'NO_SIGNAL' && (
+        <div className="rounded-xl p-4 mb-4"
+          style={{ background: 'var(--surface-secondary)', border: '1px solid var(--border)' }}>
+          <div className="text-xs uppercase tracking-widest mb-3" style={{ color: 'var(--text-secondary)' }}>
+            Signal Analysis
+          </div>
+          <div className="flex items-center gap-4 flex-wrap">
+            <div className="flex flex-col gap-1">
+              <span className="text-xs" style={{ color: 'var(--text-secondary)' }}>Regime Detail</span>
+              <RegimeDetailBadge regime={session.regime_detail} />
+            </div>
+            <div className="flex flex-col gap-1">
+              <span className="text-xs" style={{ color: 'var(--text-secondary)' }}>Signal Type</span>
+              <SignalBadge signal={session.signal_type} />
+            </div>
+            <div className="flex flex-col gap-1">
+              <span className="text-xs" style={{ color: 'var(--text-secondary)' }}>Signal Score</span>
+              <div className="flex items-center gap-1">
+                <ScoreBadge score={session.signal_score} />
+                <span className="text-xs" style={{ color: 'var(--text-secondary)' }}>/100</span>
+              </div>
+            </div>
+            <div className="flex flex-col gap-1">
+              <span className="text-xs" style={{ color: 'var(--text-secondary)' }}>Data Source</span>
+              <span className="text-xs font-medium px-2 py-0.5 rounded"
+                style={{ background: 'var(--surface-tertiary)', color: 'var(--text-secondary)' }}>
+                {session.data_source ?? '—'}
+              </span>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* Option legs */}
       {session.legs?.length > 0 && (

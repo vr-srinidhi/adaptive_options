@@ -98,6 +98,15 @@ def _make_session(**overrides):
     s.created_at = None
     s.legs = [{"act": "SELL", "typ": "CE", "strike": 22150}]
     s.min_data = [{"time": "09:30", "spot": 22000.0, "pnl": 0.0}]
+    # v2 fields
+    s.no_trade_reason = None
+    s.expiry_date = None
+    s.data_source = "SYNTHETIC"
+    s.regime_detail = "TRENDING_UP"
+    s.signal_type = "TREND_CONTINUATION_LONG"
+    s.signal_score = 75
+    s.atr14 = 45.5
+    s.r_multiple = 1.2
     for k, v in overrides.items():
         setattr(s, k, v)
     return s

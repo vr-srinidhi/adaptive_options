@@ -8,14 +8,14 @@ const STRATEGY_MATRIX = [
     color: '#22c55e',
     bg: 'rgba(34,197,94,0.08)',
     border: 'rgba(34,197,94,0.3)',
-    rows: ['EMA 5 > EMA 20 (≥0.15%)', 'RSI 40–70 + IV ≥ 30 → Iron Condor', 'RSI 40–70 + IV < 30 → Bull Put Spread'],
+    rows: ['EMA 9 > EMA 21 (≥0.15%)', 'RSI 40–70 + IV ≥ 30 → Iron Condor', 'RSI 40–70 + IV < 30 → Bull Put Spread'],
   },
   {
     regime: 'BEARISH',
     color: '#ef4444',
     bg: 'rgba(239,68,68,0.08)',
     border: 'rgba(239,68,68,0.3)',
-    rows: ['EMA 5 < EMA 20 (≥0.15%)', 'RSI 30–60 + IV ≥ 30 → Iron Condor', 'RSI 30–60 + IV < 30 → Bear Call Spread'],
+    rows: ['EMA 9 < EMA 21 (≥0.15%)', 'RSI 30–60 + IV ≥ 30 → Iron Condor', 'RSI 30–60 + IV < 30 → Bear Call Spread'],
   },
   {
     regime: 'NEUTRAL',
@@ -31,8 +31,7 @@ export default function Backtest() {
   const [form, setForm] = useState({
     instrument: 'NIFTY',
     capital: 500000,
-    startDate: '2025-01-06',
-    endDate: '2025-01-31',
+    date: '2025-01-06',
   })
   const [running, setRunning] = useState(false)
   const [progress, setProgress] = useState(null)
@@ -44,15 +43,15 @@ export default function Backtest() {
   const handleRun = async () => {
     setError(null)
     setRunning(true)
-    setProgress({ current: 0, total: 0, label: 'Starting…' })
+    setProgress({ label: 'Running simulation…' })
     try {
       const res = await runBacktest({
         instrument: form.instrument,
         capital: parseFloat(form.capital),
-        startDate: form.startDate,
-        endDate: form.endDate,
+        startDate: form.date,
+        endDate: form.date,
       })
-      setProgress({ current: res.data.length, total: res.data.length, label: 'Done!' })
+      setProgress({ label: 'Done!' })
       setHasResults(true)
       setTimeout(() => navigate('/dashboard'), 800)
     } catch (err) {
@@ -74,7 +73,7 @@ export default function Backtest() {
       <div className="mb-6">
         <h1 className="text-lg font-bold text-slate-100">Run Backtest</h1>
         <p className="text-xs mt-1" style={{ color: 'var(--text-secondary)' }}>
-          Strategy auto-selected per 1-min regime detection · EMA(5,20) · RSI(14) · IV Rank
+          Strategy auto-selected per 1-min regime detection · EMA(9,21) · RSI(14) · ATR(14) · IV Rank
         </p>
       </div>
 
@@ -82,7 +81,7 @@ export default function Backtest() {
       <div className="rounded-xl p-5 mb-5"
         style={{ background: 'var(--surface-secondary)', border: '1px solid var(--border)' }}>
 
-        <div className="grid grid-cols-2 gap-4 mb-4">
+        <div className="grid grid-cols-3 gap-4 mb-4">
           {/* Instrument */}
           <div>
             <label className={labelCls} style={labelStyle}>Instrument</label>
@@ -117,32 +116,19 @@ export default function Backtest() {
             </div>
           </div>
 
-          {/* Start date */}
+          {/* Date — single day */}
           <div>
-            <label className={labelCls} style={labelStyle}>Start Date</label>
+            <label className={labelCls} style={labelStyle}>Date</label>
             <input
               type="date"
               className={inputCls}
               style={inputStyle}
-              value={form.startDate}
-              onChange={e => set('startDate', e.target.value)}
-              disabled={running}
-            />
-          </div>
-
-          {/* End date */}
-          <div>
-            <label className={labelCls} style={labelStyle}>End Date</label>
-            <input
-              type="date"
-              className={inputCls}
-              style={inputStyle}
-              value={form.endDate}
-              onChange={e => set('endDate', e.target.value)}
+              value={form.date}
+              onChange={e => set('date', e.target.value)}
               disabled={running}
             />
             <div className="text-xs mt-1" style={{ color: 'var(--text-secondary)' }}>
-              Max 60 trading days
+              Weekdays only · synthetic data
             </div>
           </div>
         </div>
@@ -163,7 +149,7 @@ export default function Backtest() {
             </div>
             <div className="h-1.5 rounded-full overflow-hidden" style={{ background: 'var(--surface-tertiary)' }}>
               <div className="h-full rounded-full progress-animate"
-                style={{ background: '#3b82f6', width: progress.total ? `${progress.current / progress.total * 100}%` : '60%' }} />
+                style={{ background: '#3b82f6', width: '60%' }} />
             </div>
           </div>
         )}
@@ -219,8 +205,8 @@ export default function Backtest() {
         </div>
         <div className="mt-3 text-xs" style={{ color: 'var(--text-secondary)' }}>
           RSI &gt; 70 or &lt; 30 (any regime) → <span style={{ color: '#64748b' }}>No Trade</span>
-          &nbsp;·&nbsp; Entry at 09:30 · Exit: Profit target, Hard stop (75%), or End of day (15:15)
-          &nbsp;·&nbsp; Position size: 2% max capital risk
+          &nbsp;·&nbsp; Dynamic entry 09:20–14:45 · Exit: Profit target, Trailing stop, or EOD (15:20)
+          &nbsp;·&nbsp; Position size: 1% capital risk per trade
         </div>
       </div>
     </div>

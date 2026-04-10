@@ -164,6 +164,69 @@ def invalidate_instruments_cache() -> None:
     _instruments_cache = None
 
 
+# ── Token-scoped helpers (for paper trading — bypass singleton) ───────────────
+
+def fetch_candles_with_token(
+    instrument_token: int,
+    trade_date: date,
+    access_token: str,
+    interval: str = "minute",
+) -> List[Dict]:
+    """
+    Fetch candles using a caller-provided access token.
+
+    Used by the paper trading engine so it does not rely on the
+    module-level singleton (which requires a prior POST /auth/zerodha/session).
+    Creates a short-lived KiteConnect instance for this call only.
+    """
+    if not API_KEY:
+        raise RuntimeError("ZERODHA_API_KEY environment variable is not set.")
+    kite = KiteConnect(api_key=API_KEY)
+    kite.set_access_token(access_token)
+
+    from_dt = datetime.combine(trade_date, time(9, 0))
+    to_dt = datetime.combine(trade_date, time(15, 35))
+
+    try:
+        records = kite.historical_data(
+            instrument_token=instrument_token,
+            from_date=from_dt,
+            to_date=to_dt,
+            interval=interval,
+            continuous=False,
+            oi=False,
+        )
+    except Exception as exc:
+        log.warning(
+            "fetch_candles_with_token failed — token=%s date=%s: %s",
+            instrument_token, trade_date, exc,
+        )
+        raise DataUnavailableError(
+            f"Zerodha API error for token {instrument_token} on {trade_date}: {exc}"
+        ) from exc
+
+    if not records:
+        raise DataUnavailableError(
+            f"No candle data returned for token={instrument_token} on {trade_date}."
+        )
+
+    return records
+
+
+def get_instruments_with_token(access_token: str, segment: str = "NFO") -> List[Dict]:
+    """
+    Fetch NFO instrument master using a caller-provided access token.
+    Short-lived KiteConnect instance; does not touch the singleton cache.
+    """
+    if not API_KEY:
+        raise RuntimeError("ZERODHA_API_KEY environment variable is not set.")
+    kite = KiteConnect(api_key=API_KEY)
+    kite.set_access_token(access_token)
+    instruments = kite.instruments(segment)
+    log.info("Loaded %d %s instruments (token-scoped call).", len(instruments), segment)
+    return instruments
+
+
 # ── Custom exceptions ─────────────────────────────────────────────────────────
 
 class DataUnavailableError(Exception):
