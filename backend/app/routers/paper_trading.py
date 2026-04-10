@@ -179,13 +179,25 @@ async def run_session(req: RunSessionRequest, db: AsyncSession = Depends(get_db)
     for d in result["decisions"]:
         db.add(MinuteDecision(**d))
 
-    # Insert trade header and related rows if a trade was opened
     if result["trade_header"]:
-        db.add(PaperTradeHeader(**result["trade_header"]))
+        # Strip the engine-generated id; let the ORM model generate a fresh one.
+        # Flush immediately so SQLAlchemy materialises header.id before we use it
+        # for the FK on legs/marks.
+        header_data = {k: v for k, v in result["trade_header"].items() if k != "id"}
+        header = PaperTradeHeader(**header_data)
+        db.add(header)
+        await db.flush()            # header.id is now populated by the ORM default
+        trade_db_id = header.id     # capture before commit expires the object
+        await db.commit()           # decisions + header committed
+
+        # Legs and marks reference the actual DB id, not the engine's ephemeral id
         for leg in result["trade_legs"]:
-            db.add(PaperTradeLeg(**leg))
+            db.add(PaperTradeLeg(**{**leg, "trade_id": trade_db_id}))
         for mark in result["minute_marks"]:
-            db.add(PaperTradeMinuteMark(**mark))
+            db.add(PaperTradeMinuteMark(**{**mark, "trade_id": trade_db_id}))
+        await db.commit()
+    else:
+        await db.commit()           # decisions only
 
     # Update session to COMPLETED
     ps.status = "COMPLETED"
