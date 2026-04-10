@@ -6,9 +6,12 @@ This file gives Claude Code full context about the project so it can assist effe
 
 ## Project Summary
 
-**Adaptive Options** is a full-stack MVP backtesting platform for NSE index options strategies (Nifty 50, Bank Nifty). It simulates Iron Condor, Bull Put Spread, and Bear Call Spread strategies using deterministic synthetic candle data with auto-regime detection.
+**Adaptive Options** is a full-stack options backtesting + paper-trading platform for NSE index options (Nifty 50, Bank Nifty). It has two distinct modules:
 
-Scope: **backtest only** — no live broker, no real order placement.
+1. **Synthetic Backtest** — simulates Iron Condor, Bull Put Spread, and Bear Call Spread strategies using deterministic synthetic candle data with auto-regime detection (EMA/RSI/IV Rank).
+2. **Paper Trading ORB Replay** — replays a real historical trading day using **live Zerodha market data**. Evaluates the Opening Range Breakout (ORB) strategy through a G1–G7 gate stack, records every minute decision, and produces full audit logs + candle data.
+
+Scope: **backtesting and paper trading only** — no live order placement.
 
 ---
 
@@ -18,6 +21,7 @@ Scope: **backtest only** — no live broker, no real order placement.
 
 ```bash
 cd Adaptive_options/
+cp .env.example .env          # fill in ZERODHA_API_KEY + ZERODHA_API_SECRET
 docker compose up -d          # start all 3 containers
 docker compose logs -f        # tail logs
 docker compose down           # stop
@@ -37,7 +41,7 @@ Health check: `curl http://localhost:8000/health`
 The app runs on Railway with 3 services: **backend**, **frontend**, and a **PostgreSQL plugin**.
 
 Key env vars:
-- Backend: `DATABASE_URL` (auto-injected by Railway plugin, scheme is normalised), `PORT` (auto by Railway)
+- Backend: `DATABASE_URL` (auto-injected by Railway plugin, scheme is normalised), `PORT` (auto by Railway), `ZERODHA_API_KEY`, `ZERODHA_API_SECRET`
 - Frontend: `VITE_API_URL` = backend public URL (set manually once); `PORT` (auto by Railway)
 
 See README § Railway Cloud Deployment for full setup steps.
@@ -57,12 +61,12 @@ Required GitHub secrets/variables: `RAILWAY_TOKEN` (secret), `RAILWAY_PROJECT_ID
 
 ### Backend
 ```bash
-cd backend && python -m pytest tests/ -v   # 142 tests
+cd backend && python -m pytest tests/ -v
 ```
 
 ### Frontend
 ```bash
-cd frontend && npm test                    # 30 tests
+cd frontend && npm test
 ```
 
 ---
@@ -72,18 +76,31 @@ cd frontend && npm test                    # 30 tests
 ```
 Adaptive_options/
 ├── docker-compose.yml
+├── .env.example              ← ZERODHA_API_KEY / ZERODHA_API_SECRET
 ├── backend/
 │   ├── Dockerfile
 │   ├── requirements.txt
 │   └── app/
 │       ├── main.py              ← FastAPI app entry point
 │       ├── database.py          ← async engine, Base, get_db(), init_db()
-│       ├── models/session.py    ← BacktestSession SQLAlchemy model
-│       ├── routers/backtest.py  ← all 5 REST endpoints
+│       ├── models/
+│       │   ├── session.py       ← BacktestSession SQLAlchemy model
+│       │   └── paper_trade.py   ← 6 paper trading ORM models
+│       ├── routers/
+│       │   ├── backtest.py      ← synthetic backtest endpoints
+│       │   ├── paper_trading.py ← paper trading endpoints
+│       │   └── auth.py          ← Zerodha OAuth flow
 │       └── services/
 │           ├── simulator.py     ← candle gen, EMA, RSI, option pricing, day runner
 │           ├── strategy.py      ← regime detection, leg builder
-│           └── position_sizer.py ← 2% capital risk sizing
+│           ├── position_sizer.py ← 2% capital risk sizing
+│           ├── paper_engine.py  ← ORB replay orchestrator
+│           ├── entry_gates.py   ← G1–G7 gate stack
+│           ├── exit_engine.py   ← MTM exit conditions
+│           ├── opening_range.py ← OR computation + candidate spread generators
+│           ├── option_resolver.py ← Zerodha instrument token lookup
+│           ├── zerodha_client.py ← Zerodha API wrappers
+│           └── calendar.py      ← NSE trading calendar helpers
 └── frontend/
     ├── Dockerfile
     ├── nginx.conf               ← SPA fallback + /api proxy
@@ -92,20 +109,23 @@ Adaptive_options/
         ├── api/index.js         ← axios wrappers
         ├── components/          ← TopNav, MetricCard, RegimeBadge, PnlChart
         └── pages/
-            ├── Backtest.jsx     ← Screen 1
-            ├── Dashboard.jsx    ← Screen 2
-            └── TradeBook.jsx    ← Screen 3
+            ├── Backtest.jsx     ← Synthetic backtest form
+            ├── Dashboard.jsx    ← Backtest results dashboard
+            ├── TradeBook.jsx    ← Per-day backtest drill-down
+            ├── PaperTrading.jsx ← Paper trading session launcher
+            ├── SessionMonitor.jsx ← Session list
+            └── PaperTradeBook.jsx ← Session detail: audit log, candle data, CSV/PDF
 ```
 
 ---
 
 ## Critical Business Logic
 
-### Simulation is Deterministic
+### Synthetic Backtest — Deterministic RNG
 
 The RNG seed is derived from `MD5(date_str + instrument)`. Same inputs → same candles every time. Do not change the seed formula without understanding the impact on reproducibility.
 
-### Option Pricing Formula
+### Synthetic Option Pricing Formula
 
 Uses a simplified Black-Scholes approximation (not real market data):
 
@@ -117,13 +137,43 @@ time_value = spot * annual_vol * sqrt(T) * 0.45 * exp(-d / (annual_vol * 0.25))
 price      = max(intrinsic + time_value, 0.50)
 ```
 
-This is intentionally simplified for educational purposes. Do not replace with a full BS implementation without updating the calibration constant (0.45).
+Do not replace with a full BS implementation without updating the calibration constant (0.45).
 
-### Regime Detection
+### ORB Paper Trading — Gate Stack (G1–G7)
+
+Each minute after OR window closes, `entry_gates.py::evaluate_gates()` runs in sequence:
+
+| Gate | Rule |
+|------|------|
+| G1 | Opening range window complete (first 15 candles) |
+| G2 | No active trade already open |
+| G3 | Close > OR high × 1.001 (bullish) or < OR low × 0.999 (bearish) |
+| G4 | Follow-through: **previous** candle also confirmed the same breakout |
+| G5 | Both legs of the spread have valid prices |
+| G6 | Max loss ≤ 2% of capital (approved_lots ≥ 1) |
+| G7 | Max possible gain ≥ session target (0.5% of capital) |
+
+Candidate spreads: 5 strike pairs per direction tried in ATM-first order (offsets 0, ±1, ±2). First pair passing G5–G7 wins.
+
+### ORB Paper Trading — Exit Conditions (exit_engine.py)
+
+| Condition | Trigger |
+|-----------|---------|
+| `EXIT_TARGET` | total MTM ≥ session target (0.5% capital) |
+| `EXIT_STOP` | total MTM ≤ −max_loss (spread fully lost) |
+| `EXIT_TIME` | 15:15 or end of candle data reached |
+
+### ORB Paper Trading — Charges
+
+`realized_net_pnl = realized_gross_pnl − charges`
+
+Charges: 4 × ₹20 brokerage + STT (0.05% sell side) + exchange txn (0.053%) + GST (18% on brokerage + exchange).
+
+### Regime Detection (Synthetic Backtest)
 
 Strictly follows the table in `strategy.py::select_strategy()`. The RSI overbought/oversold check (>70 or <30) is a hard override that results in NO_TRADE regardless of EMA state.
 
-### Position Sizing
+### Position Sizing (Synthetic Backtest)
 
 `lots = max(1, floor(capital × 0.02 / max_loss_per_lot))`
 
@@ -132,7 +182,7 @@ The minimum is always 1 lot. Never remove this floor.
 ### Candle Index to Time
 
 - Index 0 = 09:15
-- Index 15 = 09:30 (entry)
+- Index 15 = 09:30 (OR complete; first entry evaluation minute)
 - Index 360 = 15:15 (EOD trigger)
 - Index 374 = 15:29 (last candle)
 
@@ -142,23 +192,57 @@ The minimum is always 1 lot. Never remove this floor.
 
 All under `/api`:
 
+### Synthetic Backtest
+
 | Method | Path | Purpose |
 |--------|------|---------|
 | POST | `/backtest/run` | Run simulation, persist, return sessions |
-| GET | `/backtest/results` | Paginated session list (no min_data) |
+| GET | `/backtest/results` | Paginated session list |
 | GET | `/backtest/results/:id` | Full session with legs + min_data |
 | GET | `/backtest/summary` | Aggregated stats |
 | DELETE | `/backtest/results` | Clear all sessions |
+
+### Paper Trading (ORB Replay)
+
+| Method | Path | Purpose |
+|--------|------|---------|
+| POST | `/paper/session/run` | Replay one trading day; bulk-insert results |
+| GET | `/paper/sessions` | List all paper sessions |
+| GET | `/paper/session/{id}` | Session detail + action summary stats |
+| GET | `/paper/session/{id}/decisions` | Full minute audit log (paginated) |
+| GET | `/paper/session/{id}/trade` | Trade header + legs |
+| GET | `/paper/session/{id}/trade/marks` | Per-minute MTM array |
+| GET | `/paper/session/{id}/candles` | Raw OHLCV candle series (SPOT + options) |
+
+### Zerodha Auth
+
+| Method | Path | Purpose |
+|--------|------|---------|
+| GET | `/auth/zerodha/login-url` | Returns Zerodha OAuth URL |
+| POST | `/auth/zerodha/session` | Exchanges request_token → access_token |
 
 ---
 
 ## Database
 
-Single table: `backtest_sessions`. Schema is auto-created at startup via `init_db()` (SQLAlchemy `create_all`). No Alembic migrations in MVP.
+Schema is auto-created at startup via `init_db()` (SQLAlchemy `create_all`). No Alembic migrations.
 
-JSONB columns:
-- `legs` — array of option leg objects
-- `min_data` — array of `{time, spot, pnl}` for 1-min chart
+### Synthetic backtest
+
+Single table: `backtest_sessions`.
+
+JSONB columns: `legs` (option leg objects), `min_data` (`{time, spot, pnl}` per minute).
+
+### Paper Trading (6 tables)
+
+| Table | Description |
+|-------|-------------|
+| `paper_sessions` | One row per replay run |
+| `strategy_minute_decisions` | One row per market minute — full G1–G7 audit ledger |
+| `paper_trade_headers` | One row per trade opened (entry/exit prices, P&L, bias) |
+| `paper_trade_legs` | Long + short option legs with entry/exit prices |
+| `paper_trade_minute_marks` | Per-minute MTM while trade is open |
+| `paper_candle_series` | Raw 1-min OHLCV candles: SPOT + weekly/monthly option legs |
 
 ---
 
@@ -166,9 +250,12 @@ JSONB columns:
 
 | Path | Component | Screen |
 |------|-----------|--------|
-| `/backtest` | `Backtest.jsx` | Run backtest form + strategy info |
+| `/backtest` | `Backtest.jsx` | Run synthetic backtest form |
 | `/dashboard` | `Dashboard.jsx` | Metrics + chart + results table |
-| `/tradebook/:id` | `TradeBook.jsx` | Per-day drill-down |
+| `/tradebook/:id` | `TradeBook.jsx` | Per-day backtest drill-down |
+| `/paper` | `PaperTrading.jsx` | Paper trade session launcher |
+| `/paper/sessions` | `SessionMonitor.jsx` | Session list |
+| `/paper/session/:id` | `PaperTradeBook.jsx` | Session detail: audit log, trade, candles, CSV/PDF |
 
 The nginx config proxies `/api/*` to `backend:8000`. The SPA fallback handles all other routes via `try_files`.
 
@@ -181,6 +268,9 @@ The nginx config proxies `/api/*` to `backend:8000`. The SPA fallback handles al
 - `ENTRY_CANDLE_IDX = 15` — entry is always at 09:30
 - `EOD_CANDLE_IDX = 360` — end-of-day is always 15:15
 - The `legs` JSONB schema — frontend `TradeBook.jsx` depends on field names `act`, `typ`, `strike`, `delta`, `ep`, `ep2`, `legPnl`, `lots`
+- `MAX_RISK_PCT = 0.02` and `TARGET_PCT = 0.005` in `entry_gates.py` — these define the core ORB risk/reward parameters
+- `OR_WINDOW_MINUTES = 15` in `opening_range.py` — opening range is always 09:15–09:29
+- `N_CANDIDATE_SPREADS = 5` in `opening_range.py` — number of strike pairs tried per direction
 
 ---
 
@@ -199,18 +289,47 @@ docker compose build frontend && docker compose up -d frontend
 ### Inspect the database
 ```bash
 docker exec -it adaptive_options_db psql -U postgres -d adaptive_options
-\dt                                    # list tables
+\dt                                         # list tables
 SELECT count(*) FROM backtest_sessions;
-SELECT session_date, strategy, pnl FROM backtest_sessions ORDER BY session_date;
+SELECT count(*) FROM paper_sessions;
+SELECT session_date, status, decision_count FROM paper_sessions ORDER BY created_at DESC;
 ```
 
-### Reset all data
+### Reset paper trading data
+```bash
+docker exec -i adaptive_options_db psql -U postgres -d adaptive_options -c "
+TRUNCATE paper_candle_series, paper_trade_minute_marks, paper_trade_legs,
+         paper_trade_headers, strategy_minute_decisions, paper_sessions CASCADE;
+"
+```
+
+### Reset synthetic backtest data
 ```bash
 curl -X DELETE http://localhost:8000/api/backtest/results
-# or from the dashboard UI: "Clear All" button
 ```
 
-### Run a test backtest via API
+### Get Zerodha access token
+```bash
+# 1. Get login URL
+curl http://localhost:8000/api/auth/zerodha/login-url
+# 2. Open the URL in browser, complete login, copy request_token from redirect URL
+# 3. Exchange for access token
+curl -s -X POST http://localhost:8000/api/auth/zerodha/session \
+  -H "Content-Type: application/json" \
+  -d '{"request_token":"<token_from_redirect>"}'
+```
+
+Zerodha access tokens expire at 6 AM IST daily and must be refreshed each day.
+
+### Run a paper trading session via API
+```bash
+curl -s -X POST http://localhost:8000/api/paper/session/run \
+  -H "Content-Type: application/json" \
+  -d '{"instrument":"NIFTY","date":"2026-04-07","capital":2500000,"access_token":"<token>"}' \
+  | python3 -m json.tool
+```
+
+### Run a synthetic backtest via API
 ```bash
 curl -s -X POST http://localhost:8000/api/backtest/run \
   -H "Content-Type: application/json" \
@@ -223,9 +342,7 @@ curl -s -X POST http://localhost:8000/api/backtest/run \
 ## Out of Scope
 
 Do not implement the following in this repo without updating the PRD:
-- Live broker integration
-- Real-time market data (WebSocket)
+- Live broker integration (real order placement)
+- Real-time WebSocket market data
 - Multi-user auth
 - Email/push notifications
-- CSV/PDF export
-- Real NSE options chain pricing
