@@ -521,6 +521,176 @@ class TestSessionStateMachine:
 
 # ── Tests: strategy_config ──────────────────────────────────────────────────────
 
+# ── Tests: TOO_LATE_TO_ENTER ───────────────────────────────────────────────────
+
+class TestTooLateToEnter:
+    def _prices(self):
+        return _make_option_prices(
+            generate_bullish_candidates(OR_HIGH),
+            generate_bearish_candidates(OR_LOW),
+        )
+
+    def test_rejects_entry_when_too_close_to_squareoff(self):
+        """With 5 minutes left and min=20, TOO_LATE_TO_ENTER fires."""
+        from app.services.strategy_config import STRATEGY_CONFIG
+        sq = STRATEGY_CONFIG["square_off_time"]
+        # Build a current_time 10 min before square-off (< min_minutes_left_to_enter=20)
+        import datetime
+        sq_dt = datetime.datetime.combine(datetime.date.today(), sq)
+        close_time = (sq_dt - datetime.timedelta(minutes=10)).time()
+        result = evaluate_gates(
+            candle=_make_candle(BULLISH_CLOSE, idx=15),
+            or_high=OR_HIGH,
+            or_low=OR_LOW,
+            or_ready=True,
+            has_open_trade=False,
+            option_prices=self._prices(),
+            instrument="NIFTY",
+            capital=2_500_000.0,
+            expiry=date(2026, 4, 10),
+            prev_candle_close=BULLISH_CLOSE,  # prev also breakout so G4 passes
+            lot_size=75,
+            current_time=close_time,
+        )
+        assert result.action == "NO_TRADE"
+        assert result.reason_code == "TOO_LATE_TO_ENTER"
+
+    def test_allows_entry_with_enough_time_remaining(self):
+        """With 30 minutes left and min=20, entry proceeds normally."""
+        from app.services.strategy_config import STRATEGY_CONFIG
+        import datetime
+        sq = STRATEGY_CONFIG["square_off_time"]
+        sq_dt = datetime.datetime.combine(datetime.date.today(), sq)
+        close_time = (sq_dt - datetime.timedelta(minutes=30)).time()
+        result = evaluate_gates(
+            candle=_make_candle(BULLISH_CLOSE, idx=15),
+            or_high=OR_HIGH,
+            or_low=OR_LOW,
+            or_ready=True,
+            has_open_trade=False,
+            option_prices=self._prices(),
+            instrument="NIFTY",
+            capital=2_500_000.0,
+            expiry=date(2026, 4, 10),
+            prev_candle_close=BULLISH_CLOSE,
+            lot_size=75,
+            current_time=close_time,
+        )
+        assert result.action == "ENTER"
+
+    def test_no_current_time_skips_check(self):
+        """current_time=None skips the TOO_LATE_TO_ENTER check entirely."""
+        result = evaluate_gates(
+            candle=_make_candle(BULLISH_CLOSE, idx=15),
+            or_high=OR_HIGH,
+            or_low=OR_LOW,
+            or_ready=True,
+            has_open_trade=False,
+            option_prices=self._prices(),
+            instrument="NIFTY",
+            capital=2_500_000.0,
+            expiry=date(2026, 4, 10),
+            prev_candle_close=BULLISH_CLOSE,
+            lot_size=75,
+            current_time=None,  # no check
+        )
+        # Should reach ENTER (not blocked by time)
+        assert result.action == "ENTER"
+
+
+# ── Tests: config centralization ───────────────────────────────────────────────
+
+class TestConfigCentralization:
+    def test_opening_range_uses_config_values(self):
+        from app.services.opening_range import (
+            OR_WINDOW_MINUTES, FOLLOW_THROUGH_PCT, STRIKE_STEP, N_CANDIDATE_SPREADS
+        )
+        from app.services.strategy_config import STRATEGY_CONFIG
+        assert OR_WINDOW_MINUTES   == STRATEGY_CONFIG["or_window_minutes"]
+        assert FOLLOW_THROUGH_PCT  == STRATEGY_CONFIG["breakout_buffer_pct"]
+        assert STRIKE_STEP         == STRATEGY_CONFIG["strike_step"]
+        assert N_CANDIDATE_SPREADS == STRATEGY_CONFIG["n_candidate_spreads"]
+
+    def test_exit_engine_uses_config_squareoff(self):
+        from app.services.exit_engine import SQUARE_OFF_TIME
+        from app.services.strategy_config import STRATEGY_CONFIG
+        assert SQUARE_OFF_TIME == STRATEGY_CONFIG["square_off_time"]
+
+    def test_entry_gates_uses_config_squareoff(self):
+        from app.services.entry_gates import _SQUARE_OFF_TIME, _MIN_MINUTES_LEFT_TO_ENTER
+        from app.services.strategy_config import STRATEGY_CONFIG
+        assert _SQUARE_OFF_TIME           == STRATEGY_CONFIG["square_off_time"]
+        assert _MIN_MINUTES_LEFT_TO_ENTER == STRATEGY_CONFIG["min_minutes_left_to_enter"]
+
+
+# ── Tests: candidate rank + charges breakdown ──────────────────────────────────
+
+class TestCandidateAudit:
+    def test_enter_candidate_structure_has_rank_and_spread_width(self):
+        prices = _make_option_prices(
+            generate_bullish_candidates(OR_HIGH),
+            generate_bearish_candidates(OR_LOW),
+        )
+        result = evaluate_gates(
+            candle=_make_candle(BULLISH_CLOSE, idx=15),
+            or_high=OR_HIGH,
+            or_low=OR_LOW,
+            or_ready=True,
+            has_open_trade=False,
+            option_prices=prices,
+            instrument="NIFTY",
+            capital=2_500_000.0,
+            expiry=date(2026, 4, 10),
+            prev_candle_close=BULLISH_CLOSE,
+            lot_size=75,
+        )
+        assert result.action == "ENTER"
+        cs = result.candidate_structure
+        assert "candidate_rank" in cs
+        assert cs["candidate_rank"] >= 1
+        assert "spread_width" in cs
+        assert cs["spread_width"] > 0
+
+
+class TestChargesBreakdown:
+    def test_compute_charges_breakdown_has_all_components(self):
+        from app.services.paper_engine import _compute_charges_breakdown
+        bd = _compute_charges_breakdown(
+            entry_long_price=50.0,
+            entry_short_price=30.0,
+            exit_long_price=80.0,
+            exit_short_price=15.0,
+            lot_size=75,
+            approved_lots=2,
+        )
+        for key in ("brokerage", "stt", "exchange_charges", "gst", "total"):
+            assert key in bd, f"Missing key: {key}"
+            assert bd[key] >= 0
+
+    def test_total_equals_sum_of_components(self):
+        from app.services.paper_engine import _compute_charges_breakdown
+        bd = _compute_charges_breakdown(
+            entry_long_price=50.0,
+            entry_short_price=30.0,
+            exit_long_price=80.0,
+            exit_short_price=15.0,
+            lot_size=75,
+            approved_lots=2,
+        )
+        # total is rounded from raw floats; allow 1-cent tolerance from
+        # intermediate rounding of individual components
+        component_sum = bd["brokerage"] + bd["stt"] + bd["exchange_charges"] + bd["gst"]
+        assert abs(bd["total"] - component_sum) <= 0.02
+
+    def test_compute_charges_wrapper_returns_total(self):
+        from app.services.paper_engine import _compute_charges, _compute_charges_breakdown
+        total = _compute_charges(50.0, 30.0, 80.0, 15.0, 75, 2)
+        bd = _compute_charges_breakdown(50.0, 30.0, 80.0, 15.0, 75, 2)
+        assert total == bd["total"]
+
+
+# ── Tests: strategy_config ──────────────────────────────────────────────────────
+
 class TestStrategyConfig:
     def test_all_required_keys_present(self):
         from app.services.strategy_config import STRATEGY_CONFIG

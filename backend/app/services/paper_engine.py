@@ -54,6 +54,7 @@ _MAX_PRICE_STALENESS = _CFG["max_price_staleness_min"]
 _REASON_TO_GATE: Dict[str, str] = {
     "OPENING_RANGE_NOT_READY":            "G1",
     "ACTIVE_TRADE_EXISTS":                "G2",
+    "TOO_LATE_TO_ENTER":                  "G2b",
     "NO_BREAKOUT_CONFIRMATION":           "G3",
     "FAILED_BREAKOUT_OR_NO_FOLLOWTHROUGH": "G4",
     "NO_HEDGE_AVAILABLE":                 "G5",
@@ -151,16 +152,17 @@ def _get_price_at(
     return None, 0
 
 
-def _compute_charges(
+def _compute_charges_breakdown(
     entry_long_price: float,
     entry_short_price: float,
     exit_long_price: float,
     exit_short_price: float,
     lot_size: int,
     approved_lots: int,
-) -> float:
+) -> Dict[str, float]:
     """
     Approximate round-trip charges for a Bull Call / Bear Put Spread.
+    Returns a breakdown dict with brokerage, stt, exchange_charges, gst, total.
 
     Orders:
       Entry : buy long leg  (long buy)  + sell short leg (short sell)
@@ -184,7 +186,30 @@ def _compute_charges(
     # GST on brokerage + exchange charges
     gst = (brokerage + exchange) * _GST_RATE
 
-    return round(brokerage + stt + exchange + gst, 2)
+    total = round(brokerage + stt + exchange + gst, 2)
+    return {
+        "brokerage":        round(brokerage, 2),
+        "stt":              round(stt, 2),
+        "exchange_charges": round(exchange, 2),
+        "gst":              round(gst, 2),
+        "total":            total,
+    }
+
+
+def _compute_charges(
+    entry_long_price: float,
+    entry_short_price: float,
+    exit_long_price: float,
+    exit_short_price: float,
+    lot_size: int,
+    approved_lots: int,
+) -> float:
+    """Convenience wrapper — returns total charges only."""
+    return _compute_charges_breakdown(
+        entry_long_price, entry_short_price,
+        exit_long_price, exit_short_price,
+        lot_size, approved_lots,
+    )["total"]
 
 
 # ── Main engine ───────────────────────────────────────────────────────────────
@@ -357,6 +382,7 @@ def run_paper_engine(
                 expiry=expiry,
                 prev_candle_close=prev_candle_close,
                 lot_size=lot_size,
+                current_time=current_time,
             )
 
             # ── Derive signal_substate ────────────────────────────────────────
@@ -443,6 +469,23 @@ def run_paper_engine(
                     "expiry":           expiry,
                     "_entry_long_price":  round(long_ep, 2) if long_ep else 0.0,
                     "_entry_short_price": round(short_ep, 2) if short_ep else 0.0,
+                    # Immutable context frozen at entry
+                    "_entry_reason_code": gate.reason_code,
+                    "_entry_reason_text": gate.reason_text,
+                    "_risk_cap":          capital * _CFG["max_risk_pct"],
+                    "_strategy_params": {
+                        "strategy_name":            _CFG["strategy_name"],
+                        "strategy_version":         _CFG["strategy_version"],
+                        "or_window_minutes":        _CFG["or_window_minutes"],
+                        "breakout_buffer_pct":      _CFG["breakout_buffer_pct"],
+                        "max_risk_pct":             _CFG["max_risk_pct"],
+                        "target_profit_pct":        _CFG["target_profit_pct"],
+                        "square_off_time":          str(_CFG["square_off_time"]),
+                        "min_minutes_left_to_enter": _CFG["min_minutes_left_to_enter"],
+                        "n_candidate_spreads":      _CFG["n_candidate_spreads"],
+                        "lot_size":                 lot_size,
+                        "capital":                  capital,
+                    },
                 }
                 trade_legs = [
                     {
@@ -546,7 +589,7 @@ def run_paper_engine(
             })
 
             minute_marks.append({
-                "trade_id":                trade_id,
+                "trade_id":                active_trade["id"],
                 "timestamp":               ts,
                 "long_leg_price":          round(long_p, 2),
                 "short_leg_price":         round(short_p, 2),
@@ -560,12 +603,13 @@ def run_paper_engine(
                 "gross_mtm":               round(ev.gross_mtm, 2),
                 "estimated_exit_charges":  round(ev.estimated_exit_charges, 2),
                 "estimated_net_mtm":       round(ev.estimated_net_mtm, 2),
+                "price_freshness_json":    price_freshness_json,
             })
 
             if ev.action != "HOLD":
-                # ── Close trade: final gross + net P&L ────────────────────────
+                # ── Close trade: final gross + net P&L + charges breakdown ────
                 realized_gross = round(ev.total_mtm, 2)
-                charges = _compute_charges(
+                charges_breakdown = _compute_charges_breakdown(
                     entry_long_price=active_trade["_entry_long_price"],
                     entry_short_price=active_trade["_entry_short_price"],
                     exit_long_price=round(long_p, 2),
@@ -573,6 +617,7 @@ def run_paper_engine(
                     lot_size=active_trade["lot_size"],
                     approved_lots=active_trade["approved_lots"],
                 )
+                charges = charges_breakdown["total"]
                 realized_net = round(realized_gross - charges, 2)
 
                 for leg in trade_legs:
@@ -582,25 +627,33 @@ def run_paper_engine(
                         leg["exit_price"] = round(short_p, 2)
 
                 trade_header = {
-                    "id":                 active_trade["id"],
-                    "session_id":         session_id,
-                    "entry_time":         active_trade["entry_time"],
-                    "exit_time":          ts,
-                    "bias":               active_trade["bias"],
-                    "expiry":             active_trade["expiry"],
-                    "lot_size":           active_trade["lot_size"],
-                    "approved_lots":      active_trade["approved_lots"],
-                    "entry_debit":        active_trade["entry_debit"],
-                    "total_max_loss":     active_trade["total_max_loss"],
-                    "target_profit":      active_trade["target_profit"],
-                    "realized_gross_pnl": realized_gross,
-                    "realized_net_pnl":   realized_net,
-                    "charges":            charges,
-                    "status":             "CLOSED",
-                    "exit_reason":        ev.action,
-                    "long_strike":        active_trade["long_strike"],
-                    "short_strike":       active_trade["short_strike"],
-                    "option_type":        active_trade["opt_type"],
+                    "id":                     active_trade["id"],
+                    "session_id":             session_id,
+                    "entry_time":             active_trade["entry_time"],
+                    "exit_time":              ts,
+                    "bias":                   active_trade["bias"],
+                    "expiry":                 active_trade["expiry"],
+                    "lot_size":               active_trade["lot_size"],
+                    "approved_lots":          active_trade["approved_lots"],
+                    "entry_debit":            active_trade["entry_debit"],
+                    "total_max_loss":         active_trade["total_max_loss"],
+                    "target_profit":          active_trade["target_profit"],
+                    "realized_gross_pnl":     realized_gross,
+                    "realized_net_pnl":       realized_net,
+                    "charges":                charges,
+                    "charges_breakdown_json": charges_breakdown,
+                    "status":                 "CLOSED",
+                    "exit_reason":            ev.action,
+                    "long_strike":            active_trade["long_strike"],
+                    "short_strike":           active_trade["short_strike"],
+                    "option_type":            active_trade["opt_type"],
+                    # Immutable strategy context
+                    "strategy_name":          _CFG["strategy_name"],
+                    "strategy_version":       _CFG["strategy_version"],
+                    "strategy_params_json":   active_trade["_strategy_params"],
+                    "risk_cap":               active_trade["_risk_cap"],
+                    "entry_reason_code":      active_trade["_entry_reason_code"],
+                    "entry_reason_text":      active_trade["_entry_reason_text"],
                 }
                 active_trade = None
                 trade_closed_this_session = True  # lock: no re-entry
@@ -620,7 +673,7 @@ def run_paper_engine(
                 * active_trade["approved_lots"],
                 2,
             )
-            charges = _compute_charges(
+            charges_breakdown = _compute_charges_breakdown(
                 entry_long_price=active_trade["_entry_long_price"],
                 entry_short_price=active_trade["_entry_short_price"],
                 exit_long_price=round(long_p, 2),
@@ -628,11 +681,13 @@ def run_paper_engine(
                 lot_size=active_trade["lot_size"],
                 approved_lots=active_trade["approved_lots"],
             )
+            charges = charges_breakdown["total"]
             realized_net = round(realized_gross - charges, 2)
         else:
-            realized_gross = 0.0
-            realized_net   = 0.0
-            charges        = 0.0
+            realized_gross     = 0.0
+            realized_net       = 0.0
+            charges            = 0.0
+            charges_breakdown  = {"brokerage": 0.0, "stt": 0.0, "exchange_charges": 0.0, "gst": 0.0, "total": 0.0}
 
         for leg in trade_legs:
             leg["exit_price"] = (
@@ -642,25 +697,33 @@ def run_paper_engine(
             )
 
         trade_header = {
-            "id":                 active_trade["id"],
-            "session_id":         session_id,
-            "entry_time":         active_trade["entry_time"],
-            "exit_time":          last_ts,
-            "bias":               active_trade["bias"],
-            "expiry":             active_trade["expiry"],
-            "lot_size":           active_trade["lot_size"],
-            "approved_lots":      active_trade["approved_lots"],
-            "entry_debit":        active_trade["entry_debit"],
-            "total_max_loss":     active_trade["total_max_loss"],
-            "target_profit":      active_trade["target_profit"],
-            "realized_gross_pnl": realized_gross,
-            "realized_net_pnl":   realized_net,
-            "charges":            charges,
-            "status":             "CLOSED",
-            "exit_reason":        "EXIT_TIME",
-            "long_strike":        active_trade["long_strike"],
-            "short_strike":       active_trade["short_strike"],
-            "option_type":        active_trade["opt_type"],
+            "id":                     active_trade["id"],
+            "session_id":             session_id,
+            "entry_time":             active_trade["entry_time"],
+            "exit_time":              last_ts,
+            "bias":                   active_trade["bias"],
+            "expiry":                 active_trade["expiry"],
+            "lot_size":               active_trade["lot_size"],
+            "approved_lots":          active_trade["approved_lots"],
+            "entry_debit":            active_trade["entry_debit"],
+            "total_max_loss":         active_trade["total_max_loss"],
+            "target_profit":          active_trade["target_profit"],
+            "realized_gross_pnl":     realized_gross,
+            "realized_net_pnl":       realized_net,
+            "charges":                charges,
+            "charges_breakdown_json": charges_breakdown,
+            "status":                 "CLOSED",
+            "exit_reason":            "EXIT_TIME",
+            "long_strike":            active_trade["long_strike"],
+            "short_strike":           active_trade["short_strike"],
+            "option_type":            active_trade["opt_type"],
+            # Immutable strategy context
+            "strategy_name":          _CFG["strategy_name"],
+            "strategy_version":       _CFG["strategy_version"],
+            "strategy_params_json":   active_trade["_strategy_params"],
+            "risk_cap":               active_trade["_risk_cap"],
+            "entry_reason_code":      active_trade["_entry_reason_code"],
+            "entry_reason_text":      active_trade["_entry_reason_text"],
         }
         current_session_state = "TRADE_CLOSED"
 

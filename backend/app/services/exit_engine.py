@@ -9,8 +9,10 @@ Reason codes match PRD Section 11.
 from dataclasses import dataclass
 from datetime import time as time_type
 
-# ── Config ────────────────────────────────────────────────────────────────────
-SQUARE_OFF_TIME = time_type(15, 20)   # Force exit at or after 15:20
+from app.services.strategy_config import STRATEGY_CONFIG as _CFG
+
+# ── Config (sourced from central config — single source of truth) ─────────────
+SQUARE_OFF_TIME: time_type = _CFG["square_off_time"]   # Force exit at or after 15:20
 
 
 # ── Result dataclass ──────────────────────────────────────────────────────────

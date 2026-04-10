@@ -54,5 +54,13 @@ async def init_db():
             "ALTER TABLE paper_trade_minute_marks ADD COLUMN IF NOT EXISTS estimated_exit_charges NUMERIC(10,2)",
             "ALTER TABLE paper_trade_minute_marks ADD COLUMN IF NOT EXISTS estimated_net_mtm NUMERIC(10,2)",
             "ALTER TABLE paper_trade_headers ADD COLUMN IF NOT EXISTS charges NUMERIC(10,2)",
+            "ALTER TABLE paper_trade_headers ADD COLUMN IF NOT EXISTS charges_breakdown_json JSONB",
+            "ALTER TABLE paper_trade_headers ADD COLUMN IF NOT EXISTS strategy_name VARCHAR(50)",
+            "ALTER TABLE paper_trade_headers ADD COLUMN IF NOT EXISTS strategy_version VARCHAR(20)",
+            "ALTER TABLE paper_trade_headers ADD COLUMN IF NOT EXISTS strategy_params_json JSONB",
+            "ALTER TABLE paper_trade_headers ADD COLUMN IF NOT EXISTS risk_cap NUMERIC(12,2)",
+            "ALTER TABLE paper_trade_headers ADD COLUMN IF NOT EXISTS entry_reason_code VARCHAR(60)",
+            "ALTER TABLE paper_trade_headers ADD COLUMN IF NOT EXISTS entry_reason_text TEXT",
+            "ALTER TABLE paper_trade_minute_marks ADD COLUMN IF NOT EXISTS price_freshness_json JSONB",
         ]:
             await conn.execute(__import__("sqlalchemy").text(stmt))

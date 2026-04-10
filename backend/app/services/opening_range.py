@@ -10,12 +10,13 @@ the range boundary, preventing false signals from single-pip crossings.
 import math
 from typing import Dict, List, Tuple
 
-N_CANDIDATE_SPREADS = 5   # how many strike pairs to try per direction
+from app.services.strategy_config import STRATEGY_CONFIG as _CFG
 
-# ── Config ────────────────────────────────────────────────────────────────────
-OR_WINDOW_MINUTES = 15       # 09:15 (idx 0) → 09:29 (idx 14)
-FOLLOW_THROUGH_PCT = 0.001   # 0.1% beyond OR level required
-STRIKE_STEP = 50             # NIFTY strike granularity (pts)
+# ── Config (sourced from central config — single source of truth) ─────────────
+OR_WINDOW_MINUTES   = _CFG["or_window_minutes"]     # 09:15 (idx 0) → 09:29 (idx 14)
+FOLLOW_THROUGH_PCT  = _CFG["breakout_buffer_pct"]   # 0.1% beyond OR level required
+STRIKE_STEP         = _CFG["strike_step"]           # NIFTY strike granularity (pts)
+N_CANDIDATE_SPREADS = _CFG["n_candidate_spreads"]   # strike pairs tried per direction
 
 
 # ── OR computation ────────────────────────────────────────────────────────────

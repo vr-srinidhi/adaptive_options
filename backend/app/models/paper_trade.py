@@ -73,12 +73,20 @@ class PaperTradeHeader(Base):
     target_profit = Column(Numeric(10, 2))
     realized_gross_pnl = Column(Numeric(10, 2))
     realized_net_pnl = Column(Numeric(10, 2))
-    charges = Column(Numeric(10, 2))        # Phase 1: total exit charges applied
+    charges = Column(Numeric(10, 2))        # Phase 1: total exit charges
+    charges_breakdown_json = Column(JSONB)  # Phase 1: {brokerage, stt, exchange_charges, gst, total}
     status = Column(String(20), default="OPEN")  # OPEN / CLOSED
     exit_reason = Column(String(30))
     long_strike = Column(Integer)
     short_strike = Column(Integer)
     option_type = Column(String(5))     # CE / PE
+    # Phase 1: immutable strategy context frozen at entry
+    strategy_name = Column(String(50))
+    strategy_version = Column(String(20))
+    strategy_params_json = Column(JSONB)    # key config params at entry time
+    risk_cap = Column(Numeric(12, 2))       # capital × max_risk_pct at entry
+    entry_reason_code = Column(String(60))  # ENTER_TRADE
+    entry_reason_text = Column(Text)        # full gate reason text
 
 
 class PaperTradeMinuteMark(Base):
@@ -100,6 +108,7 @@ class PaperTradeMinuteMark(Base):
     gross_mtm = Column(Numeric(10, 2))
     estimated_exit_charges = Column(Numeric(10, 2))
     estimated_net_mtm = Column(Numeric(10, 2))
+    price_freshness_json = Column(JSONB)    # {long_age_min, short_age_min}
 
 
 class PaperTradeLeg(Base):

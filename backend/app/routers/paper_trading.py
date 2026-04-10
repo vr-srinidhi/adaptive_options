@@ -98,6 +98,13 @@ def _trade_dict(t: PaperTradeHeader, legs=None) -> dict:
         "realized_gross_pnl": float(t.realized_gross_pnl) if t.realized_gross_pnl is not None else None,
         "realized_net_pnl": float(t.realized_net_pnl) if t.realized_net_pnl is not None else None,
         "charges": float(t.charges) if t.charges is not None else None,
+        "charges_breakdown_json": t.charges_breakdown_json,
+        "strategy_name": t.strategy_name,
+        "strategy_version": t.strategy_version,
+        "strategy_params_json": t.strategy_params_json,
+        "risk_cap": float(t.risk_cap) if t.risk_cap is not None else None,
+        "entry_reason_code": t.entry_reason_code,
+        "entry_reason_text": t.entry_reason_text,
         "status": t.status,
         "exit_reason": t.exit_reason,
         "long_strike": t.long_strike,
@@ -134,6 +141,7 @@ def _mark_dict(m: PaperTradeMinuteMark) -> dict:
         "gross_mtm": float(m.gross_mtm) if m.gross_mtm is not None else None,
         "estimated_exit_charges": float(m.estimated_exit_charges) if m.estimated_exit_charges is not None else None,
         "estimated_net_mtm": float(m.estimated_net_mtm) if m.estimated_net_mtm is not None else None,
+        "price_freshness_json": m.price_freshness_json,
     }
 
 
