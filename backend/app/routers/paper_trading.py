@@ -23,6 +23,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.database import get_db
 from app.models.paper_trade import (
     MinuteDecision,
+    PaperCandleSeries,
     PaperSession,
     PaperTradeHeader,
     PaperTradeLeg,
@@ -199,6 +200,11 @@ async def run_session(req: RunSessionRequest, db: AsyncSession = Depends(get_db)
     else:
         await db.commit()           # decisions only
 
+    # Candle series — always stored regardless of whether a trade was opened
+    for cs in result.get("candle_series", []):
+        db.add(PaperCandleSeries(**cs))
+    await db.commit()
+
     # Update session to COMPLETED
     ps.status = "COMPLETED"
     ps.decision_count = len(result["decisions"])
@@ -320,3 +326,26 @@ async def get_marks(session_id: str, db: AsyncSession = Depends(get_db)):
     )).scalars().all()
 
     return [_mark_dict(m) for m in marks]
+
+
+@router.get("/paper/session/{session_id}/candles")
+async def get_candles(session_id: str, db: AsyncSession = Depends(get_db)):
+    """
+    Return all stored candle series for a session.
+    Each item: {series_type: str, candles: [{time,open,high,low,close,volume},...]}
+    """
+    try:
+        sid = uuid.UUID(session_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid session ID.")
+
+    rows = (await db.execute(
+        select(PaperCandleSeries)
+        .where(PaperCandleSeries.session_id == sid)
+        .order_by(PaperCandleSeries.series_type)
+    )).scalars().all()
+
+    return [
+        {"series_type": r.series_type, "candles": r.candles}
+        for r in rows
+    ]

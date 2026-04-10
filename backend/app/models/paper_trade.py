@@ -1,12 +1,13 @@
 """
 SQLAlchemy ORM models for the Paper Trading (ORB replay) module.
 
-Five tables:
+Six tables:
   paper_sessions            — one row per replay session
   strategy_minute_decisions — one row per market minute (full audit ledger)
   paper_trade_headers       — one row per trade opened
   paper_trade_minute_marks  — per-minute MTM while trade is open
   paper_trade_legs          — long + short option legs
+  paper_candle_series       — raw 1-min OHLCV candles per session (SPOT + options)
 """
 import uuid
 from sqlalchemy import (
@@ -100,3 +101,14 @@ class PaperTradeLeg(Base):
     expiry = Column(Date)
     entry_price = Column(Numeric(10, 2))
     exit_price = Column(Numeric(10, 2))
+
+
+class PaperCandleSeries(Base):
+    __tablename__ = "paper_candle_series"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    session_id = Column(UUID(as_uuid=True), ForeignKey("paper_sessions.id"), nullable=False)
+    # e.g. "SPOT", "22900_CE_WEEKLY", "22900_CE_MONTHLY", "22850_CE_WEEKLY", etc.
+    series_type = Column(String(80), nullable=False)
+    # [{time, open, high, low, close, volume}, ...]
+    candles = Column(JSONB, nullable=False)
