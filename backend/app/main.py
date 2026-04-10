@@ -2,6 +2,8 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from app.database import init_db
 from app.routers import backtest
+from app.routers import auth
+from app.routers import paper_trading
 
 app = FastAPI(title="Adaptive Options API", version="1.0.0")
 
@@ -20,6 +22,8 @@ async def startup():
 
 
 app.include_router(backtest.router, prefix="/api")
+app.include_router(auth.router, prefix="/api")
+app.include_router(paper_trading.router, prefix="/api")
 
 
 @app.get("/health")

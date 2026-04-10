@@ -1,11 +1,22 @@
-import { NavLink } from 'react-router-dom'
+import { NavLink, useLocation } from 'react-router-dom'
 
 export default function TopNav() {
+  const location = useLocation()
+  const isPaper = location.pathname.startsWith('/paper')
+
   const linkClass = ({ isActive }) =>
     [
       'px-4 py-0 text-xs font-medium transition-colors relative flex items-center h-full',
       isActive
         ? 'text-blue-400 after:absolute after:bottom-0 after:left-0 after:right-0 after:h-0.5 after:bg-blue-400'
+        : 'text-slate-400 hover:text-slate-200',
+    ].join(' ')
+
+  const paperLinkClass = ({ isActive }) =>
+    [
+      'px-4 py-0 text-xs font-medium transition-colors relative flex items-center h-full',
+      isActive
+        ? 'text-amber-400 after:absolute after:bottom-0 after:left-0 after:right-0 after:h-0.5 after:bg-amber-400'
         : 'text-slate-400 hover:text-slate-200',
     ].join(' ')
 
@@ -19,25 +30,42 @@ export default function TopNav() {
       }}
     >
       {/* Logo */}
-      <span className="font-bold text-slate-100 mr-8 tracking-tight text-sm">
+      <span className="font-bold text-slate-100 mr-6 tracking-tight text-sm">
         Adaptive<span className="text-blue-400">Options</span>
       </span>
 
-      {/* Nav links */}
+      {/* Divider label */}
+      <span className="text-xs mr-2 px-1.5 py-0.5 rounded"
+        style={{ color: 'var(--text-secondary)', background: 'var(--surface-tertiary)', border: '1px solid var(--border)' }}>
+        BACKTEST
+      </span>
+
       <div className="flex h-full">
-        <NavLink to="/backtest" className={linkClass}>
-          Backtest
-        </NavLink>
-        <NavLink to="/dashboard" className={linkClass}>
-          Dashboard
-        </NavLink>
+        <NavLink to="/backtest" className={linkClass}>Run</NavLink>
+        <NavLink to="/dashboard" className={linkClass}>Dashboard</NavLink>
       </div>
 
-      {/* Regime tag (decorative) */}
-      <div className="ml-auto flex items-center gap-2">
+      {/* Paper trading section */}
+      <div className="mx-4 h-5 w-px" style={{ background: 'var(--border)' }} />
+
+      <span className="text-xs mr-2 px-1.5 py-0.5 rounded"
+        style={{ color: '#f59e0b', background: 'rgba(245,158,11,0.12)', border: '1px solid rgba(245,158,11,0.3)' }}>
+        PAPER
+      </span>
+
+      <div className="flex h-full">
+        <NavLink to="/paper" end className={paperLinkClass}>Replay</NavLink>
+        <NavLink to="/paper/sessions" className={paperLinkClass}>Sessions</NavLink>
+      </div>
+
+      {/* Mode tag */}
+      <div className="ml-auto">
         <span className="text-xs px-2 py-0.5 rounded font-medium"
-          style={{ background: 'rgba(34,197,94,0.15)', color: '#22c55e', border: '1px solid rgba(34,197,94,0.3)' }}>
-          BACKTEST MODE
+          style={isPaper
+            ? { background: 'rgba(245,158,11,0.15)', color: '#f59e0b', border: '1px solid rgba(245,158,11,0.3)' }
+            : { background: 'rgba(34,197,94,0.15)', color: '#22c55e', border: '1px solid rgba(34,197,94,0.3)' }
+          }>
+          {isPaper ? 'PAPER MODE' : 'BACKTEST MODE'}
         </span>
       </div>
     </nav>

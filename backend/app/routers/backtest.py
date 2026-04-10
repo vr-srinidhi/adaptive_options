@@ -2,7 +2,7 @@
 REST endpoints per PRD Section 5.
 """
 import uuid
-from datetime import date, timedelta
+from datetime import date
 from typing import List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -12,7 +12,19 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db
 from app.models.session import BacktestSession
+from app.services.calendar import HOLIDAY, TRADING_DAY, WEEKEND, get_trading_days
 from app.services.simulator import run_day_simulation
+
+
+def _trading_days(start: date, end: date) -> list:
+    """Compatibility shim: weekday-only days (no holiday check). Used by tests."""
+    from datetime import timedelta
+    days, current = [], start
+    while current <= end:
+        if current.weekday() < 5:
+            days.append(current)
+        current += timedelta(days=1)
+    return days
 
 router = APIRouter()
 
@@ -23,16 +35,6 @@ class RunBacktestRequest(BaseModel):
     startDate: str
     endDate: str
     capital: float
-
-
-# ── Helpers ───────────────────────────────────────────────────────────────────
-def _trading_days(start: date, end: date) -> List[date]:
-    days, current = [], start
-    while current <= end:
-        if current.weekday() < 5:
-            days.append(current)
-        current += timedelta(days=1)
-    return days
 
 
 def _to_dict(s: BacktestSession, full: bool = True) -> dict:
@@ -58,6 +60,14 @@ def _to_dict(s: BacktestSession, full: bool = True) -> dict:
         "ema5": float(s.ema5) if s.ema5 is not None else None,
         "ema20": float(s.ema20) if s.ema20 is not None else None,
         "rsi14": float(s.rsi14) if s.rsi14 is not None else None,
+        "no_trade_reason": s.no_trade_reason,
+        "expiry_date": str(s.expiry_date) if s.expiry_date else None,
+        "data_source": s.data_source,
+        "regime_detail": s.regime_detail,
+        "signal_type": s.signal_type,
+        "signal_score": s.signal_score,
+        "atr14": float(s.atr14) if s.atr14 is not None else None,
+        "r_multiple": float(s.r_multiple) if s.r_multiple is not None else None,
         "created_at": str(s.created_at) if s.created_at else None,
     }
     if full:
@@ -85,15 +95,88 @@ async def run_backtest(req: RunBacktestRequest, db: AsyncSession = Depends(get_d
     if not (50_000 <= req.capital <= 10_000_000):
         raise HTTPException(status_code=400, detail="Capital must be ₹50,000 – ₹10,000,000.")
 
-    days = _trading_days(start, end)
-    if not days:
-        raise HTTPException(status_code=400, detail="No trading days in selected range.")
-    if len(days) > 60:
+    all_days = get_trading_days(start, end)
+    trading_days = [(d, t) for d, t in all_days if t == TRADING_DAY]
+    non_trading_days = [(d, t) for d, t in all_days if t in (HOLIDAY, WEEKEND)]
+
+    total_days = len(all_days)
+    if total_days == 0:
+        raise HTTPException(status_code=400, detail="No days in selected range.")
+    if len(trading_days) > 60:
         raise HTTPException(status_code=400, detail="Maximum 60 trading days per run.")
 
     sessions = []
-    for td in days:
-        result = run_day_simulation(td, instrument, req.capital)
+
+    # Persist NO_TRADE audit rows for holidays and weekends
+    for td, day_type in non_trading_days:
+        no_trade_reason = "HOLIDAY" if day_type == HOLIDAY else "WEEKEND"
+        obj = BacktestSession(
+            instrument=instrument,
+            session_date=td,
+            capital=req.capital,
+            regime=None,
+            iv_rank=None,
+            strategy="NO_TRADE",
+            entry_time=None,
+            exit_time=None,
+            exit_reason=no_trade_reason,
+            spot_in=None,
+            spot_out=None,
+            lots=0,
+            max_profit=None,
+            max_loss=None,
+            pnl=0.0,
+            pnl_pct=0.0,
+            wl="NO_TRADE",
+            ema5=None,
+            ema20=None,
+            rsi14=None,
+            legs=[],
+            min_data=[],
+            no_trade_reason=no_trade_reason,
+            expiry_date=None,
+            data_source=None,
+        )
+        db.add(obj)
+        sessions.append(obj)
+
+    # Run simulation for actual trading days
+    for td, _day_type in trading_days:
+        try:
+            result = run_day_simulation(td, instrument, req.capital)
+        except Exception as exc:
+            # DATA_UNAVAILABLE — persist audit row so the date isn't silently skipped
+            obj = BacktestSession(
+                instrument=instrument,
+                session_date=td,
+                capital=req.capital,
+                regime=None,
+                iv_rank=None,
+                strategy="NO_TRADE",
+                entry_time=None,
+                exit_time=None,
+                exit_reason="DATA_UNAVAILABLE",
+                spot_in=None,
+                spot_out=None,
+                lots=0,
+                max_profit=None,
+                max_loss=None,
+                pnl=0.0,
+                pnl_pct=0.0,
+                wl="NO_TRADE",
+                ema5=None,
+                ema20=None,
+                rsi14=None,
+                legs=[],
+                min_data=[],
+                no_trade_reason="DATA_UNAVAILABLE",
+                expiry_date=None,
+                data_source=None,
+            )
+            db.add(obj)
+            sessions.append(obj)
+            continue
+
         obj = BacktestSession(
             instrument=result["instrument"],
             session_date=result["session_date"],
@@ -117,6 +200,14 @@ async def run_backtest(req: RunBacktestRequest, db: AsyncSession = Depends(get_d
             rsi14=result["rsi14"],
             legs=result["legs"],
             min_data=result["min_data"],
+            no_trade_reason=result.get("no_trade_reason"),
+            expiry_date=result.get("expiry_date"),
+            data_source=result.get("data_source"),
+            regime_detail=result.get("regime_detail"),
+            signal_type=result.get("signal_type"),
+            signal_score=result.get("signal_score"),
+            atr14=result.get("atr14"),
+            r_multiple=result.get("r_multiple"),
         )
         db.add(obj)
         sessions.append(obj)

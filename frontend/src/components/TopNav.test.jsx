@@ -19,10 +19,16 @@ describe('TopNav', () => {
     expect(screen.getByText('Options')).toBeInTheDocument()
   })
 
-  it('renders Backtest and Dashboard nav links', () => {
+  it('renders backtest nav links (Run and Dashboard)', () => {
     renderInRouter()
-    expect(screen.getByRole('link', { name: /backtest/i })).toBeInTheDocument()
+    expect(screen.getByRole('link', { name: /^run$/i })).toBeInTheDocument()
     expect(screen.getByRole('link', { name: /dashboard/i })).toBeInTheDocument()
+  })
+
+  it('renders paper trading nav links (Replay and Sessions)', () => {
+    renderInRouter()
+    expect(screen.getByRole('link', { name: /replay/i })).toBeInTheDocument()
+    expect(screen.getByRole('link', { name: /sessions/i })).toBeInTheDocument()
   })
 
   it('shows the BACKTEST MODE indicator badge', () => {
@@ -30,9 +36,9 @@ describe('TopNav', () => {
     expect(screen.getByText('BACKTEST MODE')).toBeInTheDocument()
   })
 
-  it('Backtest link points to /backtest', () => {
+  it('Run link points to /backtest', () => {
     renderInRouter()
-    expect(screen.getByRole('link', { name: /backtest/i })).toHaveAttribute('href', '/backtest')
+    expect(screen.getByRole('link', { name: /^run$/i })).toHaveAttribute('href', '/backtest')
   })
 
   it('Dashboard link points to /dashboard', () => {
@@ -42,17 +48,17 @@ describe('TopNav', () => {
 
   it('active link gets the active class when on /backtest', () => {
     renderInRouter('/backtest')
-    const backtest = screen.getByRole('link', { name: /backtest/i })
+    const runLink = screen.getByRole('link', { name: /^run$/i })
     const dashboard = screen.getByRole('link', { name: /dashboard/i })
-    expect(backtest.className).toContain('text-blue-400')
+    expect(runLink.className).toContain('text-blue-400')
     expect(dashboard.className).not.toContain('text-blue-400')
   })
 
   // ── Negative tests ───────────────────────────────────────────────────────
-  it('does not render extra nav links beyond Backtest and Dashboard', () => {
+  it('renders exactly 4 nav links (Run, Dashboard, Replay, Sessions)', () => {
     renderInRouter()
     const links = screen.getAllByRole('link')
-    expect(links).toHaveLength(2)
+    expect(links).toHaveLength(4)
   })
 
   it('Dashboard link is not active when on /backtest', () => {
