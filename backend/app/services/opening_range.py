@@ -10,6 +10,8 @@ the range boundary, preventing false signals from single-pip crossings.
 import math
 from typing import Dict, List, Tuple
 
+N_CANDIDATE_SPREADS = 5   # how many strike pairs to try per direction
+
 # ── Config ────────────────────────────────────────────────────────────────────
 OR_WINDOW_MINUTES = 15       # 09:15 (idx 0) → 09:29 (idx 14)
 FOLLOW_THROUGH_PCT = 0.001   # 0.1% beyond OR level required
@@ -72,3 +74,44 @@ def select_bearish_strikes(or_low: float, step: int = STRIKE_STEP) -> Tuple[int,
     long_strike = int(math.floor(or_low / step)) * step
     short_strike = long_strike - step
     return long_strike, short_strike
+
+
+# ── Multi-candidate spread generators ─────────────────────────────────────────
+
+def generate_bullish_candidates(
+    or_high: float,
+    step: int = STRIKE_STEP,
+    n: int = N_CANDIDATE_SPREADS,
+) -> List[Tuple[int, int]]:
+    """
+    Generate n Bull Call Spread candidate pairs around the OR-high-derived base strike.
+
+    Each tuple is (long_strike, short_strike) where short_strike = long_strike + step.
+    Ordering: ATM-first (offset 0), then alternating ITM/OTM so the most natural
+    spread is tried before wider/narrower alternatives.
+
+    Example (OR high=22893, step=50, n=5):
+      [(22900,22950), (22850,22900), (22950,23000), (22800,22850), (23000,23050)]
+    """
+    base = int(math.ceil(or_high / step)) * step
+    offsets = [0, -1, 1, -2, 2][:n]
+    return [(base + o * step, base + o * step + step) for o in offsets]
+
+
+def generate_bearish_candidates(
+    or_low: float,
+    step: int = STRIKE_STEP,
+    n: int = N_CANDIDATE_SPREADS,
+) -> List[Tuple[int, int]]:
+    """
+    Generate n Bear Put Spread candidate pairs around the OR-low-derived base strike.
+
+    Each tuple is (long_strike, short_strike) where short_strike = long_strike - step.
+    Ordering: ATM-first (offset 0), then alternating ITM/OTM.
+
+    Example (OR low=22719, step=50, n=5):
+      [(22700,22650), (22750,22700), (22650,22600), (22800,22750), (22600,22550)]
+    """
+    base = int(math.floor(or_low / step)) * step
+    offsets = [0, 1, -1, 2, -2][:n]
+    return [(base + o * step, base + o * step - step) for o in offsets]
