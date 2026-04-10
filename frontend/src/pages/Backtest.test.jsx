@@ -40,22 +40,21 @@ describe('Backtest page', () => {
     const { container } = render(<Backtest />)
     const instrumentSelect = container.querySelector('select')
     const capitalInput = container.querySelector('input[type="number"]')
-    const [startDateInput, endDateInput] = container.querySelectorAll('input[type="date"]')
+    const dateInput = container.querySelector('input[type="date"]')
 
     fireEvent.change(instrumentSelect, { target: { value: 'BANKNIFTY' } })
     fireEvent.change(capitalInput, { target: { value: '750000' } })
-    fireEvent.change(startDateInput, { target: { value: '2025-02-03' } })
-    fireEvent.change(endDateInput, { target: { value: '2025-02-07' } })
+    fireEvent.change(dateInput, { target: { value: '2025-02-03' } })
     fireEvent.click(screen.getByRole('button', { name: /run backtest/i }))
 
     expect(mocks.runBacktest).toHaveBeenCalledWith({
       instrument: 'BANKNIFTY',
       capital: 750000,
       startDate: '2025-02-03',
-      endDate: '2025-02-07',
+      endDate: '2025-02-03',
     })
-    expect(screen.getByText('Starting…')).toBeInTheDocument()
-    expect(screen.getByRole('button', { name: /running/i })).toBeDisabled()
+    expect(screen.getByText('Running simulation…')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /running…/i })).toBeDisabled()
 
     pending.resolve({ data: [{ id: 1 }, { id: 2 }] })
 
