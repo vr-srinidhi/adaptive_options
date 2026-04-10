@@ -56,6 +56,7 @@ def _session_dict(s: PaperSession) -> dict:
         "error_message": s.error_message,
         "decision_count": s.decision_count,
         "created_at": str(s.created_at) if s.created_at else None,
+        "final_session_state": s.final_session_state,
     }
 
 
@@ -74,6 +75,10 @@ def _decision_dict(d: MinuteDecision) -> dict:
         "candidate_structure": d.candidate_structure,
         "computed_max_loss": float(d.computed_max_loss) if d.computed_max_loss is not None else None,
         "computed_target": float(d.computed_target) if d.computed_target is not None else None,
+        "session_state": d.session_state,
+        "signal_substate": d.signal_substate,
+        "rejection_gate": d.rejection_gate,
+        "price_freshness_json": d.price_freshness_json,
     }
 
 
@@ -92,6 +97,7 @@ def _trade_dict(t: PaperTradeHeader, legs=None) -> dict:
         "target_profit": float(t.target_profit) if t.target_profit is not None else None,
         "realized_gross_pnl": float(t.realized_gross_pnl) if t.realized_gross_pnl is not None else None,
         "realized_net_pnl": float(t.realized_net_pnl) if t.realized_net_pnl is not None else None,
+        "charges": float(t.charges) if t.charges is not None else None,
         "status": t.status,
         "exit_reason": t.exit_reason,
         "long_strike": t.long_strike,
@@ -125,6 +131,9 @@ def _mark_dict(m: PaperTradeMinuteMark) -> dict:
         "distance_to_stop": float(m.distance_to_stop) if m.distance_to_stop is not None else None,
         "action": m.action,
         "reason": m.reason,
+        "gross_mtm": float(m.gross_mtm) if m.gross_mtm is not None else None,
+        "estimated_exit_charges": float(m.estimated_exit_charges) if m.estimated_exit_charges is not None else None,
+        "estimated_net_mtm": float(m.estimated_net_mtm) if m.estimated_net_mtm is not None else None,
     }
 
 
@@ -208,6 +217,7 @@ async def run_session(req: RunSessionRequest, db: AsyncSession = Depends(get_db)
     # Update session to COMPLETED
     ps.status = "COMPLETED"
     ps.decision_count = len(result["decisions"])
+    ps.final_session_state = result.get("final_session_state")
     await db.commit()
     await db.refresh(ps)
 

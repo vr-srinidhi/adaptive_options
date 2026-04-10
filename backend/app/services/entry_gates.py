@@ -36,12 +36,14 @@ from app.services.opening_range import (
     is_bullish_breakout,
 )
 
-# ── Strategy config ───────────────────────────────────────────────────────────
-MAX_RISK_PCT = 0.02    # G6: max 2% of capital as max loss
-TARGET_PCT   = 0.005   # profit target = 0.5% of capital
+# ── Strategy config (sourced from central config) ─────────────────────────────
+from app.services.strategy_config import STRATEGY_CONFIG as _CFG
+
+MAX_RISK_PCT = _CFG["max_risk_pct"]        # G6: max 2% of capital as max loss
+TARGET_PCT   = _CFG["target_profit_pct"]   # profit target = 0.5% of capital
 
 # Fallback lot sizes — used only if instruments master lookup fails
-_FALLBACK_LOT_SIZES: Dict[str, int] = {"NIFTY": 75, "BANKNIFTY": 35}
+_FALLBACK_LOT_SIZES: Dict[str, int] = _CFG["fallback_lot_sizes"]
 
 
 # ── Result dataclass ──────────────────────────────────────────────────────────

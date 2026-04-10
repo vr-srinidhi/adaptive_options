@@ -44,5 +44,15 @@ async def init_db():
             "ALTER TABLE backtest_sessions ADD COLUMN IF NOT EXISTS r_multiple NUMERIC(6,2)",
             # Paper trading tables (idempotent — create_all handles initial creation)
             # No ALTER needed; new tables are created fresh by SQLAlchemy create_all above
+            # Phase 1 ORB fix — new columns on existing paper trading tables
+            "ALTER TABLE paper_sessions ADD COLUMN IF NOT EXISTS final_session_state VARCHAR(30)",
+            "ALTER TABLE strategy_minute_decisions ADD COLUMN IF NOT EXISTS session_state VARCHAR(30)",
+            "ALTER TABLE strategy_minute_decisions ADD COLUMN IF NOT EXISTS signal_substate VARCHAR(30)",
+            "ALTER TABLE strategy_minute_decisions ADD COLUMN IF NOT EXISTS rejection_gate VARCHAR(10)",
+            "ALTER TABLE strategy_minute_decisions ADD COLUMN IF NOT EXISTS price_freshness_json JSONB",
+            "ALTER TABLE paper_trade_minute_marks ADD COLUMN IF NOT EXISTS gross_mtm NUMERIC(10,2)",
+            "ALTER TABLE paper_trade_minute_marks ADD COLUMN IF NOT EXISTS estimated_exit_charges NUMERIC(10,2)",
+            "ALTER TABLE paper_trade_minute_marks ADD COLUMN IF NOT EXISTS estimated_net_mtm NUMERIC(10,2)",
+            "ALTER TABLE paper_trade_headers ADD COLUMN IF NOT EXISTS charges NUMERIC(10,2)",
         ]:
             await conn.execute(__import__("sqlalchemy").text(stmt))
