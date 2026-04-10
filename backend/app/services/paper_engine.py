@@ -65,6 +65,25 @@ def _candle_time(candle: Dict):
     return ts.time(), ts
 
 
+def _monthly_expiry_from_master(
+    symbol: str, trade_date: date_type, instruments: List[Dict]
+) -> Optional[date_type]:
+    """
+    Return the last (monthly) expiry within trade_date's calendar month.
+    If no expiry exists in that month on/after trade_date, returns None.
+    """
+    nfo_name = NFO_NAME[symbol]
+    month_expiries = sorted(
+        {i["expiry"] for i in instruments
+         if i.get("name") == nfo_name
+         and i.get("expiry") is not None
+         and i["expiry"].year == trade_date.year
+         and i["expiry"].month == trade_date.month
+         and i["expiry"] >= trade_date}
+    )
+    return month_expiries[-1] if month_expiries else None
+
+
 def _nearest_expiry_from_master(
     symbol: str, trade_date: date_type, instruments: List[Dict]
 ) -> Optional[date_type]:
@@ -93,6 +112,26 @@ def _lot_size_from_master(symbol: str, instruments: List[Dict]) -> Optional[int]
         if inst.get("name") == nfo_name and inst.get("lot_size"):
             return int(inst["lot_size"])
     return None
+
+
+def _serialize_candles(candles: List[Dict]) -> List[Dict]:
+    """Convert raw Zerodha candle dicts to a JSON-serialisable list of OHLCV dicts."""
+    result = []
+    for c in candles:
+        ts = c["date"]
+        if isinstance(ts, datetime):
+            if ts.tzinfo is not None:
+                ts = ts.replace(tzinfo=None)
+            ts = ts.isoformat()
+        result.append({
+            "time": ts,
+            "open": float(c["open"]),
+            "high": float(c["high"]),
+            "low": float(c["low"]),
+            "close": float(c["close"]),
+            "volume": int(c.get("volume", 0)),
+        })
+    return result
 
 
 def _build_price_index(candles: List[Dict]) -> Dict[int, float]:
@@ -166,10 +205,11 @@ def run_paper_engine(
 
     Returns:
       {
-        "decisions":    [ {fields matching MinuteDecision}, ... ],
-        "trade_header": { fields matching PaperTradeHeader } | None,
-        "minute_marks": [ {fields matching PaperTradeMinuteMark}, ... ],
-        "trade_legs":   [ {fields matching PaperTradeLeg}, ... ],
+        "decisions":      [ {fields matching MinuteDecision}, ... ],
+        "trade_header":   { fields matching PaperTradeHeader } | None,
+        "minute_marks":   [ {fields matching PaperTradeMinuteMark}, ... ],
+        "trade_legs":     [ {fields matching PaperTradeLeg}, ... ],
+        "candle_series":  [ {session_id, series_type, candles}, ... ],
       }
 
     Raises DataUnavailableError if spot candles cannot be fetched.
@@ -228,7 +268,14 @@ def run_paper_engine(
         legs_to_fetch.add((long_s, "PE"))
         legs_to_fetch.add((short_s, "PE"))
 
+    # Also find monthly expiry (last expiry in trade month) for candle export
+    monthly_expiry = _monthly_expiry_from_master(instrument, trade_date, instruments_master)
+    if monthly_expiry and monthly_expiry == expiry:
+        monthly_expiry = None   # already weekly == monthly; no need to fetch twice
+    log.info("Monthly expiry: %s", monthly_expiry)
+
     option_price_index: Dict[Tuple[int, str], Dict[int, float]] = {}
+    option_candles_raw: Dict[Tuple[int, str], List[Dict]] = {}  # raw candles for export
 
     for strike, opt_type in sorted(legs_to_fetch):
         token = resolve_instrument_token(
@@ -242,6 +289,7 @@ def run_paper_engine(
         try:
             candles = fetch_candles_with_token(token, trade_date, access_token)
             option_price_index[(strike, opt_type)] = _build_price_index(candles)
+            option_candles_raw[(strike, opt_type)] = candles
             log.info("Fetched %d candles for %s%s", len(candles), strike, opt_type)
         except DataUnavailableError as exc:
             log.warning("Option data unavailable for %s%s: %s", strike, opt_type, exc)
@@ -526,16 +574,68 @@ def run_paper_engine(
             "option_type": active_trade["opt_type"],
         }
 
+    # ── 7. Build candle series for export ────────────────────────────────────
+    candle_series: List[Dict] = [
+        {
+            "session_id": session_id,
+            "series_type": "SPOT",
+            "candles": _serialize_candles(spot_candles),
+        }
+    ]
+
+    # If a trade was opened, include weekly + monthly option candles for the
+    # actual trade legs (long + short strike, both expiries if available).
+    if trade_header:
+        long_s   = trade_header["long_strike"]
+        short_s  = trade_header["short_strike"]
+        opt_type = trade_header["option_type"]
+
+        for strike in (long_s, short_s):
+            raw = option_candles_raw.get((strike, opt_type))
+            if raw:
+                candle_series.append({
+                    "session_id": session_id,
+                    "series_type": f"{strike}_{opt_type}_WEEKLY",
+                    "candles": _serialize_candles(raw),
+                })
+
+        # Monthly expiry option candles (if different from weekly)
+        if monthly_expiry:
+            monthly_legs = set()
+            for strike in (long_s, short_s):
+                token = resolve_instrument_token(
+                    instrument, monthly_expiry, strike, opt_type, instruments_master
+                )
+                if token and (strike, opt_type, monthly_expiry) not in monthly_legs:
+                    monthly_legs.add((strike, opt_type, monthly_expiry))
+                    try:
+                        m_candles = fetch_candles_with_token(token, trade_date, access_token)
+                        candle_series.append({
+                            "session_id": session_id,
+                            "series_type": f"{strike}_{opt_type}_MONTHLY",
+                            "candles": _serialize_candles(m_candles),
+                        })
+                        log.info(
+                            "Fetched %d monthly candles for %s%s exp=%s",
+                            len(m_candles), strike, opt_type, monthly_expiry,
+                        )
+                    except DataUnavailableError as exc:
+                        log.warning(
+                            "Monthly option data unavailable for %s%s: %s", strike, opt_type, exc
+                        )
+
     log.info(
-        "Engine complete: %d decisions, trade=%s, %d marks",
+        "Engine complete: %d decisions, trade=%s, %d marks, %d candle series",
         len(decisions),
         "YES" if trade_header else "NO",
         len(minute_marks),
+        len(candle_series),
     )
 
     return {
-        "decisions": decisions,
-        "trade_header": trade_header,
-        "minute_marks": minute_marks,
-        "trade_legs": trade_legs,
+        "decisions":     decisions,
+        "trade_header":  trade_header,
+        "minute_marks":  minute_marks,
+        "trade_legs":    trade_legs,
+        "candle_series": candle_series,
     }

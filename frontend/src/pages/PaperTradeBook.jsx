@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 import { useParams, useNavigate } from 'react-router-dom'
-import { getPaperSession, getPaperDecisions, getPaperTrade, getPaperMarks } from '../api'
+import { getPaperSession, getPaperDecisions, getPaperTrade, getPaperMarks, getPaperCandles } from '../api'
 import { PnlProgressionChart } from '../components/PnlChart'
 
 const fmtINR = v => v == null ? '—' :
@@ -43,7 +43,7 @@ function KV({ label, value, valueColor }) {
 }
 
 // ── CSV export ─────────────────────────────────────────────────────────────────
-function buildCSV(session, trade, decisions, marks) {
+function buildCSV(session, trade, decisions, marks, candleSeries) {
   const rows = []
 
   rows.push(['SESSION SUMMARY'])
@@ -112,12 +112,25 @@ function buildCSV(session, trade, decisions, marks) {
       d.candidate_structure ? `"${JSON.stringify(d.candidate_structure).replace(/"/g, "'")}"` : '',
     ])
   })
+  rows.push([])
+
+  // ── Candle series sections ────────────────────────────────────────────────
+  if (candleSeries?.length) {
+    candleSeries.forEach(cs => {
+      rows.push([`CANDLES: ${cs.series_type}`])
+      rows.push(['Time', 'Open', 'High', 'Low', 'Close', 'Volume'])
+      ;(cs.candles || []).forEach(c => {
+        rows.push([c.time?.slice(11, 16), c.open, c.high, c.low, c.close, c.volume])
+      })
+      rows.push([])
+    })
+  }
 
   return rows.map(r => r.join(',')).join('\n')
 }
 
-function downloadCSV(session, trade, decisions, marks) {
-  const csv = buildCSV(session, trade, decisions, marks)
+function downloadCSV(session, trade, decisions, marks, candleSeries) {
+  const csv = buildCSV(session, trade, decisions, marks, candleSeries)
   const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' })
   const url = URL.createObjectURL(blob)
   const a = document.createElement('a')
@@ -125,6 +138,53 @@ function downloadCSV(session, trade, decisions, marks) {
   a.download = `ORB_${session.instrument}_${session.session_date}.csv`
   a.click()
   URL.revokeObjectURL(url)
+}
+
+// ── Compact OHLCV table for PDF / print ───────────────────────────────────────
+function CandleTable({ series }) {
+  if (!series?.candles?.length) return null
+  const label = series.series_type
+    .replace('_WEEKLY', ' (Weekly)')
+    .replace('_MONTHLY', ' (Monthly)')
+    .replace('_CE_', ' CE ')
+    .replace('_PE_', ' PE ')
+  return (
+    <div className="mt-4">
+      <div className="text-xs uppercase tracking-widest mb-1" style={{ color: 'var(--text-secondary)' }}>
+        {label} — {series.candles.length} candles
+      </div>
+      <div className="rounded-lg overflow-hidden" style={{ border: '1px solid var(--border)' }}>
+        <div style={{ maxHeight: 220, overflowY: 'auto' }}>
+          <table className="w-full text-xs">
+            <thead style={{ position: 'sticky', top: 0, background: 'var(--surface-tertiary)' }}>
+              <tr style={{ borderBottom: '1px solid var(--border)' }}>
+                {['Time', 'Open', 'High', 'Low', 'Close', 'Vol'].map(h => (
+                  <th key={h} className="text-left px-2 py-1.5 font-medium uppercase tracking-wider"
+                    style={{ color: 'var(--text-secondary)' }}>{h}</th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {series.candles.map((c, i) => (
+                <tr key={i} style={{ borderBottom: '0.5px solid var(--border)' }}>
+                  <td className="px-2 py-1 font-mono" style={{ color: 'var(--text-primary)' }}>
+                    {c.time?.slice(11, 16)}
+                  </td>
+                  <td className="px-2 py-1" style={{ color: 'var(--text-secondary)' }}>{fmtNum(c.open)}</td>
+                  <td className="px-2 py-1" style={{ color: '#22c55e' }}>{fmtNum(c.high)}</td>
+                  <td className="px-2 py-1" style={{ color: '#ef4444' }}>{fmtNum(c.low)}</td>
+                  <td className="px-2 py-1 font-medium" style={{ color: 'var(--text-primary)' }}>{fmtNum(c.close)}</td>
+                  <td className="px-2 py-1" style={{ color: 'var(--text-secondary)' }}>
+                    {c.volume?.toLocaleString('en-IN')}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  )
 }
 
 // ── Legs contract table ────────────────────────────────────────────────────────
@@ -210,6 +270,7 @@ export default function PaperTradeBook() {
   const [decisions, setDecisions] = useState([])
   const [trade, setTrade] = useState(null)
   const [marks, setMarks] = useState([])
+  const [candleSeries, setCandleSeries] = useState([])
   const [loading, setLoading] = useState(true)
   const [filter, setFilter] = useState('ALL')
   const [error, setError] = useState(null)
@@ -220,12 +281,14 @@ export default function PaperTradeBook() {
       getPaperDecisions(id),
       getPaperTrade(id),
       getPaperMarks(id),
+      getPaperCandles(id),
     ])
-      .then(([sRes, dRes, tRes, mRes]) => {
+      .then(([sRes, dRes, tRes, mRes, cRes]) => {
         setSession(sRes.data)
         setDecisions(dRes.data)
         setTrade(tRes.data.trade)
         setMarks(mRes.data)
+        setCandleSeries(cRes.data)
       })
       .catch(err => setError(err.response?.data?.detail || err.message))
       .finally(() => setLoading(false))
@@ -281,7 +344,7 @@ export default function PaperTradeBook() {
             ← Sessions
           </button>
           <div className="flex gap-2">
-            <button onClick={() => downloadCSV(session, trade, decisions, marks)}
+            <button onClick={() => downloadCSV(session, trade, decisions, marks, candleSeries)}
               className="px-3 py-1.5 rounded text-xs font-medium flex items-center gap-1.5"
               style={{ background: 'var(--surface-secondary)', border: '1px solid var(--border)', color: 'var(--text-secondary)', cursor: 'pointer' }}>
               ↓ CSV
@@ -378,6 +441,19 @@ export default function PaperTradeBook() {
           <div className="rounded-xl p-4 mb-4 text-sm text-center"
             style={{ background: 'var(--surface-secondary)', border: '1px solid var(--border)', color: 'var(--text-secondary)' }}>
             No trade was opened this session — all gate conditions failed.
+          </div>
+        )}
+
+        {/* Candle data section */}
+        {candleSeries.length > 0 && (
+          <div className="rounded-xl p-4 mb-4"
+            style={{ background: 'var(--surface-secondary)', border: '1px solid var(--border)' }}>
+            <div className="text-xs uppercase tracking-widest mb-3" style={{ color: 'var(--text-secondary)' }}>
+              Raw Candle Data ({candleSeries.length} series)
+            </div>
+            {candleSeries.map(cs => (
+              <CandleTable key={cs.series_type} series={cs} />
+            ))}
           </div>
         )}
 
