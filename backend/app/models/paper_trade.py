@@ -29,6 +29,8 @@ class PaperSession(Base):
     error_message = Column(Text)
     decision_count = Column(Integer, default=0)
     created_at = Column(TIMESTAMP(timezone=True), server_default=func.now())
+    # Phase 1: session lifecycle terminal state
+    final_session_state = Column(String(30))  # OBSERVING / TRADE_CLOSED / SESSION_COMPLETE / etc.
 
 
 class MinuteDecision(Base):
@@ -48,6 +50,11 @@ class MinuteDecision(Base):
     candidate_structure = Column(JSONB)
     computed_max_loss = Column(Numeric(10, 2))
     computed_target = Column(Numeric(10, 2))
+    # Phase 1: enriched audit fields
+    session_state = Column(String(30))      # OBSERVING / TENTATIVE_SIGNAL / OPEN_TRADE / TRADE_CLOSED / SESSION_COMPLETE
+    signal_substate = Column(String(30))    # TENTATIVE_BREAKOUT / CONFIRMED_BREAKOUT / FAILED_FIRST_BREAKOUT
+    rejection_gate = Column(String(10))     # G1–G7 or None
+    price_freshness_json = Column(JSONB)    # {spot_age_min, long_age_min, short_age_min}
 
 
 class PaperTradeHeader(Base):
@@ -66,11 +73,20 @@ class PaperTradeHeader(Base):
     target_profit = Column(Numeric(10, 2))
     realized_gross_pnl = Column(Numeric(10, 2))
     realized_net_pnl = Column(Numeric(10, 2))
+    charges = Column(Numeric(10, 2))        # Phase 1: total exit charges
+    charges_breakdown_json = Column(JSONB)  # Phase 1: {brokerage, stt, exchange_charges, gst, total}
     status = Column(String(20), default="OPEN")  # OPEN / CLOSED
     exit_reason = Column(String(30))
     long_strike = Column(Integer)
     short_strike = Column(Integer)
     option_type = Column(String(5))     # CE / PE
+    # Phase 1: immutable strategy context frozen at entry
+    strategy_name = Column(String(50))
+    strategy_version = Column(String(20))
+    strategy_params_json = Column(JSONB)    # key config params at entry time
+    risk_cap = Column(Numeric(12, 2))       # capital × max_risk_pct at entry
+    entry_reason_code = Column(String(60))  # ENTER_TRADE
+    entry_reason_text = Column(Text)        # full gate reason text
 
 
 class PaperTradeMinuteMark(Base):
@@ -88,6 +104,11 @@ class PaperTradeMinuteMark(Base):
     distance_to_stop = Column(Numeric(10, 2))
     action = Column(String(20))
     reason = Column(String(200))
+    # Phase 1: gross/net split
+    gross_mtm = Column(Numeric(10, 2))
+    estimated_exit_charges = Column(Numeric(10, 2))
+    estimated_net_mtm = Column(Numeric(10, 2))
+    price_freshness_json = Column(JSONB)    # {long_age_min, short_age_min}
 
 
 class PaperTradeLeg(Base):

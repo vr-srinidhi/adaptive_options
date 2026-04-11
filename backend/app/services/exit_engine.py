@@ -9,15 +9,17 @@ Reason codes match PRD Section 11.
 from dataclasses import dataclass
 from datetime import time as time_type
 
-# ── Config ────────────────────────────────────────────────────────────────────
-SQUARE_OFF_TIME = time_type(15, 20)   # Force exit at or after 15:20
+from app.services.strategy_config import STRATEGY_CONFIG as _CFG
+
+# ── Config (sourced from central config — single source of truth) ─────────────
+SQUARE_OFF_TIME: time_type = _CFG["square_off_time"]   # Force exit at or after 15:20
 
 
 # ── Result dataclass ──────────────────────────────────────────────────────────
 
 @dataclass
 class ExitEval:
-    action: str           # HOLD / EXIT_TARGET / EXIT_STOP / EXIT_TIME / EXIT_INVALIDATION
+    action: str           # HOLD / EXIT_TARGET / EXIT_STOP / EXIT_TIME
     reason: str
     long_price: float
     short_price: float
@@ -26,6 +28,10 @@ class ExitEval:
     total_mtm: float
     distance_to_target: float
     distance_to_stop: float
+    # ── Gross/net split (Phase 1) ─────────────────────────────────────────
+    gross_mtm: float = 0.0              # = total_mtm (pre-charges)
+    estimated_exit_charges: float = 0.0  # estimated round-trip charges if exited now
+    estimated_net_mtm: float = 0.0      # gross_mtm − estimated_exit_charges
 
 
 # ── Evaluator ─────────────────────────────────────────────────────────────────
@@ -39,6 +45,7 @@ def evaluate_exit(
     approved_lots: int,
     total_max_loss: float,
     target_profit: float,
+    estimated_charges: float = 0.0,   # pre-computed by caller; 0 = ignore
 ) -> ExitEval:
     """
     Compute the current MTM and decide whether to hold or exit.
@@ -54,6 +61,18 @@ def evaluate_exit(
 
     dist_to_target = float(target_profit) - total_mtm
     dist_to_stop = total_mtm + float(total_max_loss)   # positive = cushion remaining
+    net_mtm = round(total_mtm - estimated_charges, 2)
+
+    _common = dict(
+        long_price=long_price, short_price=short_price,
+        current_spread=current_spread, mtm_per_lot=mtm_per_lot,
+        total_mtm=total_mtm,
+        distance_to_target=dist_to_target,
+        distance_to_stop=dist_to_stop,
+        gross_mtm=total_mtm,
+        estimated_exit_charges=estimated_charges,
+        estimated_net_mtm=net_mtm,
+    )
 
     # Priority 1 — Target hit
     if total_mtm >= float(target_profit):
@@ -61,13 +80,10 @@ def evaluate_exit(
             action="EXIT_TARGET",
             reason=(
                 f"Target reached. MTM ₹{total_mtm:.0f} ≥ target ₹{target_profit:.0f}. "
-                f"Spread {entry_debit:.2f} → {current_spread:.2f}."
+                f"Spread {entry_debit:.2f} → {current_spread:.2f}. "
+                f"Net (est.) ₹{net_mtm:.0f}."
             ),
-            long_price=long_price, short_price=short_price,
-            current_spread=current_spread, mtm_per_lot=mtm_per_lot,
-            total_mtm=total_mtm,
-            distance_to_target=dist_to_target,
-            distance_to_stop=dist_to_stop,
+            **_common,
         )
 
     # Priority 2 — Stop hit
@@ -76,13 +92,10 @@ def evaluate_exit(
             action="EXIT_STOP",
             reason=(
                 f"Stop hit. MTM ₹{total_mtm:.0f} ≤ -₹{total_max_loss:.0f}. "
-                f"Spread {entry_debit:.2f} → {current_spread:.2f}."
+                f"Spread {entry_debit:.2f} → {current_spread:.2f}. "
+                f"Net (est.) ₹{net_mtm:.0f}."
             ),
-            long_price=long_price, short_price=short_price,
-            current_spread=current_spread, mtm_per_lot=mtm_per_lot,
-            total_mtm=total_mtm,
-            distance_to_target=dist_to_target,
-            distance_to_stop=dist_to_stop,
+            **_common,
         )
 
     # Priority 3 — Time-based square-off
@@ -91,13 +104,9 @@ def evaluate_exit(
             action="EXIT_TIME",
             reason=(
                 f"Forced square-off at {current_time.strftime('%H:%M')}. "
-                f"MTM ₹{total_mtm:.0f}."
+                f"MTM ₹{total_mtm:.0f}. Net (est.) ₹{net_mtm:.0f}."
             ),
-            long_price=long_price, short_price=short_price,
-            current_spread=current_spread, mtm_per_lot=mtm_per_lot,
-            total_mtm=total_mtm,
-            distance_to_target=dist_to_target,
-            distance_to_stop=dist_to_stop,
+            **_common,
         )
 
     # Hold
@@ -108,9 +117,5 @@ def evaluate_exit(
             f"To target: ₹{dist_to_target:.0f} | "
             f"Cushion before stop: ₹{dist_to_stop:.0f}."
         ),
-        long_price=long_price, short_price=short_price,
-        current_spread=current_spread, mtm_per_lot=mtm_per_lot,
-        total_mtm=total_mtm,
-        distance_to_target=dist_to_target,
-        distance_to_stop=dist_to_stop,
+        **_common,
     )

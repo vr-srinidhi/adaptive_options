@@ -10,6 +10,9 @@ Given a date, instrument, capital, and a valid Zerodha access token:
      (no trade) or the exit engine (trade open)
   5. Returns structured dicts ready for bulk DB insert — does NOT touch DB itself
 
+Session lifecycle state machine (Phase 1):
+  OBSERVING → TENTATIVE_SIGNAL → OPEN_TRADE → TRADE_CLOSED → SESSION_COMPLETE
+
 All heavy I/O (Zerodha API calls) happens synchronously; the FastAPI router
 wraps this in run_in_executor to avoid blocking the async event loop.
 """
@@ -31,6 +34,7 @@ from app.services.option_resolver import (
     UNDERLYING_TOKENS,
     resolve_instrument_token,
 )
+from app.services.strategy_config import STRATEGY_CONFIG as _CFG
 from app.services.zerodha_client import (
     DataUnavailableError,
     fetch_candles_with_token,
@@ -39,24 +43,31 @@ from app.services.zerodha_client import (
 
 log = logging.getLogger(__name__)
 
-# ── Charges config ─────────────────────────────────────────────────────────────
-# Approximate Zerodha NSE-options round-trip charges for a 2-leg spread.
-#   4 orders total (entry long-buy, entry short-sell, exit long-sell, exit short-buy)
-_BROKERAGE_PER_ORDER  = 20.0      # ₹20 flat per executed order
-_STT_RATE             = 0.0005    # 0.05% of premium on sell side
-_EXCHANGE_TXN_RATE    = 0.00053   # 0.053% of premium turnover
-_GST_RATE             = 0.18      # 18% on (brokerage + exchange charges)
+# ── Charges config (from central config) ───────────────────────────────────────
+_BROKERAGE_PER_ORDER = _CFG["brokerage_per_order"]
+_STT_RATE            = _CFG["stt_rate"]
+_EXCHANGE_TXN_RATE   = _CFG["exchange_txn_rate"]
+_GST_RATE            = _CFG["gst_rate"]
+_MAX_PRICE_STALENESS = _CFG["max_price_staleness_min"]
 
-# Maximum number of minutes a backfilled option price is considered usable
-_MAX_PRICE_STALENESS = 5
+# ── Gate reason-code → gate label ─────────────────────────────────────────────
+_REASON_TO_GATE: Dict[str, str] = {
+    "OPENING_RANGE_NOT_READY":            "G1",
+    "ACTIVE_TRADE_EXISTS":                "G2",
+    "TOO_LATE_TO_ENTER":                  "G2b",
+    "NO_BREAKOUT_CONFIRMATION":           "G3",
+    "FAILED_BREAKOUT_OR_NO_FOLLOWTHROUGH": "G4",
+    "NO_HEDGE_AVAILABLE":                 "G5",
+    "RISK_EXCEEDS_CAP":                   "G6",
+    "TARGET_NOT_VIABLE":                  "G7",
+    "STALE_OPTION_PRICE":                 "FRESHNESS",
+}
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _candle_time(candle: Dict):
-    """Extract (time, naive_datetime) from a candle's date field.
-    Strips timezone so timestamps are compatible with TIMESTAMP(timezone=False) columns.
-    """
+    """Extract (time, naive_datetime) from a candle's date field."""
     ts = candle["date"]
     if isinstance(ts, str):
         ts = datetime.fromisoformat(ts)
@@ -68,10 +79,7 @@ def _candle_time(candle: Dict):
 def _monthly_expiry_from_master(
     symbol: str, trade_date: date_type, instruments: List[Dict]
 ) -> Optional[date_type]:
-    """
-    Return the last (monthly) expiry within trade_date's calendar month.
-    If no expiry exists in that month on/after trade_date, returns None.
-    """
+    """Return the last (monthly) expiry within trade_date's calendar month."""
     nfo_name = NFO_NAME[symbol]
     month_expiries = sorted(
         {i["expiry"] for i in instruments
@@ -87,22 +95,13 @@ def _monthly_expiry_from_master(
 def _nearest_expiry_from_master(
     symbol: str, trade_date: date_type, instruments: List[Dict]
 ) -> Optional[date_type]:
-    """
-    Find the nearest expiry date >= trade_date that actually exists in the
-    instruments master for *symbol*.
-
-    More reliable than weekday arithmetic because:
-      - Expiry may shift due to holidays
-      - Expired contracts are removed from the master on/after expiry day
-    """
+    """Find the nearest expiry date >= trade_date in the instruments master."""
     nfo_name = NFO_NAME[symbol]
     expiries = sorted(
         {i["expiry"] for i in instruments
          if i.get("name") == nfo_name and i.get("expiry") >= trade_date}
     )
-    if not expiries:
-        return None
-    return expiries[0]
+    return expiries[0] if expiries else None
 
 
 def _lot_size_from_master(symbol: str, instruments: List[Dict]) -> Optional[int]:
@@ -124,11 +123,11 @@ def _serialize_candles(candles: List[Dict]) -> List[Dict]:
                 ts = ts.replace(tzinfo=None)
             ts = ts.isoformat()
         result.append({
-            "time": ts,
-            "open": float(c["open"]),
-            "high": float(c["high"]),
-            "low": float(c["low"]),
-            "close": float(c["close"]),
+            "time":   ts,
+            "open":   float(c["open"]),
+            "high":   float(c["high"]),
+            "low":    float(c["low"]),
+            "close":  float(c["close"]),
             "volume": int(c.get("volume", 0)),
         })
     return result
@@ -145,9 +144,8 @@ def _get_price_at(
     """
     Return (price, staleness_minutes) for minute index *idx*.
 
-    If the exact minute is missing (thin liquidity gap), scan back up to
-    *lookback* minutes.  staleness_minutes=0 means a fresh price was found.
-    Returns (None, 0) when no price is found within the lookback window.
+    Scans back up to *lookback* minutes for missing prices (thin liquidity gaps).
+    staleness_minutes=0 means a fresh price was found.
     """
     for i in range(idx, max(-1, idx - lookback - 1), -1):
         if i in price_index:
@@ -155,16 +153,17 @@ def _get_price_at(
     return None, 0
 
 
-def _compute_charges(
+def _compute_charges_breakdown(
     entry_long_price: float,
     entry_short_price: float,
     exit_long_price: float,
     exit_short_price: float,
     lot_size: int,
     approved_lots: int,
-) -> float:
+) -> Dict[str, float]:
     """
     Approximate round-trip charges for a Bull Call / Bear Put Spread.
+    Returns a breakdown dict with brokerage, stt, exchange_charges, gst, total.
 
     Orders:
       Entry : buy long leg  (long buy)  + sell short leg (short sell)
@@ -188,7 +187,30 @@ def _compute_charges(
     # GST on brokerage + exchange charges
     gst = (brokerage + exchange) * _GST_RATE
 
-    return round(brokerage + stt + exchange + gst, 2)
+    total = round(brokerage + stt + exchange + gst, 2)
+    return {
+        "brokerage":        round(brokerage, 2),
+        "stt":              round(stt, 2),
+        "exchange_charges": round(exchange, 2),
+        "gst":              round(gst, 2),
+        "total":            total,
+    }
+
+
+def _compute_charges(
+    entry_long_price: float,
+    entry_short_price: float,
+    exit_long_price: float,
+    exit_short_price: float,
+    lot_size: int,
+    approved_lots: int,
+) -> float:
+    """Convenience wrapper — returns total charges only."""
+    return _compute_charges_breakdown(
+        entry_long_price, entry_short_price,
+        exit_long_price, exit_short_price,
+        lot_size, approved_lots,
+    )["total"]
 
 
 # ── Main engine ───────────────────────────────────────────────────────────────
@@ -205,11 +227,12 @@ def run_paper_engine(
 
     Returns:
       {
-        "decisions":      [ {fields matching MinuteDecision}, ... ],
-        "trade_header":   { fields matching PaperTradeHeader } | None,
-        "minute_marks":   [ {fields matching PaperTradeMinuteMark}, ... ],
-        "trade_legs":     [ {fields matching PaperTradeLeg}, ... ],
-        "candle_series":  [ {session_id, series_type, candles}, ... ],
+        "decisions":           [ {fields matching MinuteDecision}, ... ],
+        "trade_header":        { fields matching PaperTradeHeader } | None,
+        "minute_marks":        [ {fields matching PaperTradeMinuteMark}, ... ],
+        "trade_legs":          [ {fields matching PaperTradeLeg}, ... ],
+        "candle_series":       [ {session_id, series_type, candles}, ... ],
+        "final_session_state": str,
       }
 
     Raises DataUnavailableError if spot candles cannot be fetched.
@@ -244,7 +267,6 @@ def run_paper_engine(
         )
     log.info("Nearest expiry from master: %s", expiry)
 
-    # Read lot size from live master (falls back to hardcoded if not found)
     lot_size = _lot_size_from_master(instrument, instruments_master)
     if lot_size is None:
         from app.services.entry_gates import _FALLBACK_LOT_SIZES
@@ -254,12 +276,9 @@ def run_paper_engine(
         log.info("Lot size from master: %d", lot_size)
 
     # ── 4. Pre-fetch ALL candidate option series ──────────────────────────────
-    # Generate all candidate strike pairs for both directions up-front so the
-    # replay loop has every possible price available without further API calls.
     bullish_candidates = generate_bullish_candidates(or_high)
     bearish_candidates = generate_bearish_candidates(or_low)
 
-    # Deduplicated set of (strike, opt_type) to fetch
     legs_to_fetch = set()
     for long_s, short_s in bullish_candidates:
         legs_to_fetch.add((long_s, "CE"))
@@ -268,14 +287,13 @@ def run_paper_engine(
         legs_to_fetch.add((long_s, "PE"))
         legs_to_fetch.add((short_s, "PE"))
 
-    # Also find monthly expiry (last expiry in trade month) for candle export
     monthly_expiry = _monthly_expiry_from_master(instrument, trade_date, instruments_master)
     if monthly_expiry and monthly_expiry == expiry:
-        monthly_expiry = None   # already weekly == monthly; no need to fetch twice
+        monthly_expiry = None
     log.info("Monthly expiry: %s", monthly_expiry)
 
     option_price_index: Dict[Tuple[int, str], Dict[int, float]] = {}
-    option_candles_raw: Dict[Tuple[int, str], List[Dict]] = {}  # raw candles for export
+    option_candles_raw: Dict[Tuple[int, str], List[Dict]] = {}
 
     for strike, opt_type in sorted(legs_to_fetch):
         token = resolve_instrument_token(
@@ -301,29 +319,57 @@ def run_paper_engine(
     trade_legs: List[Dict] = []
     active_trade: Optional[Dict] = None
 
+    # Phase 1 session state machine
+    current_session_state = "OBSERVING"
+    trade_closed_this_session = False
+    prev_was_tentative_breakout = False
+
     for idx, candle in enumerate(spot_candles):
         current_time, ts = _candle_time(candle)
         or_ready = idx >= OR_WINDOW_MINUTES   # True from index 15 (09:30)
 
-        # Previous candle close — for G4 next-candle follow-through check
         prev_candle_close: Optional[float] = (
             float(spot_candles[idx - 1]["close"]) if idx > 0 else None
         )
 
-        def opt_price(strike, otype) -> Tuple[Optional[float], int]:
-            return _get_price_at(option_price_index.get((strike, otype), {}), idx)
+        def opt_price(strike, otype, _idx=idx) -> Tuple[Optional[float], int]:
+            return _get_price_at(option_price_index.get((strike, otype), {}), _idx)
+
+        # ── SESSION_COMPLETE: trade already closed — no re-entry ──────────────
+        if trade_closed_this_session:
+            current_session_state = "SESSION_COMPLETE"
+            decisions.append({
+                "session_id":          session_id,
+                "timestamp":           ts,
+                "spot_close":          float(candle["close"]),
+                "opening_range_high":  or_high,
+                "opening_range_low":   or_low,
+                "trade_state":         "NO_OPEN_TRADE",
+                "signal_state":        "SKIP_MINUTE",
+                "action":              "NO_TRADE",
+                "reason_code":         "SESSION_COMPLETE",
+                "reason_text":         "Trade already closed for this session. No re-entry.",
+                "candidate_structure": None,
+                "computed_max_loss":   None,
+                "computed_target":     None,
+                "session_state":       current_session_state,
+                "signal_substate":     None,
+                "rejection_gate":      None,
+                "price_freshness_json": None,
+            })
+            continue
 
         if active_trade is None:
             # ── No open trade: run entry gates ────────────────────────────────
-            # Build option price snapshot for all candidate strikes (both dirs)
             prices: Dict[Tuple[int, str], float] = {}
-            max_staleness = 0
+            price_staleness_map: Dict[str, int] = {}
+
             for (s, t) in legs_to_fetch:
                 p, stale = opt_price(s, t)
                 if p is not None:
                     prices[(s, t)] = p
-                    if stale > max_staleness:
-                        max_staleness = stale
+                    if stale > 0:
+                        price_staleness_map[f"{s}_{t}_age_min"] = stale
 
             gate = evaluate_gates(
                 candle=candle,
@@ -337,99 +383,209 @@ def run_paper_engine(
                 expiry=expiry,
                 prev_candle_close=prev_candle_close,
                 lot_size=lot_size,
+                current_time=current_time,
             )
 
-            # candidate_structure carries full economics on ENTER;
-            # pre_entry_snapshot carries partial economics on NO_TRADE (G3+)
+            # ── Derive signal_substate ────────────────────────────────────────
+            signal_substate: Optional[str] = None
+            if gate.reason_code == "FAILED_BREAKOUT_OR_NO_FOLLOWTHROUGH":
+                signal_substate = "TENTATIVE_BREAKOUT"
+            elif prev_was_tentative_breakout:
+                if gate.reason_code == "NO_BREAKOUT_CONFIRMATION":
+                    signal_substate = "FAILED_FIRST_BREAKOUT"
+                else:
+                    # Breakout held through G4 (may or may not have entered)
+                    signal_substate = "CONFIRMED_BREAKOUT"
+
+            # ── Update session state ──────────────────────────────────────────
+            if not or_ready:
+                current_session_state = "OBSERVING"
+            elif gate.action == "ENTER":
+                current_session_state = "OPEN_TRADE"
+            elif signal_substate == "TENTATIVE_BREAKOUT":
+                current_session_state = "TENTATIVE_SIGNAL"
+            elif signal_substate in ("FAILED_FIRST_BREAKOUT", None):
+                current_session_state = "OBSERVING"
+            # CONFIRMED_BREAKOUT but no entry (G6/G7 blocked) → still OBSERVING
+            elif signal_substate == "CONFIRMED_BREAKOUT" and gate.action != "ENTER":
+                current_session_state = "OBSERVING"
+
+            # ── Advance tentative-breakout tracker for next minute ────────────
+            # (use original gate.reason_code, before any stale override below)
+            prev_was_tentative_breakout = (
+                gate.reason_code == "FAILED_BREAKOUT_OR_NO_FOLLOWTHROUGH"
+            )
+
+            # ── Stale price check for entry ───────────────────────────────────
+            # Require FRESH (current-minute) option prices for any entry.
+            # Any backfill > 0 min → reject with STALE_OPTION_PRICE so the audit
+            # trail records that the signal was confirmed but prices were stale.
+            stale_entry_rejected = False
+            if gate.action == "ENTER":
+                l_stale = price_staleness_map.get(
+                    f"{gate.long_strike}_{gate.opt_type}_age_min", 0
+                )
+                s_stale = price_staleness_map.get(
+                    f"{gate.short_strike}_{gate.opt_type}_age_min", 0
+                )
+                max_entry_stale = max(l_stale, s_stale)
+                if max_entry_stale > 0:
+                    stale_entry_rejected = True
+                    effective_action      = "NO_TRADE"
+                    effective_reason_code = "STALE_OPTION_PRICE"
+                    effective_reason_text = (
+                        f"Entry blocked: prices are {max_entry_stale} min stale "
+                        f"(long {gate.long_strike}{gate.opt_type}: {l_stale} min, "
+                        f"short {gate.short_strike}{gate.opt_type}: {s_stale} min). "
+                        f"Fresh prices required at entry."
+                    )
+                    rejection_gate        = "FRESHNESS"
+                    current_session_state = "OBSERVING"
+                    # signal_substate stays CONFIRMED_BREAKOUT — the signal was real
+                else:
+                    effective_action      = gate.action
+                    effective_reason_code = gate.reason_code
+                    effective_reason_text = gate.reason_text
+                    rejection_gate        = None
+            else:
+                effective_action      = gate.action
+                effective_reason_code = gate.reason_code
+                effective_reason_text = gate.reason_text
+                rejection_gate        = _REASON_TO_GATE.get(gate.reason_code)
+
+            # ── Build audit structure ─────────────────────────────────────────
             audit_structure = (
                 gate.candidate_structure
                 if gate.action == "ENTER"
                 else gate.pre_entry_snapshot
             )
-            if audit_structure and max_staleness > 0:
-                audit_structure = {**audit_structure, "max_price_staleness_min": max_staleness}
+
+            # ── price_freshness_json ──────────────────────────────────────────
+            price_freshness_json = price_staleness_map if price_staleness_map else None
 
             decisions.append({
-                "session_id": session_id,
-                "timestamp": ts,
-                "spot_close": float(candle["close"]),
-                "opening_range_high": or_high,
-                "opening_range_low": or_low,
-                "trade_state": "NO_OPEN_TRADE",
-                "signal_state": "EVALUATE" if or_ready else "SKIP_MINUTE",
-                "action": gate.action,
-                "reason_code": gate.reason_code,
-                "reason_text": gate.reason_text,
+                "session_id":          session_id,
+                "timestamp":           ts,
+                "spot_close":          float(candle["close"]),
+                "opening_range_high":  or_high,
+                "opening_range_low":   or_low,
+                "trade_state":         "NO_OPEN_TRADE",
+                "signal_state":        "EVALUATE" if or_ready else "SKIP_MINUTE",
+                "action":              effective_action,
+                "reason_code":         effective_reason_code,
+                "reason_text":         effective_reason_text,
                 "candidate_structure": audit_structure,
-                "computed_max_loss": gate.computed_max_loss,
-                "computed_target": gate.computed_target,
+                "computed_max_loss":   gate.computed_max_loss,
+                "computed_target":     gate.computed_target,
+                "session_state":       current_session_state,
+                "signal_substate":     signal_substate,
+                "rejection_gate":      rejection_gate,
+                "price_freshness_json": price_freshness_json,
             })
 
-            if gate.action == "ENTER":
+            if gate.action == "ENTER" and not stale_entry_rejected:
                 trade_id = uuid.uuid4()
                 long_ep, _ = opt_price(gate.long_strike, gate.opt_type)
                 short_ep, _ = opt_price(gate.short_strike, gate.opt_type)
 
                 active_trade = {
-                    "id": trade_id,
-                    "entry_time": ts,
-                    "bias": gate.bias,
-                    "long_strike": gate.long_strike,
-                    "short_strike": gate.short_strike,
-                    "opt_type": gate.opt_type,
-                    "entry_debit": gate.entry_debit,
-                    "approved_lots": gate.approved_lots,
-                    "lot_size": lot_size,
-                    "total_max_loss": gate.computed_max_loss,
-                    "target_profit": gate.computed_target,
-                    "expiry": expiry,
-                    # Store entry prices for charges calculation at close
-                    "_entry_long_price": round(long_ep, 2) if long_ep else 0.0,
+                    "id":               trade_id,
+                    "entry_time":       ts,
+                    "bias":             gate.bias,
+                    "long_strike":      gate.long_strike,
+                    "short_strike":     gate.short_strike,
+                    "opt_type":         gate.opt_type,
+                    "entry_debit":      gate.entry_debit,
+                    "approved_lots":    gate.approved_lots,
+                    "lot_size":         lot_size,
+                    "total_max_loss":   gate.computed_max_loss,
+                    "target_profit":    gate.computed_target,
+                    "expiry":           expiry,
+                    "_entry_long_price":  round(long_ep, 2) if long_ep else 0.0,
                     "_entry_short_price": round(short_ep, 2) if short_ep else 0.0,
+                    # Immutable context frozen at entry
+                    "_entry_reason_code": gate.reason_code,
+                    "_entry_reason_text": gate.reason_text,
+                    "_risk_cap":          capital * _CFG["max_risk_pct"],
+                    "_strategy_params": {
+                        "strategy_name":            _CFG["strategy_name"],
+                        "strategy_version":         _CFG["strategy_version"],
+                        "or_window_minutes":        _CFG["or_window_minutes"],
+                        "breakout_buffer_pct":      _CFG["breakout_buffer_pct"],
+                        "max_risk_pct":             _CFG["max_risk_pct"],
+                        "target_profit_pct":        _CFG["target_profit_pct"],
+                        "square_off_time":          str(_CFG["square_off_time"]),
+                        "min_minutes_left_to_enter": _CFG["min_minutes_left_to_enter"],
+                        "n_candidate_spreads":      _CFG["n_candidate_spreads"],
+                        "lot_size":                 lot_size,
+                        "capital":                  capital,
+                    },
                 }
                 trade_legs = [
                     {
-                        "trade_id": trade_id,
-                        "leg_side": "LONG",
+                        "trade_id":    trade_id,
+                        "leg_side":    "LONG",
                         "option_type": gate.opt_type,
-                        "strike": gate.long_strike,
-                        "expiry": expiry,
+                        "strike":      gate.long_strike,
+                        "expiry":      expiry,
                         "entry_price": round(long_ep, 2) if long_ep else None,
-                        "exit_price": None,
+                        "exit_price":  None,
                     },
                     {
-                        "trade_id": trade_id,
-                        "leg_side": "SHORT",
+                        "trade_id":    trade_id,
+                        "leg_side":    "SHORT",
                         "option_type": gate.opt_type,
-                        "strike": gate.short_strike,
-                        "expiry": expiry,
+                        "strike":      gate.short_strike,
+                        "expiry":      expiry,
                         "entry_price": round(short_ep, 2) if short_ep else None,
-                        "exit_price": None,
+                        "exit_price":  None,
                     },
                 ]
 
         else:
             # ── Trade open: run exit engine ───────────────────────────────────
+            current_session_state = "OPEN_TRADE"
             long_p, long_stale   = opt_price(active_trade["long_strike"],  active_trade["opt_type"])
             short_p, short_stale = opt_price(active_trade["short_strike"], active_trade["opt_type"])
 
+            price_freshness_json: Optional[Dict] = None
+            if long_stale > 0 or short_stale > 0:
+                price_freshness_json = {
+                    "long_age_min":  long_stale,
+                    "short_age_min": short_stale,
+                }
+
             if long_p is None or short_p is None:
                 decisions.append({
-                    "session_id": session_id,
-                    "timestamp": ts,
-                    "spot_close": float(candle["close"]),
-                    "opening_range_high": or_high,
-                    "opening_range_low": or_low,
-                    "trade_state": "OPEN_TRADE",
-                    "signal_state": "SKIP_MINUTE",
-                    "action": "HOLD",
-                    "reason_code": "DATA_GAP",
-                    "reason_text": "Option price data unavailable for this minute; holding.",
+                    "session_id":          session_id,
+                    "timestamp":           ts,
+                    "spot_close":          float(candle["close"]),
+                    "opening_range_high":  or_high,
+                    "opening_range_low":   or_low,
+                    "trade_state":         "OPEN_TRADE",
+                    "signal_state":        "SKIP_MINUTE",
+                    "action":              "HOLD",
+                    "reason_code":         "DATA_GAP",
+                    "reason_text":         "Option price data unavailable for this minute; holding.",
                     "candidate_structure": None,
-                    "computed_max_loss": active_trade["total_max_loss"],
-                    "computed_target": active_trade["target_profit"],
+                    "computed_max_loss":   active_trade["total_max_loss"],
+                    "computed_target":     active_trade["target_profit"],
+                    "session_state":       current_session_state,
+                    "signal_substate":     None,
+                    "rejection_gate":      None,
+                    "price_freshness_json": price_freshness_json,
                 })
                 continue
+
+            # Estimate round-trip charges using current market prices as exit proxy
+            estimated_charges = _compute_charges(
+                entry_long_price=active_trade["_entry_long_price"],
+                entry_short_price=active_trade["_entry_short_price"],
+                exit_long_price=round(long_p, 2),
+                exit_short_price=round(short_p, 2),
+                lot_size=active_trade["lot_size"],
+                approved_lots=active_trade["approved_lots"],
+            )
 
             ev = evaluate_exit(
                 current_time=current_time,
@@ -440,47 +596,54 @@ def run_paper_engine(
                 approved_lots=active_trade["approved_lots"],
                 total_max_loss=active_trade["total_max_loss"],
                 target_profit=active_trade["target_profit"],
+                estimated_charges=estimated_charges,
             )
 
-            staleness_note = (
-                {"long_price_staleness_min": long_stale, "short_price_staleness_min": short_stale}
-                if (long_stale > 0 or short_stale > 0) else None
-            )
+            if ev.action != "HOLD":
+                current_session_state = "TRADE_CLOSED"
 
             decisions.append({
-                "session_id": session_id,
-                "timestamp": ts,
-                "spot_close": float(candle["close"]),
-                "opening_range_high": or_high,
-                "opening_range_low": or_low,
-                "trade_state": "OPEN_TRADE",
-                "signal_state": "EVALUATE",
-                "action": ev.action,
-                "reason_code": ev.action,
-                "reason_text": ev.reason,
-                "candidate_structure": staleness_note,
-                "computed_max_loss": active_trade["total_max_loss"],
-                "computed_target": active_trade["target_profit"],
+                "session_id":          session_id,
+                "timestamp":           ts,
+                "spot_close":          float(candle["close"]),
+                "opening_range_high":  or_high,
+                "opening_range_low":   or_low,
+                "trade_state":         "OPEN_TRADE",
+                "signal_state":        "EVALUATE",
+                "action":              ev.action,
+                "reason_code":         ev.action,
+                "reason_text":         ev.reason,
+                "candidate_structure": None,
+                "computed_max_loss":   active_trade["total_max_loss"],
+                "computed_target":     active_trade["target_profit"],
+                "session_state":       current_session_state,
+                "signal_substate":     None,
+                "rejection_gate":      None,
+                "price_freshness_json": price_freshness_json,
             })
 
             minute_marks.append({
-                "trade_id": active_trade["id"],
-                "timestamp": ts,
-                "long_leg_price": round(long_p, 2),
-                "short_leg_price": round(short_p, 2),
-                "current_spread_value": round(ev.current_spread, 2),
-                "mtm_per_lot": round(ev.mtm_per_lot, 2),
-                "total_mtm": round(ev.total_mtm, 2),
-                "distance_to_target": round(ev.distance_to_target, 2),
-                "distance_to_stop": round(ev.distance_to_stop, 2),
-                "action": ev.action,
-                "reason": ev.reason[:200],
+                "trade_id":                active_trade["id"],
+                "timestamp":               ts,
+                "long_leg_price":          round(long_p, 2),
+                "short_leg_price":         round(short_p, 2),
+                "current_spread_value":    round(ev.current_spread, 2),
+                "mtm_per_lot":             round(ev.mtm_per_lot, 2),
+                "total_mtm":               round(ev.total_mtm, 2),
+                "distance_to_target":      round(ev.distance_to_target, 2),
+                "distance_to_stop":        round(ev.distance_to_stop, 2),
+                "action":                  ev.action,
+                "reason":                  ev.reason[:200],
+                "gross_mtm":               round(ev.gross_mtm, 2),
+                "estimated_exit_charges":  round(ev.estimated_exit_charges, 2),
+                "estimated_net_mtm":       round(ev.estimated_net_mtm, 2),
+                "price_freshness_json":    price_freshness_json,
             })
 
             if ev.action != "HOLD":
-                # ── Close trade: compute gross + net P&L ──────────────────
+                # ── Close trade: final gross + net P&L + charges breakdown ────
                 realized_gross = round(ev.total_mtm, 2)
-                charges = _compute_charges(
+                charges_breakdown = _compute_charges_breakdown(
                     entry_long_price=active_trade["_entry_long_price"],
                     entry_short_price=active_trade["_entry_short_price"],
                     exit_long_price=round(long_p, 2),
@@ -488,6 +651,7 @@ def run_paper_engine(
                     lot_size=active_trade["lot_size"],
                     approved_lots=active_trade["approved_lots"],
                 )
+                charges = charges_breakdown["total"]
                 realized_net = round(realized_gross - charges, 2)
 
                 for leg in trade_legs:
@@ -497,26 +661,36 @@ def run_paper_engine(
                         leg["exit_price"] = round(short_p, 2)
 
                 trade_header = {
-                    "id": active_trade["id"],
-                    "session_id": session_id,
-                    "entry_time": active_trade["entry_time"],
-                    "exit_time": ts,
-                    "bias": active_trade["bias"],
-                    "expiry": active_trade["expiry"],
-                    "lot_size": active_trade["lot_size"],
-                    "approved_lots": active_trade["approved_lots"],
-                    "entry_debit": active_trade["entry_debit"],
-                    "total_max_loss": active_trade["total_max_loss"],
-                    "target_profit": active_trade["target_profit"],
-                    "realized_gross_pnl": realized_gross,
-                    "realized_net_pnl": realized_net,
-                    "status": "CLOSED",
-                    "exit_reason": ev.action,
-                    "long_strike": active_trade["long_strike"],
-                    "short_strike": active_trade["short_strike"],
-                    "option_type": active_trade["opt_type"],
+                    "id":                     active_trade["id"],
+                    "session_id":             session_id,
+                    "entry_time":             active_trade["entry_time"],
+                    "exit_time":              ts,
+                    "bias":                   active_trade["bias"],
+                    "expiry":                 active_trade["expiry"],
+                    "lot_size":               active_trade["lot_size"],
+                    "approved_lots":          active_trade["approved_lots"],
+                    "entry_debit":            active_trade["entry_debit"],
+                    "total_max_loss":         active_trade["total_max_loss"],
+                    "target_profit":          active_trade["target_profit"],
+                    "realized_gross_pnl":     realized_gross,
+                    "realized_net_pnl":       realized_net,
+                    "charges":                charges,
+                    "charges_breakdown_json": charges_breakdown,
+                    "status":                 "CLOSED",
+                    "exit_reason":            ev.action,
+                    "long_strike":            active_trade["long_strike"],
+                    "short_strike":           active_trade["short_strike"],
+                    "option_type":            active_trade["opt_type"],
+                    # Immutable strategy context
+                    "strategy_name":          _CFG["strategy_name"],
+                    "strategy_version":       _CFG["strategy_version"],
+                    "strategy_params_json":   active_trade["_strategy_params"],
+                    "risk_cap":               active_trade["_risk_cap"],
+                    "entry_reason_code":      active_trade["_entry_reason_code"],
+                    "entry_reason_text":      active_trade["_entry_reason_text"],
                 }
                 active_trade = None
+                trade_closed_this_session = True  # lock: no re-entry
 
     # ── 6. Trade still open at end of data (failsafe) ────────────────────────
     if active_trade is not None and trade_header is None:
@@ -533,7 +707,7 @@ def run_paper_engine(
                 * active_trade["approved_lots"],
                 2,
             )
-            charges = _compute_charges(
+            charges_breakdown = _compute_charges_breakdown(
                 entry_long_price=active_trade["_entry_long_price"],
                 entry_short_price=active_trade["_entry_short_price"],
                 exit_long_price=round(long_p, 2),
@@ -541,10 +715,13 @@ def run_paper_engine(
                 lot_size=active_trade["lot_size"],
                 approved_lots=active_trade["approved_lots"],
             )
+            charges = charges_breakdown["total"]
             realized_net = round(realized_gross - charges, 2)
         else:
-            realized_gross = 0.0
-            realized_net = 0.0
+            realized_gross     = 0.0
+            realized_net       = 0.0
+            charges            = 0.0
+            charges_breakdown  = {"brokerage": 0.0, "stt": 0.0, "exchange_charges": 0.0, "gst": 0.0, "total": 0.0}
 
         for leg in trade_legs:
             leg["exit_price"] = (
@@ -554,37 +731,45 @@ def run_paper_engine(
             )
 
         trade_header = {
-            "id": active_trade["id"],
-            "session_id": session_id,
-            "entry_time": active_trade["entry_time"],
-            "exit_time": last_ts,
-            "bias": active_trade["bias"],
-            "expiry": active_trade["expiry"],
-            "lot_size": active_trade["lot_size"],
-            "approved_lots": active_trade["approved_lots"],
-            "entry_debit": active_trade["entry_debit"],
-            "total_max_loss": active_trade["total_max_loss"],
-            "target_profit": active_trade["target_profit"],
-            "realized_gross_pnl": realized_gross,
-            "realized_net_pnl": realized_net,
-            "status": "CLOSED",
-            "exit_reason": "EXIT_TIME",
-            "long_strike": active_trade["long_strike"],
-            "short_strike": active_trade["short_strike"],
-            "option_type": active_trade["opt_type"],
+            "id":                     active_trade["id"],
+            "session_id":             session_id,
+            "entry_time":             active_trade["entry_time"],
+            "exit_time":              last_ts,
+            "bias":                   active_trade["bias"],
+            "expiry":                 active_trade["expiry"],
+            "lot_size":               active_trade["lot_size"],
+            "approved_lots":          active_trade["approved_lots"],
+            "entry_debit":            active_trade["entry_debit"],
+            "total_max_loss":         active_trade["total_max_loss"],
+            "target_profit":          active_trade["target_profit"],
+            "realized_gross_pnl":     realized_gross,
+            "realized_net_pnl":       realized_net,
+            "charges":                charges,
+            "charges_breakdown_json": charges_breakdown,
+            "status":                 "CLOSED",
+            "exit_reason":            "EXIT_TIME",
+            "long_strike":            active_trade["long_strike"],
+            "short_strike":           active_trade["short_strike"],
+            "option_type":            active_trade["opt_type"],
+            # Immutable strategy context
+            "strategy_name":          _CFG["strategy_name"],
+            "strategy_version":       _CFG["strategy_version"],
+            "strategy_params_json":   active_trade["_strategy_params"],
+            "risk_cap":               active_trade["_risk_cap"],
+            "entry_reason_code":      active_trade["_entry_reason_code"],
+            "entry_reason_text":      active_trade["_entry_reason_text"],
         }
+        current_session_state = "TRADE_CLOSED"
 
     # ── 7. Build candle series for export ────────────────────────────────────
     candle_series: List[Dict] = [
         {
-            "session_id": session_id,
+            "session_id":  session_id,
             "series_type": "SPOT",
-            "candles": _serialize_candles(spot_candles),
+            "candles":     _serialize_candles(spot_candles),
         }
     ]
 
-    # If a trade was opened, include weekly + monthly option candles for the
-    # actual trade legs (long + short strike, both expiries if available).
     if trade_header:
         long_s   = trade_header["long_strike"]
         short_s  = trade_header["short_strike"]
@@ -594,12 +779,11 @@ def run_paper_engine(
             raw = option_candles_raw.get((strike, opt_type))
             if raw:
                 candle_series.append({
-                    "session_id": session_id,
+                    "session_id":  session_id,
                     "series_type": f"{strike}_{opt_type}_WEEKLY",
-                    "candles": _serialize_candles(raw),
+                    "candles":     _serialize_candles(raw),
                 })
 
-        # Monthly expiry option candles (if different from weekly)
         if monthly_expiry:
             monthly_legs = set()
             for strike in (long_s, short_s):
@@ -611,9 +795,9 @@ def run_paper_engine(
                     try:
                         m_candles = fetch_candles_with_token(token, trade_date, access_token)
                         candle_series.append({
-                            "session_id": session_id,
+                            "session_id":  session_id,
                             "series_type": f"{strike}_{opt_type}_MONTHLY",
-                            "candles": _serialize_candles(m_candles),
+                            "candles":     _serialize_candles(m_candles),
                         })
                         log.info(
                             "Fetched %d monthly candles for %s%s exp=%s",
@@ -625,17 +809,19 @@ def run_paper_engine(
                         )
 
     log.info(
-        "Engine complete: %d decisions, trade=%s, %d marks, %d candle series",
+        "Engine complete: %d decisions, trade=%s, %d marks, %d candle series, final_state=%s",
         len(decisions),
         "YES" if trade_header else "NO",
         len(minute_marks),
         len(candle_series),
+        current_session_state,
     )
 
     return {
-        "decisions":     decisions,
-        "trade_header":  trade_header,
-        "minute_marks":  minute_marks,
-        "trade_legs":    trade_legs,
-        "candle_series": candle_series,
+        "decisions":           decisions,
+        "trade_header":        trade_header,
+        "minute_marks":        minute_marks,
+        "trade_legs":          trade_legs,
+        "candle_series":       candle_series,
+        "final_session_state": current_session_state,
     }

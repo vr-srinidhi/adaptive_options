@@ -25,7 +25,7 @@ Key design notes
 """
 import math
 from dataclasses import dataclass, field
-from datetime import date as date_type
+from datetime import date as date_type, time as time_type
 from typing import Dict, List, Optional, Tuple
 
 from app.services.opening_range import (
@@ -36,12 +36,24 @@ from app.services.opening_range import (
     is_bullish_breakout,
 )
 
-# ── Strategy config ───────────────────────────────────────────────────────────
-MAX_RISK_PCT = 0.02    # G6: max 2% of capital as max loss
-TARGET_PCT   = 0.005   # profit target = 0.5% of capital
+# ── Strategy config (sourced from central config) ─────────────────────────────
+from app.services.strategy_config import STRATEGY_CONFIG as _CFG
+
+MAX_RISK_PCT = _CFG["max_risk_pct"]        # G6: max 2% of capital as max loss
+TARGET_PCT   = _CFG["target_profit_pct"]   # profit target = 0.5% of capital
+
+_SQUARE_OFF_TIME           = _CFG["square_off_time"]            # 15:20
+_MIN_MINUTES_LEFT_TO_ENTER = _CFG["min_minutes_left_to_enter"]  # reject if < 20 mins remain
 
 # Fallback lot sizes — used only if instruments master lookup fails
-_FALLBACK_LOT_SIZES: Dict[str, int] = {"NIFTY": 75, "BANKNIFTY": 35}
+_FALLBACK_LOT_SIZES: Dict[str, int] = _CFG["fallback_lot_sizes"]
+
+
+def _minutes_until_squareoff(current_time: time_type) -> int:
+    """Return minutes remaining from current_time until SQUARE_OFF_TIME (may be negative)."""
+    sq  = _SQUARE_OFF_TIME.hour * 60 + _SQUARE_OFF_TIME.minute
+    cur = current_time.hour * 60 + current_time.minute
+    return sq - cur
 
 
 # ── Result dataclass ──────────────────────────────────────────────────────────
@@ -82,6 +94,7 @@ def evaluate_gates(
     expiry: date_type,
     prev_candle_close: Optional[float] = None,  # for G4 follow-through
     lot_size: Optional[int] = None,             # from instruments master
+    current_time: Optional[time_type] = None,   # for TOO_LATE_TO_ENTER check
 ) -> GateResult:
     """
     Evaluate G1–G7 for the given minute candle.
@@ -115,6 +128,20 @@ def evaluate_gates(
             reason_code="ACTIVE_TRADE_EXISTS",
             reason_text="A paper trade is already open. Only one trade per session.",
         )
+
+    # ── G2b: Enough time left before forced square-off ────────────────────────
+    if current_time is not None:
+        mins_left = _minutes_until_squareoff(current_time)
+        if mins_left < _MIN_MINUTES_LEFT_TO_ENTER:
+            return GateResult(
+                action="NO_TRADE",
+                reason_code="TOO_LATE_TO_ENTER",
+                reason_text=(
+                    f"Only {mins_left} minute(s) until square-off at "
+                    f"{_SQUARE_OFF_TIME.strftime('%H:%M')}; "
+                    f"need ≥ {_MIN_MINUTES_LEFT_TO_ENTER} to enter."
+                ),
+            )
 
     # ── G3: Spot has closed beyond OR boundary ────────────────────────────────
     bullish = is_bullish_breakout(close, or_high)
@@ -189,7 +216,7 @@ def evaluate_gates(
     )
     best_snapshot: Optional[Dict] = None
 
-    for long_s, short_s in candidates:
+    for rank, (long_s, short_s) in enumerate(candidates, start=1):
         long_p  = option_prices.get((long_s, opt_type))
         short_p = option_prices.get((short_s, opt_type))
 
@@ -216,7 +243,9 @@ def evaluate_gates(
             )
             best_snapshot = {
                 "bias": bias, "opt_type": opt_type,
+                "candidate_rank": rank,
                 "long_strike": long_s, "short_strike": short_s,
+                "spread_width": abs(short_s - long_s),
                 "long_price": round(long_p, 2), "short_price": round(short_p, 2),
                 "spread_debit": round(spread_debit, 2),
                 "max_loss_per_lot": round(max_loss_per_lot, 2),
@@ -243,7 +272,9 @@ def evaluate_gates(
             )
             best_snapshot = {
                 "bias": bias, "opt_type": opt_type,
+                "candidate_rank": rank,
                 "long_strike": long_s, "short_strike": short_s,
+                "spread_width": spread_width,
                 "long_price": round(long_p, 2), "short_price": round(short_p, 2),
                 "spread_debit": round(spread_debit, 2),
                 "approved_lots": approved_lots,
@@ -260,8 +291,10 @@ def evaluate_gates(
         candidate = {
             "bias": bias,
             "opt_type": opt_type,
+            "candidate_rank": rank,
             "long_strike": long_s,
             "short_strike": short_s,
+            "spread_width": spread_width,
             "long_price": round(long_p, 2),
             "short_price": round(short_p, 2),
             "spread_debit": round(spread_debit, 2),
