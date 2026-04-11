@@ -174,6 +174,9 @@ class TestApr7BullishExitTarget:
         assert th["short_strike"]  == 22150
         assert th["option_type"]   == "CE"
         assert th["realized_gross_pnl"] == pytest.approx(24750.0)
+        assert th["selection_method"] == "ranked_candidate_selection_v1"
+        assert th["selected_candidate_rank"] == 1
+        assert th["selected_candidate_score"] is not None
 
     def test_final_state_is_session_complete(self):
         assert self._run()["final_session_state"] == "SESSION_COMPLETE"
@@ -212,6 +215,9 @@ class TestApr7BullishExitTarget:
         assert d16["signal_substate"] == "CONFIRMED_BREAKOUT"
         assert d16["action"]          == "ENTER"
         assert d16["reason_code"]     == "ENTER_TRADE"
+        assert d16["candidate_ranking_json"] is not None
+        assert d16["selected_candidate_rank"] == 1
+        assert d16["selected_candidate_score"] is not None
 
 
 # ── Scenario 2: Apr 8 — Bearish EXIT_STOP ─────────────────────────────────────
@@ -271,6 +277,8 @@ class TestApr8BearishExitStop:
         assert th["short_strike"] == 21850
         assert th["option_type"]  == "PE"
         assert th["realized_gross_pnl"] < 0
+        assert th["selected_candidate_rank"] == 1
+        assert th["selected_candidate_score"] is not None
 
     def test_final_state_is_session_complete(self):
         assert self._run()["final_session_state"] == "SESSION_COMPLETE"
@@ -408,6 +416,8 @@ class TestApr10StaleOptionPrice:
         d = stale_decisions[0]
         assert d["action"]         == "NO_TRADE"
         assert d["rejection_gate"] == "FRESHNESS"
+        assert d["candidate_ranking_json"] is not None
+        assert d["selected_candidate_rank"] is None
 
     def test_signal_substate_is_confirmed_despite_staleness(self):
         """

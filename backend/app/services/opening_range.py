@@ -88,14 +88,14 @@ def generate_bullish_candidates(
     Generate n Bull Call Spread candidate pairs around the OR-high-derived base strike.
 
     Each tuple is (long_strike, short_strike) where short_strike = long_strike + step.
-    Ordering: ATM-first (offset 0), then alternating ITM/OTM so the most natural
-    spread is tried before wider/narrower alternatives.
+    Phase 2 keeps a fixed width and expands the search universe around the OR
+    reference strike instead of forcing the reference strike itself.
 
     Example (OR high=22893, step=50, n=5):
-      [(22900,22950), (22850,22900), (22950,23000), (22800,22850), (23000,23050)]
+      [(22800,22850), (22850,22900), (22900,22950), (22950,23000), (23000,23050)]
     """
     base = int(math.ceil(or_high / step)) * step
-    offsets = [0, -1, 1, -2, 2][:n]
+    offsets = [-2, -1, 0, 1, 2][:n]
     return [(base + o * step, base + o * step + step) for o in offsets]
 
 
@@ -108,11 +108,12 @@ def generate_bearish_candidates(
     Generate n Bear Put Spread candidate pairs around the OR-low-derived base strike.
 
     Each tuple is (long_strike, short_strike) where short_strike = long_strike - step.
-    Ordering: ATM-first (offset 0), then alternating ITM/OTM.
+    Phase 2 keeps a fixed width and expands the search universe around the OR
+    reference strike instead of forcing the reference strike itself.
 
     Example (OR low=22719, step=50, n=5):
-      [(22700,22650), (22750,22700), (22650,22600), (22800,22750), (22600,22550)]
+      [(22800,22750), (22750,22700), (22700,22650), (22650,22600), (22600,22550)]
     """
     base = int(math.floor(or_low / step)) * step
-    offsets = [0, 1, -1, 2, -2][:n]
+    offsets = [2, 1, 0, -1, -2][:n]
     return [(base + o * step, base + o * step - step) for o in offsets]
