@@ -356,9 +356,12 @@ class TestApr9NoBreakout:
 class TestApr10StaleOptionPrice:
     """
     Breakout confirmed at idx 16 (09:31) — all gates pass — but option
-    price index only covers indices 0–10 (11 candles).
-    At idx 16 the staleness is 16−10=6 minutes which is beyond the configured
-    5-minute freshness threshold, so the engine must block entry
+    price index only covers indices 0–14 (15 candles).
+    At idx 16 the staleness is 16−14=2 minutes, which the selector can still
+    tolerate for ranking, but the engine must block for entry because
+    entry quotes must be current-minute fresh.
+
+    The engine must block entry
     with reason_code=STALE_OPTION_PRICE / rejection_gate=FRESHNESS.
 
     The signal_substate must remain CONFIRMED_BREAKOUT (the signal was real;
@@ -379,10 +382,10 @@ class TestApr10StaleOptionPrice:
         22050.0,   # idx 17 — back inside range, NO_BREAKOUT_CONFIRMATION
     ])
 
-    # Only 11 candles for each CE leg — indices 0–10 (last fresh price = idx 10).
-    # At idx 16 (spot candle index 16), backfill → staleness = 16 − 10 = 6.
-    CE_LONG_STALE  = _option_series(2026, 4, 10, [50]*10 + [60])   # 11 candles
-    CE_SHORT_STALE = _option_series(2026, 4, 10, [25]*10 + [30])   # 11 candles
+    # Only 15 candles for each CE leg — indices 0–14 (last fresh price = idx 14).
+    # At idx 16 (spot candle index 16), backfill → staleness = 16 − 14 = 2.
+    CE_LONG_STALE  = _option_series(2026, 4, 10, [50]*14 + [60])   # 15 candles
+    CE_SHORT_STALE = _option_series(2026, 4, 10, [25]*14 + [30])   # 15 candles
 
     def _fetch(self, token, trade_date, access_token):
         if token == TOKEN_SPOT:
@@ -439,8 +442,8 @@ class TestApr10StaleOptionPrice:
         ]
         pf = stale_decisions[0]["price_freshness_json"]
         assert pf is not None
-        assert pf.get("22100_CE_age_min") == 6
-        assert pf.get("22150_CE_age_min") == 6
+        assert pf.get("22100_CE_age_min") == 2
+        assert pf.get("22150_CE_age_min") == 2
 
     def test_final_state_is_observing_not_open_trade(self):
         """Stale rejection must leave session state as OBSERVING (not OPEN_TRADE)."""

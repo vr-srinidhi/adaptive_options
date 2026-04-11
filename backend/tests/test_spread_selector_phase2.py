@@ -169,3 +169,32 @@ class TestSpreadSelectorPhase2:
         assert selected["short_leg_age_min"] == 1
         assert selected["freshness_score"] < 1.0
         assert selected["rejection_reason"] is None
+
+    def test_mixed_rejections_collapse_to_no_valid_candidate_after_ranking(self):
+        market = {
+            (22000, "CE"): _market(90, 50_000, 500_000, age_min=6, is_backfilled=True),
+            (22050, "CE"): _market(60, 50_000, 500_000, age_min=6, is_backfilled=True),
+            (22100, "CE"): _market(35, 100_000, 1_000_000),
+            (22150, "CE"): _market(15, 0, 200_000),
+            (22200, "CE"): _market(5, 0, 0),
+            (22250, "CE"): _market(2, 0, 0),
+        }
+
+        result = select_spread_candidate(
+            bias="BULLISH",
+            reference_strike=22100,
+            spot_price=22130,
+            capital=2_500_000,
+            lot_size=75,
+            expiry="2026-04-16",
+            option_market=market,
+        )
+
+        assert result.selected_candidate is None
+        assert result.reason_code == "NO_VALID_CANDIDATE_AFTER_RANKING"
+        rejection_reasons = {
+            c["rejection_reason"]
+            for c in result.candidate_ranking_json["candidates"]
+            if c["has_usable_prices"] and c["rejection_reason"] is not None
+        }
+        assert {"STALE_OPTION_PRICE", "LOW_LIQUIDITY_REJECT"} <= rejection_reasons

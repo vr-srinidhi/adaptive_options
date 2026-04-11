@@ -351,20 +351,7 @@ def select_spread_candidate(
     for candidate in candidates:
         volume_score = _normalize(candidate["combined_volume"], volume_values)
         oi_score = _normalize(candidate["combined_oi"], oi_values)
-        volume_balance = (
-            min(candidate["long_leg_volume"], candidate["short_leg_volume"])
-            / max(candidate["long_leg_volume"], candidate["short_leg_volume"])
-            if max(candidate["long_leg_volume"], candidate["short_leg_volume"]) > 0
-            else 0.0
-        )
-        oi_balance = (
-            min(candidate["long_leg_oi"], candidate["short_leg_oi"])
-            / max(candidate["long_leg_oi"], candidate["short_leg_oi"])
-            if max(candidate["long_leg_oi"], candidate["short_leg_oi"]) > 0
-            else 0.0
-        )
-        balance_score = (volume_balance * 0.5) + (oi_balance * 0.5)
-        liquidity_score = ((volume_score * 0.6) + (oi_score * 0.4)) * balance_score
+        liquidity_score = (volume_score * 0.6) + (oi_score * 0.4)
         freshness_score = max(0.0, 1.0 - float(candidate["freshness_penalty"]))
         coverage_score = _normalize(candidate["target_coverage_ratio"], coverage_values)
         rr_score = _normalize(candidate["risk_reward_ratio"], rr_values)
@@ -396,6 +383,8 @@ def select_spread_candidate(
             breakdown = {
                 "target_coverage_score": _round(coverage_score, 4),
                 "liquidity_score": _round(liquidity_score, 4),
+                "volume_score": _round(volume_score, 4),
+                "oi_score": _round(oi_score, 4),
                 "risk_reward_score": _round(rr_score, 4),
                 "lot_score": _round(lot_score, 4),
                 "spot_distance_score": _round(spot_distance_score, 4),
@@ -416,6 +405,8 @@ def select_spread_candidate(
         else:
             candidate["score_breakdown"] = {
                 "liquidity_score": _round(liquidity_score, 4),
+                "volume_score": _round(volume_score, 4),
+                "oi_score": _round(oi_score, 4),
                 "spot_distance_score": _round(spot_distance_score, 4),
                 "freshness_score": _round(freshness_score, 4),
             }
