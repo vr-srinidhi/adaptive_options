@@ -60,6 +60,7 @@ _REASON_TO_GATE: Dict[str, str] = {
     "NO_HEDGE_AVAILABLE":                 "G5",
     "RISK_EXCEEDS_CAP":                   "G6",
     "TARGET_NOT_VIABLE":                  "G7",
+    "STALE_OPTION_PRICE":                 "FRESHNESS",
 }
 
 
@@ -410,11 +411,49 @@ def run_paper_engine(
                 current_session_state = "OBSERVING"
 
             # ── Advance tentative-breakout tracker for next minute ────────────
+            # (use original gate.reason_code, before any stale override below)
             prev_was_tentative_breakout = (
                 gate.reason_code == "FAILED_BREAKOUT_OR_NO_FOLLOWTHROUGH"
             )
 
-            # ── Build audit structure (candidate_structure without staleness) ─
+            # ── Stale price check for entry ───────────────────────────────────
+            # Require FRESH (current-minute) option prices for any entry.
+            # Any backfill > 0 min → reject with STALE_OPTION_PRICE so the audit
+            # trail records that the signal was confirmed but prices were stale.
+            stale_entry_rejected = False
+            if gate.action == "ENTER":
+                l_stale = price_staleness_map.get(
+                    f"{gate.long_strike}_{gate.opt_type}_age_min", 0
+                )
+                s_stale = price_staleness_map.get(
+                    f"{gate.short_strike}_{gate.opt_type}_age_min", 0
+                )
+                max_entry_stale = max(l_stale, s_stale)
+                if max_entry_stale > 0:
+                    stale_entry_rejected = True
+                    effective_action      = "NO_TRADE"
+                    effective_reason_code = "STALE_OPTION_PRICE"
+                    effective_reason_text = (
+                        f"Entry blocked: prices are {max_entry_stale} min stale "
+                        f"(long {gate.long_strike}{gate.opt_type}: {l_stale} min, "
+                        f"short {gate.short_strike}{gate.opt_type}: {s_stale} min). "
+                        f"Fresh prices required at entry."
+                    )
+                    rejection_gate        = "FRESHNESS"
+                    current_session_state = "OBSERVING"
+                    # signal_substate stays CONFIRMED_BREAKOUT — the signal was real
+                else:
+                    effective_action      = gate.action
+                    effective_reason_code = gate.reason_code
+                    effective_reason_text = gate.reason_text
+                    rejection_gate        = None
+            else:
+                effective_action      = gate.action
+                effective_reason_code = gate.reason_code
+                effective_reason_text = gate.reason_text
+                rejection_gate        = _REASON_TO_GATE.get(gate.reason_code)
+
+            # ── Build audit structure ─────────────────────────────────────────
             audit_structure = (
                 gate.candidate_structure
                 if gate.action == "ENTER"
@@ -424,11 +463,6 @@ def run_paper_engine(
             # ── price_freshness_json ──────────────────────────────────────────
             price_freshness_json = price_staleness_map if price_staleness_map else None
 
-            rejection_gate = (
-                None if gate.action == "ENTER"
-                else _REASON_TO_GATE.get(gate.reason_code)
-            )
-
             decisions.append({
                 "session_id":          session_id,
                 "timestamp":           ts,
@@ -437,9 +471,9 @@ def run_paper_engine(
                 "opening_range_low":   or_low,
                 "trade_state":         "NO_OPEN_TRADE",
                 "signal_state":        "EVALUATE" if or_ready else "SKIP_MINUTE",
-                "action":              gate.action,
-                "reason_code":         gate.reason_code,
-                "reason_text":         gate.reason_text,
+                "action":              effective_action,
+                "reason_code":         effective_reason_code,
+                "reason_text":         effective_reason_text,
                 "candidate_structure": audit_structure,
                 "computed_max_loss":   gate.computed_max_loss,
                 "computed_target":     gate.computed_target,
@@ -449,7 +483,7 @@ def run_paper_engine(
                 "price_freshness_json": price_freshness_json,
             })
 
-            if gate.action == "ENTER":
+            if gate.action == "ENTER" and not stale_entry_rejected:
                 trade_id = uuid.uuid4()
                 long_ep, _ = opt_price(gate.long_strike, gate.opt_type)
                 short_ep, _ = opt_price(gate.short_strike, gate.opt_type)
