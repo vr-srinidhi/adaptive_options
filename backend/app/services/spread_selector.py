@@ -170,7 +170,7 @@ def _best_invalid_candidate(candidates: List[Dict[str, Any]]) -> Optional[Dict[s
 def select_spread_candidate(
     *,
     bias: str,
-    reference_price: float,
+    reference_strike: int,
     spot_price: float,
     capital: float,
     lot_size: int,
@@ -185,11 +185,10 @@ def select_spread_candidate(
     risk_cap = capital * _CFG["max_risk_pct"]
     target_profit = capital * _CFG["target_profit_pct"]
     candidate_pairs = (
-        generate_bullish_candidates(reference_price, step=step)
+        generate_bullish_candidates(reference_strike, step=step)
         if bias == "BULLISH"
-        else generate_bearish_candidates(reference_price, step=step)
+        else generate_bearish_candidates(reference_strike, step=step)
     )
-    reference_strike = candidate_pairs[2][0] if len(candidate_pairs) >= 3 else candidate_pairs[0][0]
 
     candidates: List[Dict[str, Any]] = []
     for universe_rank, (long_strike, short_strike) in enumerate(candidate_pairs, start=1):
@@ -259,11 +258,12 @@ def select_spread_candidate(
             valid = False
             rejection_reason = "NO_HEDGE_AVAILABLE"
             rejection_text = "Candidate does not have two usable option prices with positive net debit."
-        elif long_age > 0 or short_age > 0 or is_backfilled:
+        elif max(long_age, short_age) > _MAX_PRICE_STALENESS:
             valid = False
             rejection_reason = "STALE_OPTION_PRICE"
             rejection_text = (
-                f"Candidate prices are stale/backfilled (long age={long_age}, short age={short_age})."
+                f"Candidate prices exceed freshness threshold "
+                f"(long age={long_age}, short age={short_age}, max allowed={_MAX_PRICE_STALENESS})."
             )
         elif long_volume <= 0 or short_volume <= 0 or long_oi <= 0 or short_oi <= 0:
             valid = False

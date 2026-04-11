@@ -24,7 +24,7 @@ class TestSpreadSelectorPhase2:
 
         result = select_spread_candidate(
             bias="BULLISH",
-            reference_price=22123,
+            reference_strike=22100,
             spot_price=22130,
             capital=2_500_000,
             lot_size=75,
@@ -50,7 +50,7 @@ class TestSpreadSelectorPhase2:
 
         result = select_spread_candidate(
             bias="BEARISH",
-            reference_price=21910,
+            reference_strike=21900,
             spot_price=21872,
             capital=2_500_000,
             lot_size=75,
@@ -88,8 +88,8 @@ class TestSpreadSelectorPhase2:
     def test_stale_candidate_is_rejected_before_ranking(self):
         market = {
             (22050, "CE"): _market(82, 60_000, 700_000),
-            (22100, "CE"): _market(58, 180_000, 2_100_000, age_min=1, is_backfilled=True),
-            (22150, "CE"): _market(28, 175_000, 2_000_000, age_min=1, is_backfilled=True),
+            (22100, "CE"): _market(58, 180_000, 2_100_000, age_min=6, is_backfilled=True),
+            (22150, "CE"): _market(28, 175_000, 2_000_000, age_min=6, is_backfilled=True),
             (22200, "CE"): _market(10, 0, 0),
             (22250, "CE"): _market(4, 0, 0),
             (22300, "CE"): _market(2, 0, 0),
@@ -97,7 +97,7 @@ class TestSpreadSelectorPhase2:
 
         result = select_spread_candidate(
             bias="BULLISH",
-            reference_price=22123,
+            reference_strike=22100,
             spot_price=22130,
             capital=2_500_000,
             lot_size=75,
@@ -125,7 +125,7 @@ class TestSpreadSelectorPhase2:
 
         result = select_spread_candidate(
             bias="BULLISH",
-            reference_price=22123,
+            reference_strike=22100,
             spot_price=22130,
             capital=2_500_000,
             lot_size=75,
@@ -135,7 +135,37 @@ class TestSpreadSelectorPhase2:
 
         assert result.selected_candidate is None
         assert result.reason_code == "LOW_LIQUIDITY_REJECT"
-        assert all(
-            c["rejection_reason"] == "LOW_LIQUIDITY_REJECT"
-            for c in result.candidate_ranking_json["candidates"]
+        priced_candidates = [
+            c for c in result.candidate_ranking_json["candidates"]
+            if c["has_usable_prices"]
+        ]
+        assert priced_candidates
+        assert all(c["rejection_reason"] == "LOW_LIQUIDITY_REJECT" for c in priced_candidates)
+
+    def test_within_threshold_backfill_is_penalized_not_rejected(self):
+        market = {
+            (22000, "CE"): _market(90, 10_000, 120_000, age_min=1, is_backfilled=True),
+            (22050, "CE"): _market(55, 10_000, 120_000, age_min=1, is_backfilled=True),
+            (22100, "CE"): _market(58, 180_000, 2_100_000, age_min=1, is_backfilled=True),
+            (22150, "CE"): _market(28, 175_000, 2_000_000, age_min=1, is_backfilled=True),
+            (22200, "CE"): _market(10, 0, 0),
+            (22250, "CE"): _market(4, 0, 0),
+            (22300, "CE"): _market(2, 0, 0),
+        }
+
+        result = select_spread_candidate(
+            bias="BULLISH",
+            reference_strike=22100,
+            spot_price=22130,
+            capital=2_500_000,
+            lot_size=75,
+            expiry="2026-04-16",
+            option_market=market,
         )
+
+        assert result.selected_candidate is not None
+        selected = result.selected_candidate
+        assert selected["long_leg_age_min"] == 1
+        assert selected["short_leg_age_min"] == 1
+        assert selected["freshness_score"] < 1.0
+        assert selected["rejection_reason"] is None

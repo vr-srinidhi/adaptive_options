@@ -30,6 +30,8 @@ from typing import Dict, Optional
 from app.services.opening_range import (
     is_bearish_breakout,
     is_bullish_breakout,
+    select_bearish_strikes,
+    select_bullish_strikes,
 )
 from app.services.spread_selector import SELECTION_METHOD, select_spread_candidate
 
@@ -217,7 +219,11 @@ def evaluate_gates(
 
     selection = select_spread_candidate(
         bias=bias,
-        reference_price=or_high if bullish else or_low,
+        reference_strike=(
+            select_bullish_strikes(or_high)[0]
+            if bullish
+            else select_bearish_strikes(or_low)[0]
+        ),
         spot_price=close,
         capital=capital,
         lot_size=lot_size,

@@ -155,7 +155,7 @@ def _build_market_index(candles: List[Dict]) -> Dict[int, Dict[str, Any]]:
 def _get_market_at(
     market_index: Dict[int, Dict[str, Any]],
     idx: int,
-    lookback: int = _MAX_PRICE_STALENESS,
+    lookback: Optional[int] = _MAX_PRICE_STALENESS,
 ) -> Tuple[Optional[Dict[str, Any]], int]:
     """
     Return ({price, volume, oi, age_min, is_backfilled}, staleness_minutes)
@@ -164,7 +164,8 @@ def _get_market_at(
     Scans back up to *lookback* minutes for missing prices (thin liquidity gaps).
     staleness_minutes=0 means a fresh price was found.
     """
-    for i in range(idx, max(-1, idx - lookback - 1), -1):
+    min_idx = -1 if lookback is None else max(-1, idx - lookback - 1)
+    for i in range(idx, min_idx, -1):
         if i in market_index:
             age = idx - i
             snapshot = dict(market_index[i])
@@ -353,8 +354,13 @@ def run_paper_engine(
             float(spot_candles[idx - 1]["close"]) if idx > 0 else None
         )
 
-        def opt_market(strike, otype, _idx=idx) -> Tuple[Optional[Dict[str, Any]], int]:
-            return _get_market_at(option_market_index.get((strike, otype), {}), _idx)
+        def opt_market(
+            strike,
+            otype,
+            _idx=idx,
+            lookback: Optional[int] = _MAX_PRICE_STALENESS,
+        ) -> Tuple[Optional[Dict[str, Any]], int]:
+            return _get_market_at(option_market_index.get((strike, otype), {}), _idx, lookback=lookback)
 
         def opt_price(strike, otype, _idx=idx) -> Tuple[Optional[float], int]:
             snapshot, stale = opt_market(strike, otype, _idx)
@@ -395,7 +401,7 @@ def run_paper_engine(
             price_staleness_map: Dict[str, int] = {}
 
             for (s, t) in legs_to_fetch:
-                snapshot, stale = opt_market(s, t)
+                snapshot, stale = opt_market(s, t, lookback=None)
                 if snapshot is not None:
                     prices[(s, t)] = snapshot["price"]
                     market_snapshots[(s, t)] = snapshot
