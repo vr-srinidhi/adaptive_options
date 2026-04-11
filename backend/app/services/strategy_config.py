@@ -9,7 +9,7 @@ from datetime import time as time_type
 STRATEGY_CONFIG = {
     # ── Identity ─────────────────────────────────────────────────────────────
     "strategy_name":    "ORB_DEBIT_SPREAD_V1",
-    "strategy_version": "v1.0",
+    "strategy_version": "v2.0",
 
     # ── Opening Range ─────────────────────────────────────────────────────────
     "or_window_minutes":     15,       # candles 0–14 form the OR (09:15–09:29)
@@ -29,7 +29,8 @@ STRATEGY_CONFIG = {
 
     # ── Strike selection ─────────────────────────────────────────────────────
     "strike_step":          50,    # NSE Nifty strike granularity (pts)
-    "n_candidate_spreads":  3,     # candidate spread pairs tried per direction
+    "n_candidate_spreads":  5,     # candidate spread pairs tried per direction
+    "selection_method":     "ranked_candidate_selection_v1",
 
     # ── Price freshness ───────────────────────────────────────────────────────
     "max_price_staleness_min": 5,  # backfill lookback limit (minutes)

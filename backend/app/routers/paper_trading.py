@@ -79,6 +79,10 @@ def _decision_dict(d: MinuteDecision) -> dict:
         "signal_substate": d.signal_substate,
         "rejection_gate": d.rejection_gate,
         "price_freshness_json": d.price_freshness_json,
+        "candidate_ranking_json": d.candidate_ranking_json,
+        "selected_candidate_rank": d.selected_candidate_rank,
+        "selected_candidate_score": float(d.selected_candidate_score) if d.selected_candidate_score is not None else None,
+        "selected_candidate_score_breakdown_json": d.selected_candidate_score_breakdown_json,
     }
 
 
@@ -105,6 +109,10 @@ def _trade_dict(t: PaperTradeHeader, legs=None) -> dict:
         "risk_cap": float(t.risk_cap) if t.risk_cap is not None else None,
         "entry_reason_code": t.entry_reason_code,
         "entry_reason_text": t.entry_reason_text,
+        "selection_method": t.selection_method,
+        "selected_candidate_rank": t.selected_candidate_rank,
+        "selected_candidate_score": float(t.selected_candidate_score) if t.selected_candidate_score is not None else None,
+        "selected_candidate_score_breakdown_json": t.selected_candidate_score_breakdown_json,
         "status": t.status,
         "exit_reason": t.exit_reason,
         "long_strike": t.long_strike,

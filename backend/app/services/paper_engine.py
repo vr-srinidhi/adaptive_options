@@ -58,8 +58,10 @@ _REASON_TO_GATE: Dict[str, str] = {
     "NO_BREAKOUT_CONFIRMATION":           "G3",
     "FAILED_BREAKOUT_OR_NO_FOLLOWTHROUGH": "G4",
     "NO_HEDGE_AVAILABLE":                 "G5",
+    "LOW_LIQUIDITY_REJECT":               "G5",
     "RISK_EXCEEDS_CAP":                   "G6",
-    "TARGET_NOT_VIABLE":                  "G7",
+    "INSUFFICIENT_TARGET_COVERAGE":       "G7",
+    "NO_VALID_CANDIDATE_AFTER_RANKING":   "SELECTOR",
     "STALE_OPTION_PRICE":                 "FRESHNESS",
 }
 
@@ -133,23 +135,43 @@ def _serialize_candles(candles: List[Dict]) -> List[Dict]:
     return result
 
 
-def _build_price_index(candles: List[Dict]) -> Dict[int, float]:
-    """Return {minute_index: close_price} for a candle list."""
-    return {i: float(c["close"]) for i, c in enumerate(candles)}
+def _build_market_index(candles: List[Dict]) -> Dict[int, Dict[str, Any]]:
+    """Return {minute_index: {price, volume, oi}} for a candle list."""
+    index: Dict[int, Dict[str, Any]] = {}
+    for i, candle in enumerate(candles):
+        volume = int(candle.get("volume", 0) or 0)
+        oi = candle.get("oi")
+        # Test fixtures do not carry OI. Fall back to volume so Phase 2 logic
+        # can still run deterministically on fixture data.
+        oi_value = int(oi if oi is not None else volume)
+        index[i] = {
+            "price": float(candle["close"]),
+            "volume": volume,
+            "oi": oi_value,
+        }
+    return index
 
 
-def _get_price_at(
-    price_index: Dict[int, float], idx: int, lookback: int = _MAX_PRICE_STALENESS
-) -> Tuple[Optional[float], int]:
+def _get_market_at(
+    market_index: Dict[int, Dict[str, Any]],
+    idx: int,
+    lookback: Optional[int] = _MAX_PRICE_STALENESS,
+) -> Tuple[Optional[Dict[str, Any]], int]:
     """
-    Return (price, staleness_minutes) for minute index *idx*.
+    Return ({price, volume, oi, age_min, is_backfilled}, staleness_minutes)
+    for minute index *idx*.
 
     Scans back up to *lookback* minutes for missing prices (thin liquidity gaps).
     staleness_minutes=0 means a fresh price was found.
     """
-    for i in range(idx, max(-1, idx - lookback - 1), -1):
-        if i in price_index:
-            return price_index[i], idx - i
+    min_idx = -1 if lookback is None else max(-1, idx - lookback - 1)
+    for i in range(idx, min_idx, -1):
+        if i in market_index:
+            age = idx - i
+            snapshot = dict(market_index[i])
+            snapshot["age_min"] = age
+            snapshot["is_backfilled"] = age > 0
+            return snapshot, age
     return None, 0
 
 
@@ -292,7 +314,7 @@ def run_paper_engine(
         monthly_expiry = None
     log.info("Monthly expiry: %s", monthly_expiry)
 
-    option_price_index: Dict[Tuple[int, str], Dict[int, float]] = {}
+    option_market_index: Dict[Tuple[int, str], Dict[int, Dict[str, Any]]] = {}
     option_candles_raw: Dict[Tuple[int, str], List[Dict]] = {}
 
     for strike, opt_type in sorted(legs_to_fetch):
@@ -306,7 +328,7 @@ def run_paper_engine(
             continue
         try:
             candles = fetch_candles_with_token(token, trade_date, access_token)
-            option_price_index[(strike, opt_type)] = _build_price_index(candles)
+            option_market_index[(strike, opt_type)] = _build_market_index(candles)
             option_candles_raw[(strike, opt_type)] = candles
             log.info("Fetched %d candles for %s%s", len(candles), strike, opt_type)
         except DataUnavailableError as exc:
@@ -332,8 +354,17 @@ def run_paper_engine(
             float(spot_candles[idx - 1]["close"]) if idx > 0 else None
         )
 
+        def opt_market(
+            strike,
+            otype,
+            _idx=idx,
+            lookback: Optional[int] = _MAX_PRICE_STALENESS,
+        ) -> Tuple[Optional[Dict[str, Any]], int]:
+            return _get_market_at(option_market_index.get((strike, otype), {}), _idx, lookback=lookback)
+
         def opt_price(strike, otype, _idx=idx) -> Tuple[Optional[float], int]:
-            return _get_price_at(option_price_index.get((strike, otype), {}), _idx)
+            snapshot, stale = opt_market(strike, otype, _idx)
+            return (snapshot["price"], stale) if snapshot is not None else (None, stale)
 
         # ── SESSION_COMPLETE: trade already closed — no re-entry ──────────────
         if trade_closed_this_session:
@@ -356,18 +387,24 @@ def run_paper_engine(
                 "signal_substate":     None,
                 "rejection_gate":      None,
                 "price_freshness_json": None,
+                "candidate_ranking_json": None,
+                "selected_candidate_rank": None,
+                "selected_candidate_score": None,
+                "selected_candidate_score_breakdown_json": None,
             })
             continue
 
         if active_trade is None:
             # ── No open trade: run entry gates ────────────────────────────────
             prices: Dict[Tuple[int, str], float] = {}
+            market_snapshots: Dict[Tuple[int, str], Dict[str, Any]] = {}
             price_staleness_map: Dict[str, int] = {}
 
             for (s, t) in legs_to_fetch:
-                p, stale = opt_price(s, t)
-                if p is not None:
-                    prices[(s, t)] = p
+                snapshot, stale = opt_market(s, t, lookback=None)
+                if snapshot is not None:
+                    prices[(s, t)] = snapshot["price"]
+                    market_snapshots[(s, t)] = snapshot
                     if stale > 0:
                         price_staleness_map[f"{s}_{t}_age_min"] = stale
 
@@ -384,6 +421,7 @@ def run_paper_engine(
                 prev_candle_close=prev_candle_close,
                 lot_size=lot_size,
                 current_time=current_time,
+                option_market=market_snapshots,
             )
 
             # ── Derive signal_substate ────────────────────────────────────────
@@ -411,54 +449,42 @@ def run_paper_engine(
                 current_session_state = "OBSERVING"
 
             # ── Advance tentative-breakout tracker for next minute ────────────
-            # (use original gate.reason_code, before any stale override below)
             prev_was_tentative_breakout = (
                 gate.reason_code == "FAILED_BREAKOUT_OR_NO_FOLLOWTHROUGH"
             )
 
-            # ── Stale price check for entry ───────────────────────────────────
-            # Require FRESH (current-minute) option prices for any entry.
-            # Any backfill > 0 min → reject with STALE_OPTION_PRICE so the audit
-            # trail records that the signal was confirmed but prices were stale.
+            effective_action      = gate.action
+            effective_reason_code = gate.reason_code
+            effective_reason_text = gate.reason_text
+            effective_selected_candidate_rank = gate.selected_candidate_rank
+            effective_selected_candidate_score = gate.selected_candidate_score
+            effective_selected_candidate_score_breakdown = gate.selected_candidate_score_breakdown
             stale_entry_rejected = False
+
             if gate.action == "ENTER":
-                l_stale = price_staleness_map.get(
-                    f"{gate.long_strike}_{gate.opt_type}_age_min", 0
-                )
-                s_stale = price_staleness_map.get(
-                    f"{gate.short_strike}_{gate.opt_type}_age_min", 0
-                )
-                max_entry_stale = max(l_stale, s_stale)
-                if max_entry_stale > 0:
+                long_age = price_staleness_map.get(f"{gate.long_strike}_{gate.opt_type}_age_min", 0)
+                short_age = price_staleness_map.get(f"{gate.short_strike}_{gate.opt_type}_age_min", 0)
+                if max(long_age, short_age) > 0:
                     stale_entry_rejected = True
-                    effective_action      = "NO_TRADE"
+                    effective_action = "NO_TRADE"
                     effective_reason_code = "STALE_OPTION_PRICE"
                     effective_reason_text = (
-                        f"Entry blocked: prices are {max_entry_stale} min stale "
-                        f"(long {gate.long_strike}{gate.opt_type}: {l_stale} min, "
-                        f"short {gate.short_strike}{gate.opt_type}: {s_stale} min). "
-                        f"Fresh prices required at entry."
+                        "Confirmed breakout, but entry requires current-minute option prices "
+                        f"(long age={long_age}, short age={short_age})."
                     )
-                    rejection_gate        = "FRESHNESS"
+                    effective_selected_candidate_rank = None
+                    effective_selected_candidate_score = None
+                    effective_selected_candidate_score_breakdown = None
                     current_session_state = "OBSERVING"
-                    # signal_substate stays CONFIRMED_BREAKOUT — the signal was real
-                else:
-                    effective_action      = gate.action
-                    effective_reason_code = gate.reason_code
-                    effective_reason_text = gate.reason_text
-                    rejection_gate        = None
-            else:
-                effective_action      = gate.action
-                effective_reason_code = gate.reason_code
-                effective_reason_text = gate.reason_text
-                rejection_gate        = _REASON_TO_GATE.get(gate.reason_code)
+                    if signal_substate is None:
+                        signal_substate = "CONFIRMED_BREAKOUT"
+
+            rejection_gate = (
+                None if effective_action == "ENTER" else _REASON_TO_GATE.get(effective_reason_code)
+            )
 
             # ── Build audit structure ─────────────────────────────────────────
-            audit_structure = (
-                gate.candidate_structure
-                if gate.action == "ENTER"
-                else gate.pre_entry_snapshot
-            )
+            audit_structure = gate.candidate_structure if gate.action == "ENTER" else gate.pre_entry_snapshot
 
             # ── price_freshness_json ──────────────────────────────────────────
             price_freshness_json = price_staleness_map if price_staleness_map else None
@@ -481,6 +507,10 @@ def run_paper_engine(
                 "signal_substate":     signal_substate,
                 "rejection_gate":      rejection_gate,
                 "price_freshness_json": price_freshness_json,
+                "candidate_ranking_json": gate.candidate_ranking_json,
+                "selected_candidate_rank": effective_selected_candidate_rank,
+                "selected_candidate_score": effective_selected_candidate_score,
+                "selected_candidate_score_breakdown_json": effective_selected_candidate_score_breakdown,
             })
 
             if gate.action == "ENTER" and not stale_entry_rejected:
@@ -507,6 +537,10 @@ def run_paper_engine(
                     "_entry_reason_code": gate.reason_code,
                     "_entry_reason_text": gate.reason_text,
                     "_risk_cap":          capital * _CFG["max_risk_pct"],
+                    "_selection_method":  gate.selection_method,
+                    "_selected_candidate_rank": gate.selected_candidate_rank,
+                    "_selected_candidate_score": gate.selected_candidate_score,
+                    "_selected_candidate_score_breakdown": gate.selected_candidate_score_breakdown,
                     "_strategy_params": {
                         "strategy_name":            _CFG["strategy_name"],
                         "strategy_version":         _CFG["strategy_version"],
@@ -517,6 +551,7 @@ def run_paper_engine(
                         "square_off_time":          str(_CFG["square_off_time"]),
                         "min_minutes_left_to_enter": _CFG["min_minutes_left_to_enter"],
                         "n_candidate_spreads":      _CFG["n_candidate_spreads"],
+                        "selection_method":         _CFG["selection_method"],
                         "lot_size":                 lot_size,
                         "capital":                  capital,
                     },
@@ -574,6 +609,10 @@ def run_paper_engine(
                     "signal_substate":     None,
                     "rejection_gate":      None,
                     "price_freshness_json": price_freshness_json,
+                    "candidate_ranking_json": None,
+                    "selected_candidate_rank": None,
+                    "selected_candidate_score": None,
+                    "selected_candidate_score_breakdown_json": None,
                 })
                 continue
 
@@ -620,6 +659,10 @@ def run_paper_engine(
                 "signal_substate":     None,
                 "rejection_gate":      None,
                 "price_freshness_json": price_freshness_json,
+                "candidate_ranking_json": None,
+                "selected_candidate_rank": None,
+                "selected_candidate_score": None,
+                "selected_candidate_score_breakdown_json": None,
             })
 
             minute_marks.append({
@@ -688,6 +731,10 @@ def run_paper_engine(
                     "risk_cap":               active_trade["_risk_cap"],
                     "entry_reason_code":      active_trade["_entry_reason_code"],
                     "entry_reason_text":      active_trade["_entry_reason_text"],
+                    "selection_method":       active_trade["_selection_method"],
+                    "selected_candidate_rank": active_trade["_selected_candidate_rank"],
+                    "selected_candidate_score": active_trade["_selected_candidate_score"],
+                    "selected_candidate_score_breakdown_json": active_trade["_selected_candidate_score_breakdown"],
                 }
                 active_trade = None
                 trade_closed_this_session = True  # lock: no re-entry
@@ -758,6 +805,10 @@ def run_paper_engine(
             "risk_cap":               active_trade["_risk_cap"],
             "entry_reason_code":      active_trade["_entry_reason_code"],
             "entry_reason_text":      active_trade["_entry_reason_text"],
+            "selection_method":       active_trade["_selection_method"],
+            "selected_candidate_rank": active_trade["_selected_candidate_rank"],
+            "selected_candidate_score": active_trade["_selected_candidate_score"],
+            "selected_candidate_score_breakdown_json": active_trade["_selected_candidate_score_breakdown"],
         }
         current_session_state = "TRADE_CLOSED"
 

@@ -650,6 +650,10 @@ class TestCandidateAudit:
         assert cs["candidate_rank"] >= 1
         assert "spread_width" in cs
         assert cs["spread_width"] > 0
+        assert result.candidate_ranking_json is not None
+        assert result.selected_candidate_rank == 1
+        assert result.selected_candidate_score is not None
+        assert result.selected_candidate_score_breakdown is not None
 
 
 class TestChargesBreakdown:

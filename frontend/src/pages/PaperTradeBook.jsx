@@ -42,9 +42,41 @@ function KV({ label, value, valueColor }) {
   )
 }
 
+function extractSelectionAudit(decisions, trade) {
+  const decisionWithRanking =
+    decisions.find(d => d.action === 'ENTER' && d.candidate_ranking_json) ||
+    [...decisions].reverse().find(d => d.candidate_ranking_json)
+
+  if (!decisionWithRanking?.candidate_ranking_json) return null
+
+  const ranking = decisionWithRanking.candidate_ranking_json
+  const rankedCandidates = (ranking.candidates || [])
+    .filter(c => c.rank != null)
+    .sort((a, b) => a.rank - b.rank)
+
+  const selected = rankedCandidates.find(c => c.rank === 1) || rankedCandidates[0] || null
+  const chosenSpread = trade
+    ? `${trade.long_strike}/${trade.short_strike} ${trade.option_type}`
+    : selected
+      ? `${selected.long_strike}/${selected.short_strike} ${selected.option_type || selected.opt_type}`
+      : '—'
+
+  return {
+    selectionMethod: trade?.selection_method || ranking.selection_method || '—',
+    signalDirection: trade?.bias || ranking.signal_direction || selected?.direction || '—',
+    evaluatedCount: ranking.evaluated_candidates ?? ranking.evaluatedCount ?? 0,
+    validCount: ranking.valid_candidates ?? ranking.validCount ?? 0,
+    chosenSpread,
+    chosenRank: trade?.selected_candidate_rank ?? ranking.selected_candidate_rank ?? selected?.rank ?? null,
+    chosenScore: trade?.selected_candidate_score ?? ranking.selected_candidate_score ?? selected?.score ?? null,
+    topCandidates: rankedCandidates.slice(0, 3),
+  }
+}
+
 // ── CSV export ─────────────────────────────────────────────────────────────────
 function buildCSV(session, trade, decisions, marks, candleSeries) {
   const rows = []
+  const selectionAudit = extractSelectionAudit(decisions, trade)
 
   rows.push(['SESSION SUMMARY'])
   rows.push(['Date', session.session_date])
@@ -86,6 +118,37 @@ function buildCSV(session, trade, decisions, marks, candleSeries) {
           trade.approved_lots * trade.lot_size,
           l.entry_price ?? '',
           l.exit_price ?? '',
+        ])
+      })
+      rows.push([])
+    }
+  }
+
+  if (selectionAudit) {
+    rows.push(['SPREAD SELECTION'])
+    rows.push(['Signal Direction', selectionAudit.signalDirection])
+    rows.push(['Selection Method', selectionAudit.selectionMethod])
+    rows.push(['Candidates Evaluated', selectionAudit.evaluatedCount])
+    rows.push(['Valid Candidates', selectionAudit.validCount])
+    rows.push(['Chosen Spread', selectionAudit.chosenSpread])
+    rows.push(['Chosen Rank', selectionAudit.chosenRank ?? ''])
+    rows.push(['Chosen Score', selectionAudit.chosenScore ?? ''])
+    rows.push([])
+
+    if (selectionAudit.topCandidates.length) {
+      rows.push(['TOP 3 CANDIDATES'])
+      rows.push(['Rank', 'Spread', 'Debit', 'Max Loss', 'Max Gain', 'Volume', 'OI', 'Score', 'Status'])
+      selectionAudit.topCandidates.forEach(c => {
+        rows.push([
+          c.rank,
+          `${c.long_strike}/${c.short_strike} ${c.option_type || c.opt_type}`,
+          c.spread_debit,
+          c.total_max_loss,
+          c.max_gain_total,
+          c.combined_volume,
+          c.combined_oi,
+          c.score,
+          c.status,
         ])
       })
       rows.push([])
@@ -317,6 +380,7 @@ export default function PaperTradeBook() {
   const visibleDecisions = filter === 'ALL' ? decisions : decisions.filter(d => d.action === filter)
 
   const chartData = marks.map(m => ({ time: m.timestamp?.slice(11, 16), spot: 0, pnl: m.total_mtm }))
+  const selectionAudit = extractSelectionAudit(decisions, trade)
 
   const handlePDF = () => window.print()
 
@@ -441,6 +505,69 @@ export default function PaperTradeBook() {
           <div className="rounded-xl p-4 mb-4 text-sm text-center"
             style={{ background: 'var(--surface-secondary)', border: '1px solid var(--border)', color: 'var(--text-secondary)' }}>
             No trade was opened this session — all gate conditions failed.
+          </div>
+        )}
+
+        {selectionAudit && (
+          <div className="rounded-xl p-4 mb-4" style={{ background: 'var(--surface-secondary)', border: '1px solid var(--border)' }}>
+            <div className="flex items-center justify-between mb-3">
+              <div className="text-xs uppercase tracking-widest" style={{ color: 'var(--text-secondary)' }}>
+                Spread Selection
+              </div>
+              <div className="text-xs" style={{ color: 'var(--text-secondary)' }}>
+                {selectionAudit.selectionMethod}
+              </div>
+            </div>
+
+            <div className="grid grid-cols-2 gap-4 mb-4">
+              <div>
+                <KV label="Signal Direction" value={selectionAudit.signalDirection} />
+                <KV label="Candidates Evaluated" value={selectionAudit.evaluatedCount} />
+                <KV label="Valid Candidates" value={selectionAudit.validCount} />
+              </div>
+              <div>
+                <KV label="Chosen Spread" value={selectionAudit.chosenSpread} />
+                <KV label="Chosen Rank" value={selectionAudit.chosenRank != null ? `#${selectionAudit.chosenRank}` : '—'} />
+                <KV label="Chosen Score" value={selectionAudit.chosenScore != null ? Number(selectionAudit.chosenScore).toFixed(4) : '—'} valueColor="#22c55e" />
+              </div>
+            </div>
+
+            {selectionAudit.topCandidates.length > 0 && (
+              <div className="rounded-lg overflow-hidden" style={{ border: '1px solid var(--border)' }}>
+                <table className="w-full text-xs">
+                  <thead style={{ background: 'var(--surface-tertiary)' }}>
+                    <tr style={{ borderBottom: '1px solid var(--border)' }}>
+                      {['Rank', 'Spread', 'Debit', 'Max Loss', 'Max Gain', 'Volume', 'OI', 'Score', 'Status'].map(h => (
+                        <th key={h} className="text-left px-3 py-2 font-medium uppercase tracking-wider"
+                          style={{ color: 'var(--text-secondary)' }}>{h}</th>
+                      ))}
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {selectionAudit.topCandidates.map(candidate => (
+                      <tr key={`${candidate.rank}-${candidate.long_strike}-${candidate.short_strike}`}
+                        style={{ borderBottom: '0.5px solid var(--border)' }}>
+                        <td className="px-3 py-2 font-medium" style={{ color: 'var(--text-primary)' }}>#{candidate.rank}</td>
+                        <td className="px-3 py-2" style={{ color: 'var(--text-primary)' }}>
+                          {candidate.long_strike}/{candidate.short_strike} {candidate.option_type || candidate.opt_type}
+                        </td>
+                        <td className="px-3 py-2" style={{ color: 'var(--text-secondary)' }}>₹{fmtNum(candidate.spread_debit)}</td>
+                        <td className="px-3 py-2" style={{ color: '#ef4444' }}>{fmtINR(candidate.total_max_loss)}</td>
+                        <td className="px-3 py-2" style={{ color: '#22c55e' }}>{fmtINR(candidate.max_gain_total)}</td>
+                        <td className="px-3 py-2" style={{ color: 'var(--text-secondary)' }}>{candidate.combined_volume?.toLocaleString('en-IN') ?? '—'}</td>
+                        <td className="px-3 py-2" style={{ color: 'var(--text-secondary)' }}>{candidate.combined_oi?.toLocaleString('en-IN') ?? '—'}</td>
+                        <td className="px-3 py-2 font-medium" style={{ color: 'var(--text-primary)' }}>
+                          {candidate.score != null ? Number(candidate.score).toFixed(4) : '—'}
+                        </td>
+                        <td className="px-3 py-2" style={{ color: candidate.rank === 1 ? '#22c55e' : 'var(--text-secondary)' }}>
+                          {candidate.rank === 1 ? 'Selected' : 'Rejected'}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
           </div>
         )}
 

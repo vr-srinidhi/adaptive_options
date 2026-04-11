@@ -55,6 +55,10 @@ class MinuteDecision(Base):
     signal_substate = Column(String(30))    # TENTATIVE_BREAKOUT / CONFIRMED_BREAKOUT / FAILED_FIRST_BREAKOUT
     rejection_gate = Column(String(10))     # G1–G7 or None
     price_freshness_json = Column(JSONB)    # {spot_age_min, long_age_min, short_age_min}
+    candidate_ranking_json = Column(JSONB)
+    selected_candidate_rank = Column(Integer)
+    selected_candidate_score = Column(Numeric(10, 4))
+    selected_candidate_score_breakdown_json = Column(JSONB)
 
 
 class PaperTradeHeader(Base):
@@ -87,6 +91,10 @@ class PaperTradeHeader(Base):
     risk_cap = Column(Numeric(12, 2))       # capital × max_risk_pct at entry
     entry_reason_code = Column(String(60))  # ENTER_TRADE
     entry_reason_text = Column(Text)        # full gate reason text
+    selection_method = Column(String(60))
+    selected_candidate_rank = Column(Integer)
+    selected_candidate_score = Column(Numeric(10, 4))
+    selected_candidate_score_breakdown_json = Column(JSONB)
 
 
 class PaperTradeMinuteMark(Base):

@@ -117,7 +117,7 @@ def fetch_candles(
             to_date=to_dt,
             interval=interval,
             continuous=False,
-            oi=False,
+            oi=True,
         )
     except Exception as exc:
         log.warning(
@@ -194,7 +194,7 @@ def fetch_candles_with_token(
             to_date=to_dt,
             interval=interval,
             continuous=False,
-            oi=False,
+            oi=True,
         )
     except Exception as exc:
         log.warning(
