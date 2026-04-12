@@ -5,13 +5,16 @@ import uuid
 from datetime import date
 from typing import List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
 from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.rate_limit import limiter
 from app.database import get_db
+from app.dependencies.auth import get_current_active_user
 from app.models.session import BacktestSession
+from app.models.user import User
 from app.services.calendar import HOLIDAY, TRADING_DAY, WEEKEND, get_trading_days
 from app.services.simulator import run_day_simulation
 
@@ -78,7 +81,13 @@ def _to_dict(s: BacktestSession, full: bool = True) -> dict:
 
 # ── Endpoints ─────────────────────────────────────────────────────────────────
 @router.post("/backtest/run")
-async def run_backtest(req: RunBacktestRequest, db: AsyncSession = Depends(get_db)):
+@limiter.limit("10/minute")
+async def run_backtest(
+    request: Request,
+    req: RunBacktestRequest,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_active_user),
+):
     try:
         start = date.fromisoformat(req.startDate)
         end = date.fromisoformat(req.endDate)
@@ -136,6 +145,7 @@ async def run_backtest(req: RunBacktestRequest, db: AsyncSession = Depends(get_d
             no_trade_reason=no_trade_reason,
             expiry_date=None,
             data_source=None,
+            user_id=user.id,
         )
         db.add(obj)
         sessions.append(obj)
@@ -172,6 +182,7 @@ async def run_backtest(req: RunBacktestRequest, db: AsyncSession = Depends(get_d
                 no_trade_reason="DATA_UNAVAILABLE",
                 expiry_date=None,
                 data_source=None,
+                user_id=user.id,
             )
             db.add(obj)
             sessions.append(obj)
@@ -208,6 +219,7 @@ async def run_backtest(req: RunBacktestRequest, db: AsyncSession = Depends(get_d
             signal_score=result.get("signal_score"),
             atr14=result.get("atr14"),
             r_multiple=result.get("r_multiple"),
+            user_id=user.id,
         )
         db.add(obj)
         sessions.append(obj)
@@ -225,8 +237,12 @@ async def get_results(
     limit: int = 200,
     offset: int = 0,
     db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_active_user),
 ):
     q = select(BacktestSession).order_by(BacktestSession.session_date.desc())
+    q = q.where(
+        (BacktestSession.user_id == user.id) | (BacktestSession.user_id.is_(None))
+    )
     if instrument:
         q = q.where(BacktestSession.instrument == instrument.strip().upper())
     q = q.limit(limit).offset(offset)
@@ -235,7 +251,11 @@ async def get_results(
 
 
 @router.get("/backtest/results/{session_id}")
-async def get_session(session_id: str, db: AsyncSession = Depends(get_db)):
+async def get_session(
+    session_id: str,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_active_user),
+):
     try:
         sid = uuid.UUID(session_id)
     except ValueError:
@@ -252,8 +272,11 @@ async def get_session(session_id: str, db: AsyncSession = Depends(get_db)):
 async def get_summary(
     instrument: Optional[str] = None,
     db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_active_user),
 ):
-    q = select(BacktestSession)
+    q = select(BacktestSession).where(
+        (BacktestSession.user_id == user.id) | (BacktestSession.user_id.is_(None))
+    )
     if instrument:
         q = q.where(BacktestSession.instrument == instrument.strip().upper())
     rows = (await db.execute(q)).scalars().all()
@@ -281,9 +304,19 @@ async def get_summary(
 
 
 @router.delete("/backtest/results")
-async def clear_results(db: AsyncSession = Depends(get_db)):
-    result = await db.execute(select(func.count()).select_from(BacktestSession))
-    count = result.scalar() or 0
-    await db.execute(delete(BacktestSession))
+async def clear_results(
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_active_user),
+):
+    # Only delete this user's sessions (+ legacy sessions with no owner)
+    q_count = select(func.count()).select_from(BacktestSession).where(
+        (BacktestSession.user_id == user.id) | (BacktestSession.user_id.is_(None))
+    )
+    count = (await db.execute(q_count)).scalar() or 0
+    await db.execute(
+        delete(BacktestSession).where(
+            (BacktestSession.user_id == user.id) | (BacktestSession.user_id.is_(None))
+        )
+    )
     await db.commit()
     return {"deleted": count}

@@ -31,6 +31,8 @@ class PaperSession(Base):
     created_at = Column(TIMESTAMP(timezone=True), server_default=func.now())
     # Phase 1: session lifecycle terminal state
     final_session_state = Column(String(30))  # OBSERVING / TRADE_CLOSED / SESSION_COMPLETE / etc.
+    # Security: owning user (nullable for backward compat with pre-auth sessions)
+    user_id = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=True)
 
 
 class MinuteDecision(Base):

@@ -1,7 +1,10 @@
-import { NavLink, useLocation } from 'react-router-dom'
+import { NavLink, useLocation, useNavigate } from 'react-router-dom'
+import { useAuth } from '../contexts/AuthContext'
 
 export default function TopNav() {
   const location = useLocation()
+  const navigate = useNavigate()
+  const { user, logout } = useAuth()
   const isPaper = location.pathname.startsWith('/paper')
 
   const linkClass = ({ isActive }) =>
@@ -58,8 +61,8 @@ export default function TopNav() {
         <NavLink to="/paper/sessions" className={paperLinkClass}>Sessions</NavLink>
       </div>
 
-      {/* Mode tag */}
-      <div className="ml-auto">
+      {/* Right side: mode tag + zerodha + user */}
+      <div className="ml-auto flex items-center gap-3">
         <span className="text-xs px-2 py-0.5 rounded font-medium"
           style={isPaper
             ? { background: 'rgba(245,158,11,0.15)', color: '#f59e0b', border: '1px solid rgba(245,158,11,0.3)' }
@@ -67,6 +70,24 @@ export default function TopNav() {
           }>
           {isPaper ? 'PAPER MODE' : 'BACKTEST MODE'}
         </span>
+
+        <NavLink to="/zerodha-connect"
+          className="text-xs px-2 py-0.5 rounded transition"
+          style={{ color: 'var(--text-secondary)', border: '1px solid var(--border)', textDecoration: 'none' }}>
+          Zerodha
+        </NavLink>
+
+        {user && (
+          <div className="flex items-center gap-2">
+            <span className="text-xs" style={{ color: 'var(--text-secondary)' }}>{user.email}</span>
+            <button
+              onClick={async () => { await logout(); navigate('/login') }}
+              className="text-xs px-2 py-0.5 rounded transition"
+              style={{ color: '#ef4444', border: '1px solid rgba(239,68,68,0.3)', background: 'none', cursor: 'pointer' }}>
+              Sign out
+            </button>
+          </div>
+        )}
       </div>
     </nav>
   )

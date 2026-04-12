@@ -1,5 +1,5 @@
 import uuid
-from sqlalchemy import Column, String, Date, Numeric, Integer, Time, TIMESTAMP, func
+from sqlalchemy import Column, String, Date, Numeric, Integer, Time, TIMESTAMP, ForeignKey, func
 from sqlalchemy.dialects.postgresql import UUID, JSONB
 from app.database import Base
 
@@ -40,3 +40,5 @@ class BacktestSession(Base):
     atr14 = Column(Numeric(10, 2))
     r_multiple = Column(Numeric(6, 2))
     created_at = Column(TIMESTAMP(timezone=True), server_default=func.now())
+    # Security: owning user (nullable for backward compat with pre-auth sessions)
+    user_id = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=True)

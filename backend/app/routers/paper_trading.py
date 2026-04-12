@@ -15,12 +15,14 @@ import uuid
 from datetime import date
 from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.rate_limit import limiter
 from app.database import get_db
+from app.dependencies.auth import get_current_active_user
 from app.models.paper_trade import (
     MinuteDecision,
     PaperCandleSeries,
@@ -29,7 +31,9 @@ from app.models.paper_trade import (
     PaperTradeLeg,
     PaperTradeMinuteMark,
 )
+from app.models.user import User
 from app.services.paper_engine import run_paper_engine
+from app.services.token_store import get_broker_token
 from app.services.zerodha_client import DataUnavailableError
 
 router = APIRouter()
@@ -41,7 +45,6 @@ class RunSessionRequest(BaseModel):
     instrument: str
     date: str
     capital: float
-    access_token: str
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -156,7 +159,13 @@ def _mark_dict(m: PaperTradeMinuteMark) -> dict:
 # ── Endpoints ─────────────────────────────────────────────────────────────────
 
 @router.post("/paper/session/run")
-async def run_session(req: RunSessionRequest, db: AsyncSession = Depends(get_db)):
+@limiter.limit("5/minute")
+async def run_session(
+    request: Request,
+    req: RunSessionRequest,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_active_user),
+):
     # Validate inputs
     try:
         trade_date = date.fromisoformat(req.date)
@@ -168,8 +177,14 @@ async def run_session(req: RunSessionRequest, db: AsyncSession = Depends(get_db)
         raise HTTPException(status_code=400, detail="instrument must be NIFTY or BANKNIFTY.")
     if not (50_000 <= req.capital <= 10_000_000):
         raise HTTPException(status_code=400, detail="Capital must be ₹50,000 – ₹10,000,000.")
-    if not req.access_token or len(req.access_token) < 10:
-        raise HTTPException(status_code=400, detail="A valid Zerodha access token is required.")
+
+    # Retrieve stored Zerodha token for this user
+    access_token = await get_broker_token(db, user.id)
+    if not access_token:
+        raise HTTPException(
+            status_code=422,
+            detail="No Zerodha access token found. Connect your Zerodha account first via POST /api/auth/zerodha/session.",
+        )
 
     # Create session row (status=RUNNING)
     session_id = uuid.uuid4()
@@ -179,6 +194,7 @@ async def run_session(req: RunSessionRequest, db: AsyncSession = Depends(get_db)
         session_date=trade_date,
         capital=req.capital,
         status="RUNNING",
+        user_id=user.id,
     )
     db.add(ps)
     await db.commit()
@@ -188,7 +204,7 @@ async def run_session(req: RunSessionRequest, db: AsyncSession = Depends(get_db)
         result = await asyncio.get_event_loop().run_in_executor(
             None,
             run_paper_engine,
-            session_id, trade_date, instrument, req.capital, req.access_token,
+            session_id, trade_date, instrument, req.capital, access_token,
         )
     except DataUnavailableError as exc:
         ps.status = "ERROR"
@@ -251,8 +267,12 @@ async def list_sessions(
     instrument: Optional[str] = None,
     limit: int = 50,
     db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_active_user),
 ):
     q = select(PaperSession).order_by(PaperSession.created_at.desc())
+    q = q.where(
+        (PaperSession.user_id == user.id) | (PaperSession.user_id.is_(None))
+    )
     if instrument:
         q = q.where(PaperSession.instrument == instrument.strip().upper())
     q = q.limit(limit)
@@ -261,7 +281,11 @@ async def list_sessions(
 
 
 @router.get("/paper/session/{session_id}")
-async def get_session(session_id: str, db: AsyncSession = Depends(get_db)):
+async def get_session(
+    session_id: str,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_active_user),
+):
     try:
         sid = uuid.UUID(session_id)
     except ValueError:
@@ -292,6 +316,7 @@ async def get_decisions(
     limit: int = 400,
     offset: int = 0,
     db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_active_user),
 ):
     try:
         sid = uuid.UUID(session_id)
@@ -311,7 +336,11 @@ async def get_decisions(
 
 
 @router.get("/paper/session/{session_id}/trade")
-async def get_trade(session_id: str, db: AsyncSession = Depends(get_db)):
+async def get_trade(
+    session_id: str,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_active_user),
+):
     try:
         sid = uuid.UUID(session_id)
     except ValueError:
@@ -332,7 +361,11 @@ async def get_trade(session_id: str, db: AsyncSession = Depends(get_db)):
 
 
 @router.get("/paper/session/{session_id}/trade/marks")
-async def get_marks(session_id: str, db: AsyncSession = Depends(get_db)):
+async def get_marks(
+    session_id: str,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_active_user),
+):
     try:
         sid = uuid.UUID(session_id)
     except ValueError:
@@ -355,7 +388,11 @@ async def get_marks(session_id: str, db: AsyncSession = Depends(get_db)):
 
 
 @router.get("/paper/session/{session_id}/candles")
-async def get_candles(session_id: str, db: AsyncSession = Depends(get_db)):
+async def get_candles(
+    session_id: str,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_active_user),
+):
     """
     Return all stored candle series for a session.
     Each item: {series_type: str, candles: [{time,open,high,low,close,volume},...]}

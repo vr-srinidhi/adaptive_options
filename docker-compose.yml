@@ -25,6 +25,10 @@ services:
       DATABASE_URL: postgresql+asyncpg://postgres:postgres@db:5432/adaptive_options
       ZERODHA_API_KEY: ${ZERODHA_API_KEY}
       ZERODHA_API_SECRET: ${ZERODHA_API_SECRET}
+      SECRET_KEY: ${SECRET_KEY:-CHANGE_ME_IN_PRODUCTION_USE_OPENSSL_RAND}
+      BROKER_TOKEN_ENCRYPTION_KEY: ${BROKER_TOKEN_ENCRYPTION_KEY:-}
+      ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-http://localhost:3000}
+      ENVIRONMENT: ${ENVIRONMENT:-development}
     depends_on:
       db:
         condition: service_healthy

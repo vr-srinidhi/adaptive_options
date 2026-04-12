@@ -27,13 +27,20 @@ async def get_db():
 
 
 async def init_db():
-    # Import models so they register with Base metadata
+    # Import all models so they register with Base metadata
     from app.models import session as _  # noqa
     from app.models import paper_trade as _pt  # noqa
+    from app.models import user as _u  # noqa
+    from app.models import broker_token as _bt  # noqa
+    from app.models import audit_log as _al  # noqa
+
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
-        # Idempotent migrations for new columns added post-initial-deploy
+
+        # Idempotent schema additions — run on every startup so both fresh
+        # deployments and upgrades converge to the same schema without Alembic.
         for stmt in [
+            # ── Backtest session columns ──────────────────────────────────────
             "ALTER TABLE backtest_sessions ADD COLUMN IF NOT EXISTS no_trade_reason VARCHAR(30)",
             "ALTER TABLE backtest_sessions ADD COLUMN IF NOT EXISTS expiry_date DATE",
             "ALTER TABLE backtest_sessions ADD COLUMN IF NOT EXISTS data_source VARCHAR(20)",
@@ -42,10 +49,11 @@ async def init_db():
             "ALTER TABLE backtest_sessions ADD COLUMN IF NOT EXISTS signal_score INTEGER",
             "ALTER TABLE backtest_sessions ADD COLUMN IF NOT EXISTS atr14 NUMERIC(10,2)",
             "ALTER TABLE backtest_sessions ADD COLUMN IF NOT EXISTS r_multiple NUMERIC(6,2)",
-            # Paper trading tables (idempotent — create_all handles initial creation)
-            # No ALTER needed; new tables are created fresh by SQLAlchemy create_all above
-            # Phase 1 ORB fix — new columns on existing paper trading tables
+            "ALTER TABLE backtest_sessions ADD COLUMN IF NOT EXISTS user_id UUID REFERENCES users(id)",
+            # ── Paper session columns ─────────────────────────────────────────
             "ALTER TABLE paper_sessions ADD COLUMN IF NOT EXISTS final_session_state VARCHAR(30)",
+            "ALTER TABLE paper_sessions ADD COLUMN IF NOT EXISTS user_id UUID REFERENCES users(id)",
+            # ── strategy_minute_decisions columns ─────────────────────────────
             "ALTER TABLE strategy_minute_decisions ADD COLUMN IF NOT EXISTS session_state VARCHAR(30)",
             "ALTER TABLE strategy_minute_decisions ADD COLUMN IF NOT EXISTS signal_substate VARCHAR(30)",
             "ALTER TABLE strategy_minute_decisions ADD COLUMN IF NOT EXISTS rejection_gate VARCHAR(10)",
@@ -54,9 +62,12 @@ async def init_db():
             "ALTER TABLE strategy_minute_decisions ADD COLUMN IF NOT EXISTS selected_candidate_rank INTEGER",
             "ALTER TABLE strategy_minute_decisions ADD COLUMN IF NOT EXISTS selected_candidate_score NUMERIC(10,4)",
             "ALTER TABLE strategy_minute_decisions ADD COLUMN IF NOT EXISTS selected_candidate_score_breakdown_json JSONB",
+            # ── paper_trade_minute_marks columns ─────────────────────────────
             "ALTER TABLE paper_trade_minute_marks ADD COLUMN IF NOT EXISTS gross_mtm NUMERIC(10,2)",
             "ALTER TABLE paper_trade_minute_marks ADD COLUMN IF NOT EXISTS estimated_exit_charges NUMERIC(10,2)",
             "ALTER TABLE paper_trade_minute_marks ADD COLUMN IF NOT EXISTS estimated_net_mtm NUMERIC(10,2)",
+            "ALTER TABLE paper_trade_minute_marks ADD COLUMN IF NOT EXISTS price_freshness_json JSONB",
+            # ── paper_trade_headers columns ───────────────────────────────────
             "ALTER TABLE paper_trade_headers ADD COLUMN IF NOT EXISTS charges NUMERIC(10,2)",
             "ALTER TABLE paper_trade_headers ADD COLUMN IF NOT EXISTS charges_breakdown_json JSONB",
             "ALTER TABLE paper_trade_headers ADD COLUMN IF NOT EXISTS strategy_name VARCHAR(50)",
@@ -69,6 +80,5 @@ async def init_db():
             "ALTER TABLE paper_trade_headers ADD COLUMN IF NOT EXISTS selected_candidate_rank INTEGER",
             "ALTER TABLE paper_trade_headers ADD COLUMN IF NOT EXISTS selected_candidate_score NUMERIC(10,4)",
             "ALTER TABLE paper_trade_headers ADD COLUMN IF NOT EXISTS selected_candidate_score_breakdown_json JSONB",
-            "ALTER TABLE paper_trade_minute_marks ADD COLUMN IF NOT EXISTS price_freshness_json JSONB",
         ]:
             await conn.execute(__import__("sqlalchemy").text(stmt))

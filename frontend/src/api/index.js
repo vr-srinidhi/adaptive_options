@@ -3,6 +3,22 @@ import axios from 'axios'
 const api = axios.create({
   baseURL: import.meta.env.VITE_API_URL || '/api',
   timeout: 120000,
+  withCredentials: true,  // needed for HttpOnly refresh cookie
+})
+
+// ── Auth interceptor: attach access token from in-memory store ────────────────
+// The token is injected by AuthContext via the `setToken` helper below.
+let _accessToken = null
+
+export function setToken(token) {
+  _accessToken = token
+}
+
+api.interceptors.request.use(config => {
+  if (_accessToken && !config.headers['Authorization']) {
+    config.headers['Authorization'] = `Bearer ${_accessToken}`
+  }
+  return config
 })
 
 // ── Backtest ──────────────────────────────────────────────────────────────────
@@ -20,3 +36,17 @@ export const getPaperDecisions = (id, params) => api.get(`/paper/session/${id}/d
 export const getPaperTrade = (id) => api.get(`/paper/session/${id}/trade`)
 export const getPaperMarks = (id) => api.get(`/paper/session/${id}/trade/marks`)
 export const getPaperCandles = (id) => api.get(`/paper/session/${id}/candles`)
+
+// ── App Auth ──────────────────────────────────────────────────────────────────
+export const authRegister = (payload) => api.post('/users/register', payload)
+export const authLogin = (payload) => api.post('/users/login', payload)
+export const authRefresh = () => api.post('/users/refresh')
+export const authLogout = () => api.post('/users/logout')
+export const authMe = () => api.get('/users/me')
+
+// ── Zerodha ───────────────────────────────────────────────────────────────────
+export const zerodhaLoginUrl = () => api.get('/auth/zerodha/login-url')
+export const zerodhaSession = (payload) => api.post('/auth/zerodha/session', payload)
+export const zerodhaStatus = () => api.get('/auth/zerodha/status')
+
+export default api
