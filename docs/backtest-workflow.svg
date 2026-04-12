@@ -1,0 +1,128 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1400" height="1680" viewBox="0 0 1400 1680" role="img" aria-labelledby="title desc">
+  <title id="title">Adaptive Options Backtest Workflow</title>
+  <desc id="desc">Workflow diagram showing frontend request flow, backend validation, daily simulation, persistence, and dashboard display.</desc>
+  <defs>
+    <style>
+      .bg { fill: #f8fafc; }
+      .title { font: 700 30px Arial, sans-serif; fill: #0f172a; }
+      .subtitle { font: 400 16px Arial, sans-serif; fill: #475569; }
+      .box-title { font: 700 18px Arial, sans-serif; fill: #0f172a; }
+      .box-text { font: 400 14px Arial, sans-serif; fill: #334155; }
+      .section-title { font: 700 20px Arial, sans-serif; fill: #1e293b; }
+      .arrow { stroke: #475569; stroke-width: 3; fill: none; marker-end: url(#arrowhead); }
+      .note { font: 400 13px Arial, sans-serif; fill: #1e293b; }
+    </style>
+    <marker id="arrowhead" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto">
+      <polygon points="0 0, 10 3.5, 0 7" fill="#475569" />
+    </marker>
+  </defs>
+
+  <rect class="bg" x="0" y="0" width="1400" height="1680" rx="24" />
+
+  <text class="title" x="700" y="52" text-anchor="middle">Adaptive Options Backtest Workflow</text>
+  <text class="subtitle" x="700" y="82" text-anchor="middle">UI -> API -> Simulation Engine -> PostgreSQL -> Dashboard</text>
+
+  <text class="section-title" x="110" y="138">1. Frontend Request</text>
+  <rect x="100" y="160" width="1200" height="150" rx="18" fill="#dbeafe" stroke="#60a5fa" stroke-width="2" />
+  <rect x="140" y="195" width="300" height="80" rx="14" fill="#ffffff" stroke="#93c5fd" stroke-width="2" />
+  <text class="box-title" x="290" y="225" text-anchor="middle">User Inputs</text>
+  <text class="box-text" x="290" y="246" text-anchor="middle">instrument, capital, start date, end date</text>
+  <rect x="550" y="195" width="300" height="80" rx="14" fill="#ffffff" stroke="#93c5fd" stroke-width="2" />
+  <text class="box-title" x="700" y="225" text-anchor="middle">Run Backtest</text>
+  <text class="box-text" x="700" y="246" text-anchor="middle">[Backtest.jsx] handleRun()</text>
+  <rect x="960" y="195" width="300" height="80" rx="14" fill="#ffffff" stroke="#93c5fd" stroke-width="2" />
+  <text class="box-title" x="1110" y="225" text-anchor="middle">POST /api/backtest/run</text>
+  <text class="box-text" x="1110" y="246" text-anchor="middle">[api/index.js] runBacktest()</text>
+  <path class="arrow" d="M440 235 L550 235" />
+  <path class="arrow" d="M850 235 L960 235" />
+
+  <path class="arrow" d="M700 310 L700 360" />
+
+  <text class="section-title" x="110" y="400">2. API Validation and Day Expansion</text>
+  <rect x="100" y="420" width="1200" height="220" rx="18" fill="#e2e8f0" stroke="#94a3b8" stroke-width="2" />
+  <rect x="140" y="465" width="300" height="110" rx="14" fill="#ffffff" stroke="#cbd5e1" stroke-width="2" />
+  <text class="box-title" x="290" y="495" text-anchor="middle">Parse and Validate</text>
+  <text class="box-text" x="290" y="518" text-anchor="middle">date format</text>
+  <text class="box-text" x="290" y="538" text-anchor="middle">end date >= start date</text>
+  <text class="box-text" x="290" y="558" text-anchor="middle">instrument, capital, max 60 days</text>
+  <rect x="550" y="465" width="300" height="110" rx="14" fill="#ffffff" stroke="#cbd5e1" stroke-width="2" />
+  <text class="box-title" x="700" y="495" text-anchor="middle">Trading Day Filter</text>
+  <text class="box-text" x="700" y="518" text-anchor="middle">_trading_days()</text>
+  <text class="box-text" x="700" y="538" text-anchor="middle">keep weekdays only</text>
+  <text class="box-text" x="700" y="558" text-anchor="middle">build list of daily sessions</text>
+  <rect x="960" y="465" width="300" height="110" rx="14" fill="#ffffff" stroke="#cbd5e1" stroke-width="2" />
+  <text class="box-title" x="1110" y="495" text-anchor="middle">For Each Trading Day</text>
+  <text class="box-text" x="1110" y="518" text-anchor="middle">run_day_simulation()</text>
+  <text class="box-text" x="1110" y="538" text-anchor="middle">one backtest session per date</text>
+  <path class="arrow" d="M440 520 L550 520" />
+  <path class="arrow" d="M850 520 L960 520" />
+
+  <path class="arrow" d="M700 640 L700 690" />
+
+  <text class="section-title" x="110" y="730">3. Daily Simulation Engine</text>
+  <rect x="100" y="750" width="1200" height="690" rx="18" fill="#dcfce7" stroke="#4ade80" stroke-width="2" />
+
+  <rect x="150" y="800" width="500" height="120" rx="16" fill="#ffffff" stroke="#86efac" stroke-width="2" />
+  <text class="box-title" x="400" y="832" text-anchor="middle">Generate Deterministic Market Data</text>
+  <text class="box-text" x="400" y="856" text-anchor="middle">seed = md5(date + instrument)</text>
+  <text class="box-text" x="400" y="878" text-anchor="middle">base price from yfinance or synthetic fallback</text>
+  <text class="box-text" x="400" y="900" text-anchor="middle">375 one-minute OHLC candles</text>
+
+  <rect x="750" y="800" width="500" height="120" rx="16" fill="#ffffff" stroke="#86efac" stroke-width="2" />
+  <text class="box-title" x="1000" y="832" text-anchor="middle">Compute Indicators</text>
+  <text class="box-text" x="1000" y="856" text-anchor="middle">EMA(5), EMA(20), RSI(14), IV Rank</text>
+  <text class="box-text" x="1000" y="878" text-anchor="middle">read values at 09:30 only</text>
+  <text class="box-text" x="1000" y="900" text-anchor="middle">spot_in = close at candle index 15</text>
+
+  <path class="arrow" d="M650 860 L750 860" />
+
+  <rect x="420" y="980" width="560" height="120" rx="16" fill="#ffffff" stroke="#86efac" stroke-width="2" />
+  <text class="box-title" x="700" y="1012" text-anchor="middle">Select Regime and Strategy</text>
+  <text class="box-text" x="700" y="1036" text-anchor="middle">BULLISH / BEARISH / NEUTRAL from EMA spread</text>
+  <text class="box-text" x="700" y="1058" text-anchor="middle">RSI hard override: if RSI &gt; 70 or &lt; 30 then NO_TRADE</text>
+  <text class="box-text" x="700" y="1080" text-anchor="middle">Choose IRON_CONDOR / BULL_PUT_SPREAD / BEAR_CALL_SPREAD / NO_TRADE</text>
+
+  <path class="arrow" d="M700 920 L700 980" />
+
+  <polygon points="700,1135 835,1210 700,1285 565,1210" fill="#ffffff" stroke="#86efac" stroke-width="2" />
+  <text class="box-title" x="700" y="1202" text-anchor="middle">Strategy</text>
+  <text class="box-title" x="700" y="1224" text-anchor="middle">NO_TRADE?</text>
+
+  <rect x="150" y="1160" width="280" height="100" rx="16" fill="#ffffff" stroke="#86efac" stroke-width="2" />
+  <text class="box-title" x="290" y="1192" text-anchor="middle">No Trade Result</text>
+  <text class="box-text" x="290" y="1216" text-anchor="middle">lots = 0</text>
+  <text class="box-text" x="290" y="1238" text-anchor="middle">exit_reason = NO_SIGNAL</text>
+
+  <rect x="970" y="1145" width="260" height="130" rx="16" fill="#ffffff" stroke="#86efac" stroke-width="2" />
+  <text class="box-title" x="1100" y="1175" text-anchor="middle">Build Legs</text>
+  <text class="box-text" x="1100" y="1198" text-anchor="middle">ATM-based strikes</text>
+  <text class="box-text" x="1100" y="1220" text-anchor="middle">entry premium per leg</text>
+  <text class="box-text" x="1100" y="1242" text-anchor="middle">2 or 4 option legs</text>
+
+  <path class="arrow" d="M565 1210 L430 1210" />
+  <path class="arrow" d="M835 1210 L970 1210" />
+  <text class="note" x="485" y="1198" text-anchor="middle">Yes</text>
+  <text class="note" x="915" y="1198" text-anchor="middle">No</text>
+
+  <rect x="910" y="1320" width="380" height="90" rx="16" fill="#ffffff" stroke="#86efac" stroke-width="2" />
+  <text class="box-title" x="1100" y="1350" text-anchor="middle">Size Position</text>
+  <text class="box-text" x="1100" y="1373" text-anchor="middle">risk = 2% of capital</text>
+  <text class="box-text" x="1100" y="1395" text-anchor="middle">compute lots, max profit, max loss</text>
+
+  <path class="arrow" d="M1100 1275 L1100 1320" />
+
+  <path class="arrow" d="M700 1440 L700 1490" />
+
+  <text class="section-title" x="110" y="1530">4. Persistence and UI Results</text>
+  <rect x="100" y="1550" width="1200" height="90" rx="18" fill="#fde68a" stroke="#f59e0b" stroke-width="2" />
+  <text class="box-title" x="250" y="1604" text-anchor="middle">Minute-by-minute P&amp;L loop</text>
+  <text class="box-title" x="585" y="1604" text-anchor="middle">Save BacktestSession to PostgreSQL</text>
+  <text class="box-title" x="1000" y="1604" text-anchor="middle">Return JSON -> Dashboard / Trade Book</text>
+  <path class="arrow" d="M390 1595 L470 1595" />
+  <path class="arrow" d="M760 1595 L860 1595" />
+
+  <path class="arrow" d="M290 1260 C290 1460, 290 1460, 290 1550" />
+  <path class="arrow" d="M1100 1410 C1100 1490, 1100 1490, 1000 1550" />
+
+  <text class="note" x="90" y="1665">Board-ready asset for import into Miro. Source flow is based on frontend Backtest page, backend router, strategy selector, simulator, and PostgreSQL persistence.</text>
+</svg>

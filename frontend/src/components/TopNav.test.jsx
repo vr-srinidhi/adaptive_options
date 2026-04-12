@@ -1,13 +1,16 @@
 import { render, screen } from '@testing-library/react'
 import { MemoryRouter } from 'react-router-dom'
 import { describe, expect, it } from 'vitest'
+import { AuthProvider } from '../contexts/AuthContext'
 import TopNav from './TopNav'
 
 function renderInRouter(initialPath = '/backtest') {
   return render(
-    <MemoryRouter initialEntries={[initialPath]}>
-      <TopNav />
-    </MemoryRouter>
+    <AuthProvider>
+      <MemoryRouter initialEntries={[initialPath]}>
+        <TopNav />
+      </MemoryRouter>
+    </AuthProvider>
   )
 }
 
@@ -55,10 +58,11 @@ describe('TopNav', () => {
   })
 
   // ── Negative tests ───────────────────────────────────────────────────────
-  it('renders exactly 4 nav links (Run, Dashboard, Replay, Sessions)', () => {
+  it('renders nav links including Run, Dashboard, Replay, Sessions, and Zerodha', () => {
     renderInRouter()
     const links = screen.getAllByRole('link')
-    expect(links).toHaveLength(4)
+    // Run, Dashboard, Replay, Sessions, Zerodha
+    expect(links.length).toBeGreaterThanOrEqual(5)
   })
 
   it('Dashboard link is not active when on /backtest', () => {

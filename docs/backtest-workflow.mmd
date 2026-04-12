@@ -1,0 +1,37 @@
+flowchart TD
+    A[User enters Instrument / Capital / Start / End] --> B[Click Run Backtest]
+    B --> C[Frontend POST /api/backtest/run]
+    C --> D{Request valid?}
+
+    D -->|No| Z[Return 400 error to UI]
+    D -->|Yes| E[Build weekday trading-day list]
+
+    E --> F{For each trading day}
+    F --> G[Generate deterministic 1-min candles]
+    G --> H[Compute EMA5, EMA20, RSI14, IV Rank]
+    H --> I[Read values at 09:30]
+    I --> J[Select regime + strategy]
+
+    J -->|NO_TRADE| K[Create no-trade result]
+    J -->|Trade| L[Build option legs]
+    L --> M[Size position]
+    M --> N[Minute-by-minute PnL loop]
+
+    N --> O{Exit condition hit?}
+    O -->|Profit target| P[Exit]
+    O -->|Hard stop| P
+    O -->|15:15 EOD| P
+    O -->|No| N
+
+    P --> Q[Reprice legs at exit]
+    Q --> R[Compute total PnL and result]
+
+    K --> S[Save session to PostgreSQL]
+    R --> S
+
+    S --> T{More trading days left?}
+    T -->|Yes| F
+    T -->|No| U[Commit and return sessions]
+
+    U --> V[Frontend redirects to Dashboard]
+    V --> W[Dashboard loads results, summary, trade book]

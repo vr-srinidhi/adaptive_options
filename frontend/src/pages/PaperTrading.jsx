@@ -110,7 +110,7 @@ export default function PaperTrading() {
           <div>
             <label className={labelCls} style={labelStyle}>Zerodha Access Token</label>
             <input
-              type="password"
+              type="text"
               className={inputCls}
               style={inputStyle}
               placeholder="Paste today's access token…"

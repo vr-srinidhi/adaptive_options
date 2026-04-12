@@ -261,6 +261,58 @@ The nginx config proxies `/api/*` to `backend:8000`. The SPA fallback handles al
 
 ---
 
+## Security Architecture (SEC-1 / SEC-2)
+
+### App Authentication
+
+Email/password auth with JWT.
+
+| Flow step | Endpoint | Notes |
+|-----------|----------|-------|
+| Register | POST `/api/users/register` | email + password (≥8 chars) |
+| Login | POST `/api/users/login` | returns `access_token` (15 min) + sets HttpOnly `refresh_token` cookie (7 days) |
+| Refresh | POST `/api/users/refresh` | reads cookie, returns new access_token |
+| Logout | POST `/api/users/logout` | clears cookie |
+| Profile | GET `/api/users/me` | requires Bearer token |
+
+All business endpoints (`/backtest/*`, `/paper/*`, `/auth/zerodha/*`) require `Authorization: Bearer <access_token>`.
+
+### Broker Token Storage
+
+Zerodha access tokens are stored **server-side** — never sent to or stored in the browser.
+
+1. Authenticate with app (login)
+2. POST `/api/auth/zerodha/session` with `request_token` → backend encrypts + stores in `broker_tokens` table
+3. POST `/api/paper/session/run` — no `access_token` in body; backend retrieves from DB for the current user
+
+Encryption uses Fernet (symmetric). Key priority: `BROKER_TOKEN_ENCRYPTION_KEY` env var → fallback derived from `SECRET_KEY` (dev only).
+
+### Required env vars (production)
+
+| Variable | Purpose |
+|----------|---------|
+| `SECRET_KEY` | JWT signing key — generate with `openssl rand -hex 32` |
+| `BROKER_TOKEN_ENCRYPTION_KEY` | Fernet key — generate with `python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"` |
+| `ALLOWED_ORIGINS` | Comma-separated CORS origins (e.g. `https://yourapp.railway.app`) |
+| `ENVIRONMENT` | Set to `production` to enable HSTS + fail-fast on default secrets |
+
+The app will **refuse to start** in production if `SECRET_KEY` is the default placeholder or `BROKER_TOKEN_ENCRYPTION_KEY` is unset.
+
+### Alembic Migrations
+
+`alembic.ini` + `app/migrations/` are set up. To apply migrations manually:
+
+```bash
+cd backend
+alembic upgrade head       # apply pending migrations
+alembic current            # show current revision
+alembic revision --autogenerate -m "description"  # generate new migration
+```
+
+The runtime `create_all` + idempotent `ALTER TABLE IF NOT EXISTS` in `init_db()` remains as a safety net for Docker startup compatibility.
+
+---
+
 ## What NOT to Change Without Care
 
 - `_seed()` in `simulator.py` — changing breaks determinism guarantee
