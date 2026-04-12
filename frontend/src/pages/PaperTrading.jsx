@@ -8,6 +8,7 @@ export default function PaperTrading() {
     instrument: 'NIFTY',
     capital: 2500000,
     date: '2026-04-07',
+    access_token: '',
   })
   const [running, setRunning] = useState(false)
   const [error, setError] = useState(null)
@@ -16,23 +17,21 @@ export default function PaperTrading() {
 
   const handleRun = async () => {
     setError(null)
+    if (!form.access_token.trim()) {
+      setError('Zerodha access token is required.')
+      return
+    }
     setRunning(true)
     try {
       const res = await runPaperSession({
         instrument: form.instrument,
         capital: parseFloat(form.capital),
         date: form.date,
+        access_token: form.access_token.trim(),
       })
       navigate(`/paper/session/${res.data.session_id}`)
     } catch (err) {
-      const detail = err.response?.data?.detail
-      if (typeof detail === 'string' && detail.includes('No Zerodha access token')) {
-        setError(
-          'No Zerodha token found. Connect your account first.',
-        )
-      } else {
-        setError(detail || err.message || 'Engine error.')
-      }
+      setError(err.response?.data?.detail || err.message || 'Engine error.')
     } finally {
       setRunning(false)
     }
@@ -108,16 +107,20 @@ export default function PaperTrading() {
             <div className="text-xs mt-1" style={{ color: 'var(--text-secondary)' }}>Must be a trading day with valid Zerodha data</div>
           </div>
 
-          <div className="flex flex-col justify-end">
-            <div className="text-xs px-3 py-2 rounded"
-              style={{ background: 'rgba(59,130,246,0.08)', border: '1px solid rgba(59,130,246,0.2)', color: '#64748b' }}>
-              Zerodha token loaded from server.{' '}
-              <button
-                onClick={() => window.open('/zerodha-connect', '_self')}
-                className="underline"
-                style={{ color: '#3b82f6', background: 'none', border: 'none', cursor: 'pointer', padding: 0 }}>
-                Reconnect
-              </button>
+          <div>
+            <label className={labelCls} style={labelStyle}>Zerodha Access Token</label>
+            <input
+              type="text"
+              className={inputCls}
+              style={inputStyle}
+              placeholder="Paste today's access token…"
+              value={form.access_token}
+              onChange={e => set('access_token', e.target.value)}
+              disabled={running}
+              autoComplete="off"
+            />
+            <div className="text-xs mt-1" style={{ color: 'var(--text-secondary)' }}>
+              Expires daily at 6 AM IST · never stored in DB
             </div>
           </div>
         </div>
@@ -126,12 +129,6 @@ export default function PaperTrading() {
           <div className="mb-4 px-3 py-2 rounded text-xs"
             style={{ background: 'rgba(239,68,68,0.1)', border: '1px solid rgba(239,68,68,0.3)', color: '#ef4444' }}>
             {error}
-            {error.includes('Connect your account') && (
-              <> <button onClick={() => window.open('/zerodha-connect', '_self')}
-                className="underline ml-1" style={{ color: '#ef4444', background: 'none', border: 'none', cursor: 'pointer', padding: 0 }}>
-                Connect now
-              </button></>
-            )}
           </div>
         )}
 

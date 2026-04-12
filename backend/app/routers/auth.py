@@ -96,8 +96,11 @@ async def get_status(
     if not token:
         return {"authenticated": False, "profile": None}
     try:
-        zerodha_client._get_kite().set_access_token(token)
-        profile = zerodha_client.get_profile()
+        # Use a temporary KiteConnect instance so we don't mutate the shared singleton.
+        from kiteconnect import KiteConnect
+        tmp = KiteConnect(api_key=zerodha_client.API_KEY)
+        tmp.set_access_token(token)
+        profile = tmp.profile()
         return {"authenticated": True, "profile": profile}
     except Exception:
         return {"authenticated": False, "profile": None}

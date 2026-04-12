@@ -21,6 +21,7 @@ from app.core.security import (
     hash_password,
     verify_password,
 )
+from app.core.config import settings
 from app.core.rate_limit import limiter
 from app.database import get_db
 from app.dependencies.auth import get_current_active_user
@@ -30,7 +31,15 @@ from app.services.audit import log_event
 router = APIRouter(prefix="/users", tags=["users"])
 
 _REFRESH_COOKIE = "refresh_token"
-_COOKIE_OPTS = dict(httponly=True, secure=False, samesite="lax", path="/api/users/refresh")
+# secure=True in production (requires HTTPS).
+# SameSite=lax + HttpOnly already mitigates CSRF for cross-origin requests;
+# secure=True additionally prevents the cookie being sent over plain HTTP.
+_COOKIE_OPTS = dict(
+    httponly=True,
+    secure=(settings.ENVIRONMENT == "production"),
+    samesite="lax",
+    path="/api/users/refresh",
+)
 
 
 # ── Schemas ───────────────────────────────────────────────────────────────────

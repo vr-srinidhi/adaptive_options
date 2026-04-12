@@ -33,10 +33,33 @@ from app.models.paper_trade import (
 )
 from app.models.user import User
 from app.services.paper_engine import run_paper_engine
-from app.services.token_store import get_broker_token
 from app.services.zerodha_client import DataUnavailableError
 
 router = APIRouter()
+
+
+# ── Ownership helper ──────────────────────────────────────────────────────────
+
+async def _get_owned_session(
+    sid: uuid.UUID,
+    user: User,
+    db: AsyncSession,
+) -> PaperSession:
+    """Load a PaperSession and enforce ownership. Raises 404 if not found or not owned.
+
+    user_id IS NULL: intentional migration bridge — sessions created before auth was
+    added have no owner and remain accessible to any authenticated user until they are
+    re-created or deleted.
+    """
+    s = (await db.execute(
+        select(PaperSession).where(
+            PaperSession.id == sid,
+            (PaperSession.user_id == user.id) | (PaperSession.user_id.is_(None)),
+        )
+    )).scalar_one_or_none()
+    if not s:
+        raise HTTPException(status_code=404, detail="Session not found.")
+    return s
 
 
 # ── Request schema ────────────────────────────────────────────────────────────
@@ -45,6 +68,7 @@ class RunSessionRequest(BaseModel):
     instrument: str
     date: str
     capital: float
+    access_token: str
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -177,14 +201,10 @@ async def run_session(
         raise HTTPException(status_code=400, detail="instrument must be NIFTY or BANKNIFTY.")
     if not (50_000 <= req.capital <= 10_000_000):
         raise HTTPException(status_code=400, detail="Capital must be ₹50,000 – ₹10,000,000.")
+    if not req.access_token or len(req.access_token) < 10:
+        raise HTTPException(status_code=400, detail="A valid Zerodha access token is required.")
 
-    # Retrieve stored Zerodha token for this user
-    access_token = await get_broker_token(db, user.id)
-    if not access_token:
-        raise HTTPException(
-            status_code=422,
-            detail="No Zerodha access token found. Connect your Zerodha account first via POST /api/auth/zerodha/session.",
-        )
+    access_token = req.access_token
 
     # Create session row (status=RUNNING)
     session_id = uuid.uuid4()
@@ -291,11 +311,7 @@ async def get_session(
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid session ID.")
 
-    s = (await db.execute(
-        select(PaperSession).where(PaperSession.id == sid)
-    )).scalar_one_or_none()
-    if not s:
-        raise HTTPException(status_code=404, detail="Session not found.")
+    s = await _get_owned_session(sid, user, db)
 
     # Quick stats: count decisions by action
     from sqlalchemy import func
@@ -323,6 +339,8 @@ async def get_decisions(
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid session ID.")
 
+    await _get_owned_session(sid, user, db)  # ownership check
+
     q = (
         select(MinuteDecision)
         .where(MinuteDecision.session_id == sid)
@@ -345,6 +363,8 @@ async def get_trade(
         sid = uuid.UUID(session_id)
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid session ID.")
+
+    await _get_owned_session(sid, user, db)  # ownership check
 
     trade = (await db.execute(
         select(PaperTradeHeader).where(PaperTradeHeader.session_id == sid)
@@ -370,6 +390,8 @@ async def get_marks(
         sid = uuid.UUID(session_id)
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid session ID.")
+
+    await _get_owned_session(sid, user, db)  # ownership check
 
     trade = (await db.execute(
         select(PaperTradeHeader).where(PaperTradeHeader.session_id == sid)
@@ -401,6 +423,8 @@ async def get_candles(
         sid = uuid.UUID(session_id)
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid session ID.")
+
+    await _get_owned_session(sid, user, db)  # ownership check
 
     rows = (await db.execute(
         select(PaperCandleSeries)

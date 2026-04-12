@@ -261,7 +261,11 @@ async def get_session(
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid session ID.")
     row = (await db.execute(
-        select(BacktestSession).where(BacktestSession.id == sid)
+        select(BacktestSession).where(
+            BacktestSession.id == sid,
+            # user_id IS NULL: intentional bridge for sessions created before auth was added
+            (BacktestSession.user_id == user.id) | (BacktestSession.user_id.is_(None)),
+        )
     )).scalar_one_or_none()
     if not row:
         raise HTTPException(status_code=404, detail="Session not found.")

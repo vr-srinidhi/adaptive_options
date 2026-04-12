@@ -4,8 +4,7 @@ import { useAuth } from '../contexts/AuthContext'
 
 export default function Login() {
   const navigate = useNavigate()
-  const { login, register } = useAuth()
-  const [mode, setMode] = useState('login')   // 'login' | 'register'
+  const { login } = useAuth()
   const [email, setEmail] = useState('')
   const [password, setPassword] = useState('')
   const [loading, setLoading] = useState(false)
@@ -19,11 +18,7 @@ export default function Login() {
     setError(null)
     setLoading(true)
     try {
-      if (mode === 'register') {
-        await register(email, password)
-      } else {
-        await login(email, password)
-      }
+      await login(email, password)
       navigate('/backtest', { replace: true })
     } catch (err) {
       setError(err.response?.data?.detail || err.message || 'Authentication failed.')
@@ -45,19 +40,6 @@ export default function Login() {
 
         <div className="rounded-xl p-6"
           style={{ background: 'var(--surface-secondary)', border: '1px solid var(--border)' }}>
-          <div className="flex gap-2 mb-6">
-            {['login', 'register'].map(m => (
-              <button key={m} onClick={() => setMode(m)}
-                className="flex-1 py-1.5 rounded text-xs font-semibold capitalize transition"
-                style={{
-                  background: mode === m ? '#3b82f6' : 'var(--surface)',
-                  color: mode === m ? '#fff' : 'var(--text-secondary)',
-                }}>
-                {m === 'login' ? 'Sign In' : 'Create Account'}
-              </button>
-            ))}
-          </div>
-
           <form onSubmit={handleSubmit} className="space-y-4">
             <div>
               <label className="block text-xs uppercase tracking-widest mb-1.5"
@@ -71,8 +53,8 @@ export default function Login() {
                 style={{ color: 'var(--text-secondary)' }}>Password</label>
               <input type="password" required className={inputCls} style={inputStyle}
                 value={password} onChange={e => setPassword(e.target.value)}
-                placeholder={mode === 'register' ? 'Min 8 characters' : ''}
-                autoComplete={mode === 'login' ? 'current-password' : 'new-password'} />
+                placeholder=""
+                autoComplete="current-password" />
             </div>
 
             {error && (
@@ -89,7 +71,7 @@ export default function Login() {
                 color: loading ? '#94a3b8' : '#fff',
                 cursor: loading ? 'not-allowed' : 'pointer',
               }}>
-              {loading ? 'Please wait…' : mode === 'login' ? 'Sign In' : 'Create Account'}
+              {loading ? 'Please wait…' : 'Sign In'}
             </button>
           </form>
         </div>
