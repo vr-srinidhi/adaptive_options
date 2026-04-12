@@ -74,7 +74,6 @@ async def create_session(
 
     asyncio.ensure_future(
         log_event(
-            db,
             "ZERODHA_CONNECT",
             user_id=user.id,
             ip_address=request.client.host if request.client else "unknown",

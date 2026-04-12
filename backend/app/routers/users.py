@@ -75,7 +75,7 @@ async def register(
     await db.refresh(user)
 
     asyncio.ensure_future(
-        log_event(db, "REGISTER", user_id=user.id, ip_address=_get_ip(request))
+        log_event("REGISTER", user_id=user.id, ip_address=_get_ip(request))
     )
     return {"id": str(user.id), "email": user.email}
 
@@ -109,7 +109,7 @@ async def login(
     )
 
     asyncio.ensure_future(
-        log_event(db, "LOGIN", user_id=user.id, ip_address=_get_ip(request))
+        log_event("LOGIN", user_id=user.id, ip_address=_get_ip(request))
     )
     return {"access_token": access_token, "token_type": "bearer"}
 
