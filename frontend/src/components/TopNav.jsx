@@ -1,5 +1,6 @@
 import { NavLink, useLocation, useNavigate } from 'react-router-dom'
 import { useAuth } from '../contexts/AuthContext'
+import BrandLogo from './BrandLogo'
 
 export default function TopNav() {
   const location = useLocation()
@@ -32,10 +33,7 @@ export default function TopNav() {
         borderBottom: '0.5px solid var(--border)',
       }}
     >
-      {/* Logo */}
-      <span className="font-bold text-slate-100 mr-6 tracking-tight text-sm">
-        Adaptive<span className="text-blue-400">Options</span>
-      </span>
+      <BrandLogo size={28} className="mr-6" />
 
       {/* Divider label */}
       <span className="text-xs mr-2 px-1.5 py-0.5 rounded"

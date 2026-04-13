@@ -142,6 +142,8 @@ describe('PaperTradeBook page', () => {
       expect(screen.getByText('Spread Selection')).toBeInTheDocument()
     })
 
+    expect(screen.getByAltText('Adaptive Options logo')).toBeInTheDocument()
+    expect(screen.getByText('Paper Session Detail Report')).toBeInTheDocument()
     expect(screen.getByText('ranked_candidate_selection_v1')).toBeInTheDocument()
     expect(screen.getAllByText('22100/22150 CE').length).toBeGreaterThan(0)
     expect(screen.getAllByText('#1').length).toBeGreaterThan(0)

@@ -1,6 +1,7 @@
 import { useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { useAuth } from '../contexts/AuthContext'
+import BrandLogo from '../components/BrandLogo'
 
 export default function Login() {
   const navigate = useNavigate()
@@ -32,10 +33,12 @@ export default function Login() {
       style={{ background: 'var(--surface)' }}>
       <div className="w-full max-w-sm">
         <div className="text-center mb-8">
-          <h1 className="text-2xl font-bold text-slate-100 mb-1">Adaptive Options</h1>
-          <p className="text-xs" style={{ color: 'var(--text-secondary)' }}>
-            Options backtesting &amp; paper trading platform
-          </p>
+          <BrandLogo
+            size={76}
+            stacked
+            className="items-center justify-center"
+            subtitle="Options backtesting & paper trading platform"
+          />
         </div>
 
         <div className="rounded-xl p-6"
