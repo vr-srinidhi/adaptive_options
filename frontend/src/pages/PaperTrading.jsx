@@ -8,7 +8,7 @@ export default function PaperTrading() {
     instrument: 'NIFTY',
     capital: 2500000,
     date: '2026-04-07',
-    access_token: '',
+    request_token: '',
   })
   const [running, setRunning] = useState(false)
   const [error, setError] = useState(null)
@@ -17,18 +17,17 @@ export default function PaperTrading() {
 
   const handleRun = async () => {
     setError(null)
-    if (!form.access_token.trim()) {
-      setError('Zerodha access token is required.')
-      return
-    }
     setRunning(true)
     try {
-      const res = await runPaperSession({
+      const payload = {
         instrument: form.instrument,
         capital: parseFloat(form.capital),
         date: form.date,
-        access_token: form.access_token.trim(),
-      })
+      }
+      if (form.request_token.trim()) {
+        payload.request_token = form.request_token.trim()
+      }
+      const res = await runPaperSession(payload)
       navigate(`/paper/session/${res.data.session_id}`)
     } catch (err) {
       setError(err.response?.data?.detail || err.message || 'Engine error.')
@@ -108,19 +107,19 @@ export default function PaperTrading() {
           </div>
 
           <div>
-            <label className={labelCls} style={labelStyle}>Zerodha Access Token</label>
+            <label className={labelCls} style={labelStyle}>Zerodha Request Token</label>
             <input
               type="text"
               className={inputCls}
               style={inputStyle}
-              placeholder="Paste today's access token…"
-              value={form.access_token}
-              onChange={e => set('access_token', e.target.value)}
+              placeholder="Paste request token from Zerodha redirect…"
+              value={form.request_token}
+              onChange={e => set('request_token', e.target.value)}
               disabled={running}
               autoComplete="off"
             />
             <div className="text-xs mt-1" style={{ color: 'var(--text-secondary)' }}>
-              Expires daily at 6 AM IST · never stored in DB
+              Leave blank if already authenticated today · backend auto-exchanges to access token
             </div>
           </div>
         </div>

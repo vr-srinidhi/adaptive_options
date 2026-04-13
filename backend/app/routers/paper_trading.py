@@ -32,7 +32,10 @@ from app.models.paper_trade import (
     PaperTradeMinuteMark,
 )
 from app.models.user import User
+from app.services import zerodha_client
+from app.services.audit import log_event
 from app.services.paper_engine import run_paper_engine
+from app.services.token_store import get_broker_token, store_broker_token
 from app.services.zerodha_client import DataUnavailableError
 
 router = APIRouter()
@@ -68,7 +71,8 @@ class RunSessionRequest(BaseModel):
     instrument: str
     date: str
     capital: float
-    access_token: str
+    request_token: Optional[str] = None  # preferred: backend exchanges → access token
+    access_token: Optional[str] = None   # legacy fallback: caller already exchanged
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -201,10 +205,55 @@ async def run_session(
         raise HTTPException(status_code=400, detail="instrument must be NIFTY or BANKNIFTY.")
     if not (50_000 <= req.capital <= 10_000_000):
         raise HTTPException(status_code=400, detail="Capital must be ₹50,000 – ₹10,000,000.")
-    if not req.access_token or len(req.access_token) < 10:
-        raise HTTPException(status_code=400, detail="A valid Zerodha access token is required.")
+    # ── Resolve Zerodha access token (3-path) ─────────────────────────────────
+    access_token: str = ""
 
-    access_token = req.access_token
+    if req.request_token and req.request_token.strip():
+        # Path A: exchange request token → access token, store encrypted in DB
+        try:
+            session_data = await asyncio.get_event_loop().run_in_executor(
+                None,
+                zerodha_client.generate_session,
+                req.request_token.strip(),
+            )
+        except RuntimeError as exc:
+            raise HTTPException(status_code=500, detail=str(exc))
+        except Exception as exc:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Zerodha token exchange failed: {exc}",
+            )
+        access_token = session_data.get("access_token", "")
+        await store_broker_token(db, user.id, access_token)
+        asyncio.ensure_future(
+            log_event(
+                "ZERODHA_CONNECT",
+                user_id=user.id,
+                ip_address=request.client.host if request.client else "unknown",
+            )
+        )
+
+    elif req.access_token and len(req.access_token.strip()) >= 10:
+        # Path B: legacy — caller already exchanged the token, use directly
+        access_token = req.access_token.strip()
+
+    else:
+        # Path C: no token in request — use today's stored token from DB
+        stored = await get_broker_token(db, user.id)
+        if not stored:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "No Zerodha token available. Supply a request_token "
+                    "or call POST /auth/zerodha/session first."
+                ),
+            )
+        access_token = stored
+
+    if not access_token or len(access_token) < 10:
+        raise HTTPException(
+            status_code=400, detail="Could not obtain a valid Zerodha access token."
+        )
 
     # Create session row (status=RUNNING)
     session_id = uuid.uuid4()
