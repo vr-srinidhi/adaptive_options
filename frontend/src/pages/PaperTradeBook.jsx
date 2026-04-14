@@ -2,6 +2,8 @@ import { useEffect, useRef, useState } from 'react'
 import { useParams, useNavigate } from 'react-router-dom'
 import { getPaperSession, getPaperDecisions, getPaperTrade, getPaperMarks, getPaperCandles } from '../api'
 import { PnlProgressionChart } from '../components/PnlChart'
+import BrandLogo from '../components/BrandLogo'
+import { BRAND_LOGO_PATH, BRAND_NAME, PAPER_SESSION_REPORT_NAME } from '../constants/brand'
 
 const fmtINR = v => v == null ? '—' :
   new Intl.NumberFormat('en-IN', { style: 'currency', currency: 'INR', maximumFractionDigits: 0 }).format(v)
@@ -77,6 +79,16 @@ function extractSelectionAudit(decisions, trade) {
 function buildCSV(session, trade, decisions, marks, candleSeries) {
   const rows = []
   const selectionAudit = extractSelectionAudit(decisions, trade)
+  const logoUrl = typeof window !== 'undefined'
+    ? `${window.location.origin}${BRAND_LOGO_PATH}`
+    : BRAND_LOGO_PATH
+
+  rows.push(['REPORT BRANDING'])
+  rows.push(['Brand', BRAND_NAME])
+  rows.push(['Report', PAPER_SESSION_REPORT_NAME])
+  rows.push(['Logo Asset', logoUrl])
+  rows.push(['Generated At', new Date().toISOString()])
+  rows.push([])
 
   rows.push(['SESSION SUMMARY'])
   rows.push(['Date', session.session_date])
@@ -423,13 +435,19 @@ export default function PaperTradeBook() {
 
         {/* Hero row */}
         <div className="flex items-start justify-between mb-5">
-          <div>
+          <div className="flex items-start gap-4">
+            <BrandLogo size={56} />
+            <div>
+              <div className="text-[11px] uppercase tracking-[0.35em] mb-1" style={{ color: 'var(--text-secondary)' }}>
+                {PAPER_SESSION_REPORT_NAME}
+              </div>
             <h1 className="text-lg font-bold text-slate-100">
               {session.session_date} — {session.instrument === 'NIFTY' ? 'Nifty 50' : 'Bank Nifty'} · ORB Replay
             </h1>
             <p className="text-xs mt-1" style={{ color: 'var(--text-secondary)' }}>
               {session.decision_count} minutes audited · Capital {fmtINR(session.capital)}
             </p>
+            </div>
           </div>
           {pnl != null && (
             <div className="text-right">

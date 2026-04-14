@@ -18,6 +18,7 @@ describe('TopNav', () => {
   // ── Positive tests ───────────────────────────────────────────────────────
   it('renders the brand name', () => {
     renderInRouter()
+    expect(screen.getByAltText('Adaptive Options logo')).toBeInTheDocument()
     expect(screen.getByText('Adaptive')).toBeInTheDocument()
     expect(screen.getByText('Options')).toBeInTheDocument()
   })
