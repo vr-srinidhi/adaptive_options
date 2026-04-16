@@ -101,7 +101,12 @@ async def login(
         await db.execute(select(User).where(User.email == body.email))
     ).scalar_one_or_none()
 
-    if not user or not verify_password(body.password, user.hashed_password):
+    # Run bcrypt in a thread pool — it's CPU-bound and blocks the event loop.
+    loop = asyncio.get_event_loop()
+    password_ok = user is not None and await loop.run_in_executor(
+        None, verify_password, body.password, user.hashed_password
+    )
+    if not password_ok:
         raise HTTPException(status_code=401, detail="Invalid email or password.")
 
     if not user.is_active:
