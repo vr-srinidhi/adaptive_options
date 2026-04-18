@@ -380,7 +380,7 @@ def run_paper_engine_core(
 
             rejection_gate = (
                 None if effective_action == "ENTER"
-                else _REASON_TO_GATE.get(effective_reason_code)
+                else (gate.rejection_gate or _REASON_TO_GATE.get(effective_reason_code))
             )
             audit_structure = gate.candidate_structure if gate.action == "ENTER" else gate.pre_entry_snapshot
             price_freshness_json = price_staleness_map if price_staleness_map else None
@@ -422,6 +422,8 @@ def run_paper_engine_core(
                     "_selected_candidate_rank": gate.selected_candidate_rank,
                     "_selected_candidate_score": gate.selected_candidate_score,
                     "_selected_candidate_score_breakdown": gate.selected_candidate_score_breakdown,
+                    "trail_armed": False,
+                    "peak_mtm": 0.0,
                     "_strategy_params": {
                         "strategy_name": _CFG["strategy_name"],
                         "strategy_version": _CFG["strategy_version"],
@@ -430,9 +432,12 @@ def run_paper_engine_core(
                         "max_risk_pct": _CFG["max_risk_pct"],
                         "target_profit_pct": _CFG["target_profit_pct"],
                         "square_off_time": str(_CFG["square_off_time"]),
+                        "entry_cutoff_time": str(_CFG["entry_cutoff_time"]),
                         "min_minutes_left_to_enter": _CFG["min_minutes_left_to_enter"],
                         "n_candidate_spreads": _CFG["n_candidate_spreads"],
                         "selection_method": _CFG["selection_method"],
+                        "trail_arm_pct": _CFG["trail_arm_pct"],
+                        "trail_giveback": _CFG["trail_giveback"],
                         "lot_size": lot_size, "capital": capital,
                     },
                 }
@@ -487,6 +492,7 @@ def run_paper_engine_core(
                 lot_size=active_trade["lot_size"], approved_lots=active_trade["approved_lots"],
             )
 
+            was_trail_armed = active_trade["trail_armed"]
             ev = evaluate_exit(
                 current_time=current_time, long_price=long_p, short_price=short_p,
                 entry_debit=active_trade["entry_debit"], lot_size=active_trade["lot_size"],
@@ -494,17 +500,31 @@ def run_paper_engine_core(
                 total_max_loss=active_trade["total_max_loss"],
                 target_profit=active_trade["target_profit"],
                 estimated_charges=estimated_charges,
+                trail_armed=active_trade["trail_armed"],
+                peak_mtm=active_trade["peak_mtm"],
             )
+            active_trade["trail_armed"] = ev.trail_armed
+            active_trade["peak_mtm"] = ev.peak_mtm
 
             if ev.action != "HOLD":
                 current_session_state = "TRADE_CLOSED"
+
+            decision_reason_code = ev.action
+            decision_reason_text = ev.reason
+            if ev.action == "HOLD" and not was_trail_armed and ev.trail_armed:
+                decision_reason_code = "TRAIL_ARMED"
+                decision_reason_text = (
+                    f"Trail armed. MTM ₹{ev.total_mtm:.0f} crossed arm threshold "
+                    f"₹{ev.trail_arm_threshold:.0f} (= {_CFG['trail_arm_pct'] * 100:.0f}% "
+                    f"of target ₹{active_trade['target_profit']:.0f})."
+                )
 
             decisions.append({
                 "session_id": session_id, "timestamp": ts,
                 "spot_close": float(candle["close"]),
                 "opening_range_high": or_high, "opening_range_low": or_low,
                 "trade_state": "OPEN_TRADE", "signal_state": "EVALUATE",
-                "action": ev.action, "reason_code": ev.action, "reason_text": ev.reason,
+                "action": ev.action, "reason_code": decision_reason_code, "reason_text": decision_reason_text,
                 "candidate_structure": None,
                 "computed_max_loss": active_trade["total_max_loss"],
                 "computed_target": active_trade["target_profit"],

@@ -11,6 +11,7 @@ from app.database import init_db
 from app.middleware.security_headers import SecurityHeadersMiddleware
 from app.routers import backtest, auth, paper_trading, users
 from app.routers import historical, backtests
+from app.services.strategy_config import validate_strategy_config_env
 
 app = FastAPI(title="Adaptive Options API", version="1.0.0")
 
@@ -40,6 +41,7 @@ async def startup():
             raise RuntimeError("SECRET_KEY must be set in production.")
         if not settings.BROKER_TOKEN_ENCRYPTION_KEY:
             raise RuntimeError("BROKER_TOKEN_ENCRYPTION_KEY must be set in production.")
+    validate_strategy_config_env()
     await init_db()
 
 

@@ -168,4 +168,35 @@ describe('PaperTradeBook page', () => {
 
     expect(screen.queryByText('Spread Selection')).not.toBeInTheDocument()
   })
+
+  it('renders an amber trail stop label for EXIT_TRAIL sessions', async () => {
+    mocks.getPaperSession.mockResolvedValueOnce({
+      data: { ...baseSession, action_summary: { ENTER: 1, HOLD: 2, EXIT_TRAIL: 1 } },
+    })
+    mocks.getPaperDecisions.mockResolvedValueOnce({
+      data: [
+        ...baseDecisions,
+        {
+          id: 'decision-trail',
+          timestamp: '2026-04-11T09:33:00',
+          action: 'EXIT_TRAIL',
+          reason_code: 'EXIT_TRAIL',
+          reason_text: 'Trail stop hit.',
+          trade_state: 'OPEN_TRADE',
+          signal_state: 'EVALUATE',
+        },
+      ],
+    })
+    mocks.getPaperTrade.mockResolvedValueOnce({
+      data: { trade: { ...baseTrade, exit_reason: 'EXIT_TRAIL' } },
+    })
+    mocks.getPaperMarks.mockResolvedValueOnce({ data: [{ timestamp: '2026-04-11T09:33:00', total_mtm: 1800 }] })
+    mocks.getPaperCandles.mockResolvedValueOnce({ data: [] })
+
+    render(<PaperTradeBook />)
+
+    await waitFor(() => {
+      expect(screen.getAllByText('Trail Stop').length).toBeGreaterThan(0)
+    })
+  })
 })

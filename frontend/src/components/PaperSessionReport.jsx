@@ -8,19 +8,31 @@ const ACTION_STYLES = {
   HOLD:         { bg: 'rgba(59,130,246,0.10)', border: 'rgba(59,130,246,0.3)', text: '#3b82f6' },
   EXIT_TARGET:  { bg: 'rgba(34,197,94,0.20)', border: 'rgba(34,197,94,0.5)', text: '#22c55e' },
   EXIT_STOP:    { bg: 'rgba(239,68,68,0.15)', border: 'rgba(239,68,68,0.4)', text: '#ef4444' },
+  EXIT_TRAIL:   { bg: 'rgba(245,158,11,0.18)', border: 'rgba(245,158,11,0.45)', text: '#f59e0b' },
   EXIT_TIME:    { bg: 'rgba(245,158,11,0.15)', border: 'rgba(245,158,11,0.4)', text: '#f59e0b' },
   NO_TRADE:     { bg: 'rgba(100,116,139,0.10)', border: 'rgba(100,116,139,0.3)', text: '#64748b' },
   DATA_GAP:     { bg: 'rgba(100,116,139,0.10)', border: 'rgba(100,116,139,0.3)', text: '#64748b' },
 }
 
-const FILTERS = ['ALL', 'ENTER', 'HOLD', 'EXIT_TARGET', 'EXIT_STOP', 'EXIT_TIME', 'NO_TRADE']
+const ACTION_LABELS = {
+  EXIT_TARGET: 'Target Hit',
+  EXIT_STOP: 'Stop Loss',
+  EXIT_TRAIL: 'Trail Stop',
+  EXIT_TIME: 'Time Exit',
+}
+
+const FILTERS = ['ALL', 'ENTER', 'HOLD', 'EXIT_TARGET', 'EXIT_STOP', 'EXIT_TRAIL', 'EXIT_TIME', 'NO_TRADE']
+
+function formatActionLabel(action) {
+  return ACTION_LABELS[action] || action?.replace(/_/g, ' ')
+}
 
 function ActionBadge({ action }) {
   const s = ACTION_STYLES[action] || ACTION_STYLES.NO_TRADE
   return (
     <span className="px-1.5 py-0.5 rounded text-xs font-semibold"
       style={{ background: s.bg, border: `1px solid ${s.border}`, color: s.text }}>
-      {action?.replace(/_/g, ' ')}
+      {formatActionLabel(action)}
     </span>
   )
 }
@@ -194,7 +206,7 @@ export default function PaperSessionReport({
               Gross · Net {fmtINR(netPnl)}
             </div>
             <div className="text-xs" style={{ color: 'var(--text-secondary)' }}>
-              {trade?.exit_reason?.replace(/_/g, ' ')}
+              {formatActionLabel(trade?.exit_reason)}
             </div>
           </div>
         )}
@@ -224,7 +236,7 @@ export default function PaperSessionReport({
               </div>
               <KV label="Entry Time" value={trade.entry_time?.slice(11, 16) ?? '—'} />
               <KV label="Exit Time" value={trade.exit_time?.slice(11, 16) ?? '—'} />
-              <KV label="Exit Reason" value={trade.exit_reason?.replace(/_/g, ' ') ?? '—'} />
+              <KV label="Exit Reason" value={formatActionLabel(trade.exit_reason) ?? '—'} />
               <KV label="Expiry" value={fmtDate(trade.expiry)} />
               <KV label="Exchange" value="NSE / NFO" />
               <KV label="Segment" value="Options" />
@@ -340,7 +352,7 @@ export default function PaperSessionReport({
           return (
             <span key={action} className="px-2 py-0.5 rounded text-xs font-medium"
               style={{ background: s.bg, border: `1px solid ${s.border}`, color: s.text }}>
-              {action.replace(/_/g, ' ')} × {cnt}
+              {formatActionLabel(action)} × {cnt}
             </span>
           )
         })}
@@ -357,7 +369,7 @@ export default function PaperSessionReport({
                 border: filter === option ? '1px solid #2563eb' : '1px solid var(--border)',
                 cursor: 'pointer',
               }}>
-              {option.replace(/_/g, ' ')}
+              {formatActionLabel(option)}
             </button>
           ))}
           <span className="text-xs ml-auto" style={{ color: 'var(--text-secondary)' }}>

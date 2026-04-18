@@ -139,12 +139,13 @@ price      = max(intrinsic + time_value, 0.50)
 
 Do not replace with a full BS implementation without updating the calibration constant (0.45).
 
-### ORB Paper Trading — Gate Stack (G1–G7)
+### ORB Paper Trading — Gate Stack (G0–G7)
 
 Each minute after OR window closes, `entry_gates.py::evaluate_gates()` runs in sequence:
 
 | Gate | Rule |
 |------|------|
+| G0 | No new entries at or after `ENTRY_CUTOFF_TIME` (default `13:00`) |
 | G1 | Opening range window complete (first 15 candles) |
 | G2 | No active trade already open |
 | G3 | Close > OR high × 1.001 (bullish) or < OR low × 0.999 (bearish) |
@@ -161,7 +162,8 @@ Candidate spreads: 5 strike pairs per direction tried in ATM-first order (offset
 |-----------|---------|
 | `EXIT_TARGET` | total MTM ≥ session target (0.5% capital) |
 | `EXIT_STOP` | total MTM ≤ −max_loss (spread fully lost) |
-| `EXIT_TIME` | 15:15 or end of candle data reached |
+| `EXIT_TRAIL` | trail armed at `TRAIL_ARM_PCT × target`, then MTM falls to `peak × (1 - TRAIL_GIVEBACK)` |
+| `EXIT_TIME` | configured square-off time or end of candle data reached |
 
 ### ORB Paper Trading — Charges
 
@@ -323,6 +325,7 @@ The runtime `create_all` + idempotent `ALTER TABLE IF NOT EXISTS` in `init_db()`
 - `MAX_RISK_PCT = 0.02` and `TARGET_PCT = 0.005` in `entry_gates.py` — these define the core ORB risk/reward parameters
 - `OR_WINDOW_MINUTES = 15` in `opening_range.py` — opening range is always 09:15–09:29
 - `N_CANDIDATE_SPREADS = 5` in `opening_range.py` — number of strike pairs tried per direction
+- `ENTRY_CUTOFF_TIME`, `TRAIL_ARM_PCT`, and `TRAIL_GIVEBACK` in `strategy_config.py` — these define the rule-stack v2 entry/exit behavior
 
 ---
 

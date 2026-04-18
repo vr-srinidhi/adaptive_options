@@ -24,7 +24,7 @@ Key design notes
   so the engine stays correct even after Zerodha quarterly lot-size changes.
 """
 from dataclasses import dataclass
-from datetime import date as date_type, time as time_type
+from datetime import date as date_type, datetime, time as time_type
 from typing import Dict, Optional
 
 from app.services.opening_range import (
@@ -41,6 +41,7 @@ from app.services.strategy_config import STRATEGY_CONFIG as _CFG
 MAX_RISK_PCT = _CFG["max_risk_pct"]        # G6: max 2% of capital as max loss
 TARGET_PCT   = _CFG["target_profit_pct"]   # profit target = 0.5% of capital
 
+ENTRY_CUTOFF_TIME         = _CFG["entry_cutoff_time"]          # G0: no new entries at/after cutoff
 _SQUARE_OFF_TIME           = _CFG["square_off_time"]            # 15:20
 _MIN_MINUTES_LEFT_TO_ENTER = _CFG["min_minutes_left_to_enter"]  # reject if < 20 mins remain
 
@@ -62,6 +63,7 @@ class GateResult:
     action: str                            # "ENTER" or "NO_TRADE"
     reason_code: str
     reason_text: str
+    rejection_gate: Optional[str] = None
     # Populated on ENTER
     candidate_structure: Optional[Dict] = None
     computed_max_loss: Optional[float] = None
@@ -82,6 +84,36 @@ class GateResult:
     selected_candidate_score: Optional[float] = None
     selected_candidate_score_breakdown: Optional[Dict] = None
     selection_method: Optional[str] = None
+
+
+def _resolve_gate_datetime(
+    candle: Dict,
+    current_time: Optional[time_type],
+) -> Optional[datetime]:
+    ts = candle.get("date")
+    if isinstance(ts, str):
+        ts = datetime.fromisoformat(ts)
+    if isinstance(ts, datetime):
+        return ts.replace(tzinfo=None) if ts.tzinfo is not None else ts
+    if current_time is not None:
+        return datetime.combine(date_type.today(), current_time)
+    return None
+
+
+def _g0_entry_cutoff(now: datetime, cutoff: time_type) -> GateResult | None:
+    if now.time() >= cutoff:
+        return GateResult(
+            action="NO_TRADE",
+            reason_code="TOO_LATE_TO_ENTER",
+            # TOO_LATE_TO_ENTER is reused for two paths: the entry cutoff (G0)
+            # and the near-square-off guard (G2b).
+            reason_text=(
+                f"Current time {now.strftime('%H:%M')} is at or after entry "
+                f"cutoff {cutoff.strftime('%H:%M')}. No new entries."
+            ),
+            rejection_gate="G0",
+        )
+    return None
 
 
 # ── Gate evaluator ────────────────────────────────────────────────────────────
@@ -114,6 +146,14 @@ def evaluate_gates(
     lot_size = lot_size or _FALLBACK_LOT_SIZES.get(instrument, 75)
     target_rupees = capital * TARGET_PCT
 
+    gate_now = _resolve_gate_datetime(candle, current_time)
+
+    # ── G0: Entry cutoff time ────────────────────────────────────────────────
+    if gate_now is not None:
+        g0_result = _g0_entry_cutoff(gate_now, ENTRY_CUTOFF_TIME)
+        if g0_result is not None:
+            return g0_result
+
     # ── G1: Opening range window complete ────────────────────────────────────
     if not or_ready:
         return GateResult(
@@ -145,6 +185,7 @@ def evaluate_gates(
                     f"{_SQUARE_OFF_TIME.strftime('%H:%M')}; "
                     f"need ≥ {_MIN_MINUTES_LEFT_TO_ENTER} to enter."
                 ),
+                rejection_gate="G2b",
             )
 
     # ── G3: Spot has closed beyond OR boundary ────────────────────────────────
