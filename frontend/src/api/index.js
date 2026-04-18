@@ -80,6 +80,11 @@ export const getPaperDecisions = (id, params) => api.get(`/paper/session/${id}/d
 export const getPaperTrade = (id) => api.get(`/paper/session/${id}/trade`)
 export const getPaperMarks = (id) => api.get(`/paper/session/${id}/trade/marks`)
 export const getPaperCandles = (id) => api.get(`/paper/session/${id}/candles`)
+export const exportPaperSessionsBundle = (sessionIds) => api.post(
+  '/paper/sessions/export-bundle',
+  { session_ids: sessionIds },
+  { timeout: 300000 }
+)
 
 // ── App Auth ──────────────────────────────────────────────────────────────────
 export const authRegister = (payload) => api.post('/users/register', payload)

@@ -9,6 +9,7 @@ import TradeBook from './pages/TradeBook'
 import PaperTrading from './pages/PaperTrading'
 import SessionMonitor from './pages/SessionMonitor'
 import PaperTradeBook from './pages/PaperTradeBook'
+import PaperSessionsBulkPrint from './pages/PaperSessionsBulkPrint'
 import ZerodhaConnect from './pages/ZerodhaConnect'
 import Backtests from './pages/Backtests'
 import BacktestBatchDetail from './pages/BacktestBatchDetail'
@@ -39,6 +40,7 @@ export default function App() {
                     {/* Paper Trading module */}
                     <Route path="/paper" element={<PaperTrading />} />
                     <Route path="/paper/sessions" element={<SessionMonitor />} />
+                    <Route path="/paper/sessions/print" element={<PaperSessionsBulkPrint />} />
                     <Route path="/paper/session/:id" element={<PaperTradeBook />} />
                     {/* Historical backtest module */}
                     <Route path="/backtests" element={<Backtests />} />

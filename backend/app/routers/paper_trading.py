@@ -12,6 +12,7 @@ GET  /paper/session/{id}/trade/marks — per-minute MTM array
 """
 import asyncio
 import uuid
+from collections import defaultdict
 from datetime import date
 from typing import Optional
 
@@ -73,6 +74,10 @@ class RunSessionRequest(BaseModel):
     capital: float
     request_token: Optional[str] = None  # preferred: backend exchanges → access token
     access_token: Optional[str] = None   # legacy fallback: caller already exchanged
+
+
+class SessionExportBundleRequest(BaseModel):
+    session_ids: list[str]
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -183,6 +188,13 @@ def _mark_dict(m: PaperTradeMinuteMark) -> dict:
         "estimated_exit_charges": float(m.estimated_exit_charges) if m.estimated_exit_charges is not None else None,
         "estimated_net_mtm": float(m.estimated_net_mtm) if m.estimated_net_mtm is not None else None,
         "price_freshness_json": m.price_freshness_json,
+    }
+
+
+def _candle_series_dict(c: PaperCandleSeries) -> dict:
+    return {
+        "series_type": c.series_type,
+        "candles": c.candles,
     }
 
 
@@ -366,6 +378,118 @@ async def list_sessions(
         }
 
     return [_session_dict(s, summary_pnl=pnl_by_session.get(s.id)) for s in rows]
+
+
+@router.post("/paper/sessions/export-bundle")
+async def export_sessions_bundle(
+    body: SessionExportBundleRequest,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_active_user),
+):
+    ordered_ids: list[str] = []
+    seen_ids = set()
+    for raw_id in body.session_ids:
+        value = (raw_id or "").strip()
+        if value and value not in seen_ids:
+            ordered_ids.append(value)
+            seen_ids.add(value)
+
+    if not ordered_ids:
+        raise HTTPException(status_code=400, detail="Provide at least one session ID.")
+
+    session_ids: list[uuid.UUID] = []
+    for raw_id in ordered_ids:
+        try:
+            session_ids.append(uuid.UUID(raw_id))
+        except ValueError:
+            raise HTTPException(status_code=400, detail=f"Invalid session ID: {raw_id}")
+
+    sessions = (await db.execute(
+        select(PaperSession).where(
+            PaperSession.id.in_(session_ids),
+            (PaperSession.user_id == user.id) | (PaperSession.user_id.is_(None)),
+        )
+    )).scalars().all()
+
+    session_by_id = {session.id: session for session in sessions}
+    missing_ids = [str(session_id) for session_id in session_ids if session_id not in session_by_id]
+    if missing_ids:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Sessions not found or not accessible: {', '.join(missing_ids)}",
+        )
+
+    decision_rows = (await db.execute(
+        select(MinuteDecision)
+        .where(MinuteDecision.session_id.in_(session_ids))
+        .order_by(MinuteDecision.session_id, MinuteDecision.timestamp)
+    )).scalars().all()
+    decisions_by_session = defaultdict(list)
+    for row in decision_rows:
+        decisions_by_session[row.session_id].append(row)
+
+    trade_rows = (await db.execute(
+        select(PaperTradeHeader)
+        .where(PaperTradeHeader.session_id.in_(session_ids))
+        .order_by(PaperTradeHeader.entry_time)
+    )).scalars().all()
+    trade_by_session = {trade.session_id: trade for trade in trade_rows}
+
+    trade_ids = [trade.id for trade in trade_rows]
+    legs_by_trade = defaultdict(list)
+    marks_by_trade = defaultdict(list)
+    if trade_ids:
+        leg_rows = (await db.execute(
+            select(PaperTradeLeg)
+            .where(PaperTradeLeg.trade_id.in_(trade_ids))
+            .order_by(PaperTradeLeg.trade_id, PaperTradeLeg.leg_side)
+        )).scalars().all()
+        for row in leg_rows:
+            legs_by_trade[row.trade_id].append(row)
+
+        mark_rows = (await db.execute(
+            select(PaperTradeMinuteMark)
+            .where(PaperTradeMinuteMark.trade_id.in_(trade_ids))
+            .order_by(PaperTradeMinuteMark.trade_id, PaperTradeMinuteMark.timestamp)
+        )).scalars().all()
+        for row in mark_rows:
+            marks_by_trade[row.trade_id].append(row)
+
+    candle_rows = (await db.execute(
+        select(PaperCandleSeries)
+        .where(PaperCandleSeries.session_id.in_(session_ids))
+        .order_by(PaperCandleSeries.session_id, PaperCandleSeries.series_type)
+    )).scalars().all()
+    candles_by_session = defaultdict(list)
+    for row in candle_rows:
+        candles_by_session[row.session_id].append(row)
+
+    payload = []
+    for session_id in session_ids:
+        session = session_by_id[session_id]
+        decisions = decisions_by_session.get(session_id, [])
+        action_summary = defaultdict(int)
+        for decision in decisions:
+            if decision.action:
+                action_summary[decision.action] += 1
+
+        trade = trade_by_session.get(session_id)
+        fallback_pnl = None
+        if session.summary_pnl is None and trade and trade.realized_net_pnl is not None:
+            fallback_pnl = trade.realized_net_pnl
+
+        payload.append({
+            "session": {
+                **_session_dict(session, summary_pnl=fallback_pnl),
+                "action_summary": dict(action_summary),
+            },
+            "trade": _trade_dict(trade, legs_by_trade.get(trade.id, [])) if trade else None,
+            "decisions": [_decision_dict(decision) for decision in decisions],
+            "marks": [_mark_dict(mark) for mark in marks_by_trade.get(trade.id, [])] if trade else [],
+            "candle_series": [_candle_series_dict(candle) for candle in candles_by_session.get(session_id, [])],
+        })
+
+    return {"sessions": payload}
 
 
 @router.get("/paper/session/{session_id}")
