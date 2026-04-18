@@ -29,6 +29,9 @@ services:
       BROKER_TOKEN_ENCRYPTION_KEY: ${BROKER_TOKEN_ENCRYPTION_KEY:-}
       ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-http://localhost:3000}
       ENVIRONMENT: ${ENVIRONMENT:-development}
+      DATA_SOURCE_PATH: ${DATA_SOURCE_PATH:-/data/historical}
+    volumes:
+      - ${LOCAL_DATA_PATH:-/tmp/no-data}:/data/historical:ro
     depends_on:
       db:
         condition: service_healthy

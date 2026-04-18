@@ -7,6 +7,7 @@ export default function TopNav() {
   const navigate = useNavigate()
   const { user, logout } = useAuth()
   const isPaper = location.pathname.startsWith('/paper')
+  const isBacktests = location.pathname.startsWith('/backtests')
 
   const linkClass = ({ isActive }) =>
     [
@@ -59,14 +60,28 @@ export default function TopNav() {
         <NavLink to="/paper/sessions" className={paperLinkClass}>Sessions</NavLink>
       </div>
 
+      {/* Historical backtests section */}
+      <div className="mx-4 h-5 w-px" style={{ background: 'var(--border)' }} />
+
+      <span className="text-xs mr-2 px-1.5 py-0.5 rounded"
+        style={{ color: '#22c55e', background: 'rgba(34,197,94,0.1)', border: '1px solid rgba(34,197,94,0.25)' }}>
+        HIST
+      </span>
+
+      <div className="flex h-full">
+        <NavLink to="/backtests" className={linkClass}>Backtests</NavLink>
+      </div>
+
       {/* Right side: mode tag + zerodha + user */}
       <div className="ml-auto flex items-center gap-3">
         <span className="text-xs px-2 py-0.5 rounded font-medium"
           style={isPaper
             ? { background: 'rgba(245,158,11,0.15)', color: '#f59e0b', border: '1px solid rgba(245,158,11,0.3)' }
+            : isBacktests
+            ? { background: 'rgba(34,197,94,0.12)', color: '#22c55e', border: '1px solid rgba(34,197,94,0.25)' }
             : { background: 'rgba(34,197,94,0.15)', color: '#22c55e', border: '1px solid rgba(34,197,94,0.3)' }
           }>
-          {isPaper ? 'PAPER MODE' : 'BACKTEST MODE'}
+          {isPaper ? 'PAPER MODE' : isBacktests ? 'HIST MODE' : 'BACKTEST MODE'}
         </span>
 
         <NavLink to="/zerodha-connect"

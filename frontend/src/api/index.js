@@ -9,9 +9,27 @@ const api = axios.create({
 // ── Auth interceptor: attach access token from in-memory store ────────────────
 // The token is injected by AuthContext via the `setToken` helper below.
 let _accessToken = null
+let _refreshAccessToken = null
+let _clearAuthState = null
+let _refreshPromise = null
 
 export function setToken(token) {
   _accessToken = token
+}
+
+export function setAuthHandlers({ refreshAccessToken, clearAuthState } = {}) {
+  _refreshAccessToken = refreshAccessToken || null
+  _clearAuthState = clearAuthState || null
+}
+
+async function refreshAccessTokenOnce() {
+  if (!_refreshAccessToken) return null
+  if (!_refreshPromise) {
+    _refreshPromise = Promise.resolve(_refreshAccessToken()).finally(() => {
+      _refreshPromise = null
+    })
+  }
+  return _refreshPromise
 }
 
 api.interceptors.request.use(config => {
@@ -20,6 +38,32 @@ api.interceptors.request.use(config => {
   }
   return config
 })
+
+api.interceptors.response.use(
+  response => response,
+  async error => {
+    const status = error?.response?.status
+    const original = error?.config
+    const url = original?.url || ''
+    const isAuthEndpoint = url.includes('/users/login') || url.includes('/users/refresh') || url.includes('/users/logout')
+
+    if (status === 401 && original && !original._retry && !isAuthEndpoint) {
+      original._retry = true
+      const nextToken = await refreshAccessTokenOnce()
+      if (nextToken) {
+        original.headers = original.headers || {}
+        original.headers.Authorization = `Bearer ${nextToken}`
+        return api(original)
+      }
+    }
+
+    if (status === 401 && !url.includes('/users/logout') && _clearAuthState) {
+      _clearAuthState()
+    }
+
+    return Promise.reject(error)
+  }
+)
 
 // ── Backtest ──────────────────────────────────────────────────────────────────
 export const runBacktest = (payload) => api.post('/backtest/run', payload)
@@ -36,6 +80,11 @@ export const getPaperDecisions = (id, params) => api.get(`/paper/session/${id}/d
 export const getPaperTrade = (id) => api.get(`/paper/session/${id}/trade`)
 export const getPaperMarks = (id) => api.get(`/paper/session/${id}/trade/marks`)
 export const getPaperCandles = (id) => api.get(`/paper/session/${id}/candles`)
+export const exportPaperSessionsBundle = (sessionIds) => api.post(
+  '/paper/sessions/export-bundle',
+  { session_ids: sessionIds },
+  { timeout: 300000 }
+)
 
 // ── App Auth ──────────────────────────────────────────────────────────────────
 export const authRegister = (payload) => api.post('/users/register', payload)
@@ -43,6 +92,24 @@ export const authLogin = (payload) => api.post('/users/login', payload)
 export const authRefresh = () => api.post('/users/refresh')
 export const authLogout = () => api.post('/users/logout')
 export const authMe = () => api.get('/users/me')
+
+// ── Historical data ───────────────────────────────────────────────────────────
+export const getTradingDays = (params) => api.get('/historical/trading-days', { params })
+export const ingestDay = (date, payload) => api.post(`/historical/ingest/day/${date}`, payload)
+export const ingestBulk = (payload) => api.post('/historical/ingest/bulk', payload)
+export const syncCatalogue = () => api.post('/historical/catalogue/sync')
+
+// ── Backtests ─────────────────────────────────────────────────────────────────
+export const createBatch = (payload) => api.post('/backtests/batches', payload)
+export const getBatches = (params) => api.get('/backtests/batches', { params })
+export const getBatch = (id) => api.get(`/backtests/batches/${id}`)
+export const triggerBatch = (id) => api.post(`/backtests/batches/${id}/run`)
+export const deleteBatch = (id) => api.delete(`/backtests/batches/${id}`)
+export const getBatchSessions = (id, params) => api.get(`/backtests/batches/${id}/sessions`, { params })
+export const getHistSession = (id) => api.get(`/backtests/sessions/${id}`)
+export const getHistDecisions = (id, params) => api.get(`/backtests/sessions/${id}/decisions`, { params })
+export const getHistTrade = (id) => api.get(`/backtests/sessions/${id}/trade`)
+export const getHistMarks = (id) => api.get(`/backtests/sessions/${id}/trade/marks`)
 
 // ── Zerodha ───────────────────────────────────────────────────────────────────
 export const zerodhaLoginUrl = () => api.get('/auth/zerodha/login-url')
