@@ -92,10 +92,53 @@ async def init_db():
             "ALTER TABLE paper_trade_headers ADD COLUMN IF NOT EXISTS selected_candidate_score_breakdown_json JSONB",
             # ── paper_sessions SKIPPED status support ─────────────────────────
             "ALTER TABLE paper_sessions ADD COLUMN IF NOT EXISTS error_message TEXT",
-            # ── Warehouse unique constraints (idempotency) ────────────────────
-            "ALTER TABLE spot_candles ADD CONSTRAINT IF NOT EXISTS uq_spot_candles_date_sym_ts UNIQUE (trade_date, symbol, timestamp)",
-            "ALTER TABLE vix_candles ADD CONSTRAINT IF NOT EXISTS uq_vix_candles_date_sym_ts UNIQUE (trade_date, symbol, timestamp)",
-            "ALTER TABLE futures_candles ADD CONSTRAINT IF NOT EXISTS uq_futures_candles_date_sym_exp_ts UNIQUE (trade_date, symbol, expiry_date, timestamp)",
-            "ALTER TABLE options_candles ADD CONSTRAINT IF NOT EXISTS uq_options_candles_natural UNIQUE (trade_date, symbol, expiry_date, option_type, strike, timestamp)",
         ]:
             await conn.execute(__import__("sqlalchemy").text(stmt))
+
+        # ── Warehouse unique constraints ──────────────────────────────────────
+        # PostgreSQL does not support ALTER TABLE … ADD CONSTRAINT IF NOT EXISTS.
+        # We check pg_constraint first so this block is safe to run repeatedly.
+        # We also deduplicate existing rows before adding each constraint so
+        # the operation succeeds even when data was loaded before constraints existed.
+        _sa_text = __import__("sqlalchemy").text
+        for table, constraint, cols, dedup_key in [
+            (
+                "spot_candles",
+                "uq_spot_candles_date_sym_ts",
+                "trade_date, symbol, timestamp",
+                "trade_date, symbol, timestamp",
+            ),
+            (
+                "vix_candles",
+                "uq_vix_candles_date_sym_ts",
+                "trade_date, symbol, timestamp",
+                "trade_date, symbol, timestamp",
+            ),
+            (
+                "futures_candles",
+                "uq_futures_candles_date_sym_exp_ts",
+                "trade_date, symbol, expiry_date, timestamp",
+                "trade_date, symbol, expiry_date, timestamp",
+            ),
+            (
+                "options_candles",
+                "uq_options_candles_natural",
+                "trade_date, symbol, expiry_date, option_type, strike, timestamp",
+                "trade_date, symbol, expiry_date, option_type, strike, timestamp",
+            ),
+        ]:
+            exists = (await conn.execute(_sa_text(
+                "SELECT 1 FROM pg_constraint WHERE conname = :name"
+            ), {"name": constraint})).scalar()
+            if not exists:
+                # Deduplicate: keep the row with the lowest id per natural key
+                await conn.execute(_sa_text(
+                    f"DELETE FROM {table} WHERE id NOT IN ("
+                    f"  SELECT MIN(id) FROM {table} GROUP BY {dedup_key}"
+                    f")"
+                ))
+                await conn.execute(_sa_text(
+                    f"ALTER TABLE {table} ADD CONSTRAINT {constraint} "
+                    f"UNIQUE ({cols})"
+                ))
+
