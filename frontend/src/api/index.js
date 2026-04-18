@@ -44,6 +44,24 @@ export const authRefresh = () => api.post('/users/refresh')
 export const authLogout = () => api.post('/users/logout')
 export const authMe = () => api.get('/users/me')
 
+// ── Historical data ───────────────────────────────────────────────────────────
+export const getTradingDays = (params) => api.get('/historical/trading-days', { params })
+export const ingestDay = (date, payload) => api.post(`/historical/ingest/day/${date}`, payload)
+export const ingestBulk = (payload) => api.post('/historical/ingest/bulk', payload)
+export const syncCatalogue = () => api.post('/historical/catalogue/sync')
+
+// ── Backtests ─────────────────────────────────────────────────────────────────
+export const createBatch = (payload) => api.post('/backtests/batches', payload)
+export const getBatches = (params) => api.get('/backtests/batches', { params })
+export const getBatch = (id) => api.get(`/backtests/batches/${id}`)
+export const triggerBatch = (id) => api.post(`/backtests/batches/${id}/run`)
+export const deleteBatch = (id) => api.delete(`/backtests/batches/${id}`)
+export const getBatchSessions = (id, params) => api.get(`/backtests/batches/${id}/sessions`, { params })
+export const getHistSession = (id) => api.get(`/backtests/sessions/${id}`)
+export const getHistDecisions = (id, params) => api.get(`/backtests/sessions/${id}/decisions`, { params })
+export const getHistTrade = (id) => api.get(`/backtests/sessions/${id}/trade`)
+export const getHistMarks = (id) => api.get(`/backtests/sessions/${id}/trade/marks`)
+
 // ── Zerodha ───────────────────────────────────────────────────────────────────
 export const zerodhaLoginUrl = () => api.get('/auth/zerodha/login-url')
 export const zerodhaSession = (payload) => api.post('/auth/zerodha/session', payload)

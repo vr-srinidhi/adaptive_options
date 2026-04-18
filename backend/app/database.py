@@ -33,6 +33,7 @@ async def init_db():
     from app.models import user as _u  # noqa
     from app.models import broker_token as _bt  # noqa
     from app.models import audit_log as _al  # noqa
+    from app.models import historical as _hist  # noqa
 
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
@@ -53,6 +54,15 @@ async def init_db():
             # ── Paper session columns ─────────────────────────────────────────
             "ALTER TABLE paper_sessions ADD COLUMN IF NOT EXISTS final_session_state VARCHAR(30)",
             "ALTER TABLE paper_sessions ADD COLUMN IF NOT EXISTS user_id UUID REFERENCES users(id)",
+            # ── Historical backtest columns on paper_sessions ─────────────────
+            "ALTER TABLE paper_sessions ADD COLUMN IF NOT EXISTS session_type VARCHAR(20) DEFAULT 'paper_replay'",
+            "ALTER TABLE paper_sessions ADD COLUMN IF NOT EXISTS batch_id UUID REFERENCES session_batches(id) ON DELETE SET NULL",
+            "ALTER TABLE paper_sessions ADD COLUMN IF NOT EXISTS execution_mode VARCHAR(20) DEFAULT 'interactive'",
+            "ALTER TABLE paper_sessions ADD COLUMN IF NOT EXISTS source_mode VARCHAR(20) DEFAULT 'live_like'",
+            "ALTER TABLE paper_sessions ADD COLUMN IF NOT EXISTS strategy_config_snapshot JSONB",
+            "ALTER TABLE paper_sessions ADD COLUMN IF NOT EXISTS started_at TIMESTAMPTZ",
+            "ALTER TABLE paper_sessions ADD COLUMN IF NOT EXISTS completed_at TIMESTAMPTZ",
+            "ALTER TABLE paper_sessions ADD COLUMN IF NOT EXISTS summary_pnl NUMERIC(12,2)",
             # ── strategy_minute_decisions columns ─────────────────────────────
             "ALTER TABLE strategy_minute_decisions ADD COLUMN IF NOT EXISTS session_state VARCHAR(30)",
             "ALTER TABLE strategy_minute_decisions ADD COLUMN IF NOT EXISTS signal_substate VARCHAR(30)",

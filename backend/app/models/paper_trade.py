@@ -34,6 +34,28 @@ class PaperSession(Base):
     # Security: owning user (nullable for backward compat with pre-auth sessions)
     user_id = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=True)
 
+    # Historical backtest extensions (all nullable for backward compat)
+    # paper_replay | historical_backtest
+    session_type = Column(String(20), default="paper_replay")
+    # FK to session_batches (null for interactive replay sessions)
+    batch_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey("session_batches.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    # interactive | batch
+    execution_mode = Column(String(20), default="interactive")
+    # live_like | historical_db
+    source_mode = Column(String(20), default="live_like")
+    # Full strategy config frozen at session creation
+    strategy_config_snapshot = Column(JSONB)
+    # Timing
+    started_at = Column(TIMESTAMP(timezone=True))
+    completed_at = Column(TIMESTAMP(timezone=True))
+    # Net P&L summary (positive=profit, negative=loss, null=no-trade)
+    summary_pnl = Column(Numeric(12, 2))
+
 
 class MinuteDecision(Base):
     __tablename__ = "strategy_minute_decisions"

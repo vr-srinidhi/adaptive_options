@@ -10,6 +10,9 @@ import PaperTrading from './pages/PaperTrading'
 import SessionMonitor from './pages/SessionMonitor'
 import PaperTradeBook from './pages/PaperTradeBook'
 import ZerodhaConnect from './pages/ZerodhaConnect'
+import Backtests from './pages/Backtests'
+import BacktestBatchDetail from './pages/BacktestBatchDetail'
+import HistoricalSessionDetail from './pages/HistoricalSessionDetail'
 
 export default function App() {
   return (
@@ -37,6 +40,10 @@ export default function App() {
                     <Route path="/paper" element={<PaperTrading />} />
                     <Route path="/paper/sessions" element={<SessionMonitor />} />
                     <Route path="/paper/session/:id" element={<PaperTradeBook />} />
+                    {/* Historical backtest module */}
+                    <Route path="/backtests" element={<Backtests />} />
+                    <Route path="/backtests/:batchId" element={<BacktestBatchDetail />} />
+                    <Route path="/backtests/sessions/:sessionId" element={<HistoricalSessionDetail />} />
                   </Routes>
                 </main>
                 <footer className="text-center py-3 text-xs" style={{ color: 'var(--text-secondary)', borderTop: '0.5px solid var(--border)' }}>

@@ -235,6 +235,456 @@ def _compute_charges(
     )["total"]
 
 
+# ── Core replay loop (data-source-agnostic) ───────────────────────────────────
+
+def run_paper_engine_core(
+    session_id: uuid.UUID,
+    trade_date: date_type,
+    instrument: str,
+    capital: float,
+    spot_candles: List[Dict],
+    option_market_index: Dict[Tuple[int, str], Dict[int, Dict[str, Any]]],
+    option_candles_raw: Dict[Tuple[int, str], List[Dict]],
+    expiry: date_type,
+    lot_size: int,
+    legs_to_fetch: set,
+    monthly_expiry: Optional[date_type] = None,
+    instruments_master: Optional[List[Dict]] = None,
+    access_token: Optional[str] = None,
+) -> Dict[str, Any]:
+    """
+    Pure replay loop — no I/O.  Accepts pre-loaded market data structures
+    and runs the full ORB minute-by-minute simulation.
+
+    Called by both run_paper_engine() (Zerodha live) and
+    run_historical_paper_engine() (DB-backed historical).
+
+    Returns same dict as run_paper_engine().
+    """
+    decisions: List[Dict] = []
+    minute_marks: List[Dict] = []
+    trade_header: Optional[Dict] = None
+    trade_legs: List[Dict] = []
+    active_trade: Optional[Dict] = None
+
+    current_session_state = "OBSERVING"
+    trade_closed_this_session = False
+    prev_was_tentative_breakout = False
+
+    or_high, or_low = compute_opening_range(spot_candles)
+
+    for idx, candle in enumerate(spot_candles):
+        current_time, ts = _candle_time(candle)
+        or_ready = idx >= OR_WINDOW_MINUTES
+
+        prev_candle_close: Optional[float] = (
+            float(spot_candles[idx - 1]["close"]) if idx > 0 else None
+        )
+
+        def opt_market(
+            strike, otype, _idx=idx, lookback: Optional[int] = _MAX_PRICE_STALENESS,
+        ) -> Tuple[Optional[Dict[str, Any]], int]:
+            return _get_market_at(option_market_index.get((strike, otype), {}), _idx, lookback=lookback)
+
+        def opt_price(strike, otype, _idx=idx) -> Tuple[Optional[float], int]:
+            snapshot, stale = opt_market(strike, otype, _idx)
+            return (snapshot["price"], stale) if snapshot is not None else (None, stale)
+
+        if trade_closed_this_session:
+            current_session_state = "SESSION_COMPLETE"
+            decisions.append({
+                "session_id": session_id, "timestamp": ts,
+                "spot_close": float(candle["close"]),
+                "opening_range_high": or_high, "opening_range_low": or_low,
+                "trade_state": "NO_OPEN_TRADE", "signal_state": "SKIP_MINUTE",
+                "action": "NO_TRADE", "reason_code": "SESSION_COMPLETE",
+                "reason_text": "Trade already closed for this session. No re-entry.",
+                "candidate_structure": None, "computed_max_loss": None,
+                "computed_target": None, "session_state": current_session_state,
+                "signal_substate": None, "rejection_gate": None,
+                "price_freshness_json": None, "candidate_ranking_json": None,
+                "selected_candidate_rank": None, "selected_candidate_score": None,
+                "selected_candidate_score_breakdown_json": None,
+            })
+            continue
+
+        if active_trade is None:
+            prices: Dict[Tuple[int, str], float] = {}
+            market_snapshots: Dict[Tuple[int, str], Dict[str, Any]] = {}
+            price_staleness_map: Dict[str, int] = {}
+
+            for (s, t) in legs_to_fetch:
+                snapshot, stale = opt_market(s, t, lookback=None)
+                if snapshot is not None:
+                    prices[(s, t)] = snapshot["price"]
+                    market_snapshots[(s, t)] = snapshot
+                    if stale > 0:
+                        price_staleness_map[f"{s}_{t}_age_min"] = stale
+
+            gate = evaluate_gates(
+                candle=candle, or_high=or_high, or_low=or_low, or_ready=or_ready,
+                has_open_trade=False, option_prices=prices, instrument=instrument,
+                capital=capital, expiry=expiry, prev_candle_close=prev_candle_close,
+                lot_size=lot_size, current_time=current_time, option_market=market_snapshots,
+            )
+
+            signal_substate: Optional[str] = None
+            if gate.reason_code == "FAILED_BREAKOUT_OR_NO_FOLLOWTHROUGH":
+                signal_substate = "TENTATIVE_BREAKOUT"
+            elif prev_was_tentative_breakout:
+                if gate.reason_code == "NO_BREAKOUT_CONFIRMATION":
+                    signal_substate = "FAILED_FIRST_BREAKOUT"
+                else:
+                    signal_substate = "CONFIRMED_BREAKOUT"
+
+            if not or_ready:
+                current_session_state = "OBSERVING"
+            elif gate.action == "ENTER":
+                current_session_state = "OPEN_TRADE"
+            elif signal_substate == "TENTATIVE_BREAKOUT":
+                current_session_state = "TENTATIVE_SIGNAL"
+            elif signal_substate in ("FAILED_FIRST_BREAKOUT", None):
+                current_session_state = "OBSERVING"
+            elif signal_substate == "CONFIRMED_BREAKOUT" and gate.action != "ENTER":
+                current_session_state = "OBSERVING"
+
+            prev_was_tentative_breakout = (
+                gate.reason_code == "FAILED_BREAKOUT_OR_NO_FOLLOWTHROUGH"
+            )
+
+            effective_action = gate.action
+            effective_reason_code = gate.reason_code
+            effective_reason_text = gate.reason_text
+            effective_selected_candidate_rank = gate.selected_candidate_rank
+            effective_selected_candidate_score = gate.selected_candidate_score
+            effective_selected_candidate_score_breakdown = gate.selected_candidate_score_breakdown
+            stale_entry_rejected = False
+
+            if gate.action == "ENTER":
+                long_age = price_staleness_map.get(f"{gate.long_strike}_{gate.opt_type}_age_min", 0)
+                short_age = price_staleness_map.get(f"{gate.short_strike}_{gate.opt_type}_age_min", 0)
+                if max(long_age, short_age) > 0:
+                    stale_entry_rejected = True
+                    effective_action = "NO_TRADE"
+                    effective_reason_code = "STALE_OPTION_PRICE"
+                    effective_reason_text = (
+                        "Confirmed breakout, but entry requires current-minute option prices "
+                        f"(long age={long_age}, short age={short_age})."
+                    )
+                    effective_selected_candidate_rank = None
+                    effective_selected_candidate_score = None
+                    effective_selected_candidate_score_breakdown = None
+                    current_session_state = "OBSERVING"
+                    if signal_substate is None:
+                        signal_substate = "CONFIRMED_BREAKOUT"
+
+            rejection_gate = (
+                None if effective_action == "ENTER"
+                else _REASON_TO_GATE.get(effective_reason_code)
+            )
+            audit_structure = gate.candidate_structure if gate.action == "ENTER" else gate.pre_entry_snapshot
+            price_freshness_json = price_staleness_map if price_staleness_map else None
+
+            decisions.append({
+                "session_id": session_id, "timestamp": ts,
+                "spot_close": float(candle["close"]),
+                "opening_range_high": or_high, "opening_range_low": or_low,
+                "trade_state": "NO_OPEN_TRADE",
+                "signal_state": "EVALUATE" if or_ready else "SKIP_MINUTE",
+                "action": effective_action, "reason_code": effective_reason_code,
+                "reason_text": effective_reason_text, "candidate_structure": audit_structure,
+                "computed_max_loss": gate.computed_max_loss, "computed_target": gate.computed_target,
+                "session_state": current_session_state, "signal_substate": signal_substate,
+                "rejection_gate": rejection_gate, "price_freshness_json": price_freshness_json,
+                "candidate_ranking_json": gate.candidate_ranking_json,
+                "selected_candidate_rank": effective_selected_candidate_rank,
+                "selected_candidate_score": effective_selected_candidate_score,
+                "selected_candidate_score_breakdown_json": effective_selected_candidate_score_breakdown,
+            })
+
+            if gate.action == "ENTER" and not stale_entry_rejected:
+                trade_id = uuid.uuid4()
+                long_ep, _ = opt_price(gate.long_strike, gate.opt_type)
+                short_ep, _ = opt_price(gate.short_strike, gate.opt_type)
+                active_trade = {
+                    "id": trade_id, "entry_time": ts, "bias": gate.bias,
+                    "long_strike": gate.long_strike, "short_strike": gate.short_strike,
+                    "opt_type": gate.opt_type, "entry_debit": gate.entry_debit,
+                    "approved_lots": gate.approved_lots, "lot_size": lot_size,
+                    "total_max_loss": gate.computed_max_loss, "target_profit": gate.computed_target,
+                    "expiry": expiry,
+                    "_entry_long_price": round(long_ep, 2) if long_ep else 0.0,
+                    "_entry_short_price": round(short_ep, 2) if short_ep else 0.0,
+                    "_entry_reason_code": gate.reason_code,
+                    "_entry_reason_text": gate.reason_text,
+                    "_risk_cap": capital * _CFG["max_risk_pct"],
+                    "_selection_method": gate.selection_method,
+                    "_selected_candidate_rank": gate.selected_candidate_rank,
+                    "_selected_candidate_score": gate.selected_candidate_score,
+                    "_selected_candidate_score_breakdown": gate.selected_candidate_score_breakdown,
+                    "_strategy_params": {
+                        "strategy_name": _CFG["strategy_name"],
+                        "strategy_version": _CFG["strategy_version"],
+                        "or_window_minutes": _CFG["or_window_minutes"],
+                        "breakout_buffer_pct": _CFG["breakout_buffer_pct"],
+                        "max_risk_pct": _CFG["max_risk_pct"],
+                        "target_profit_pct": _CFG["target_profit_pct"],
+                        "square_off_time": str(_CFG["square_off_time"]),
+                        "min_minutes_left_to_enter": _CFG["min_minutes_left_to_enter"],
+                        "n_candidate_spreads": _CFG["n_candidate_spreads"],
+                        "selection_method": _CFG["selection_method"],
+                        "lot_size": lot_size, "capital": capital,
+                    },
+                }
+                trade_legs = [
+                    {
+                        "trade_id": trade_id, "leg_side": "LONG",
+                        "option_type": gate.opt_type, "strike": gate.long_strike,
+                        "expiry": expiry,
+                        "entry_price": round(long_ep, 2) if long_ep else None,
+                        "exit_price": None,
+                    },
+                    {
+                        "trade_id": trade_id, "leg_side": "SHORT",
+                        "option_type": gate.opt_type, "strike": gate.short_strike,
+                        "expiry": expiry,
+                        "entry_price": round(short_ep, 2) if short_ep else None,
+                        "exit_price": None,
+                    },
+                ]
+        else:
+            current_session_state = "OPEN_TRADE"
+            long_p, long_stale = opt_price(active_trade["long_strike"], active_trade["opt_type"])
+            short_p, short_stale = opt_price(active_trade["short_strike"], active_trade["opt_type"])
+
+            price_freshness_json: Optional[Dict] = None
+            if long_stale > 0 or short_stale > 0:
+                price_freshness_json = {"long_age_min": long_stale, "short_age_min": short_stale}
+
+            if long_p is None or short_p is None:
+                decisions.append({
+                    "session_id": session_id, "timestamp": ts,
+                    "spot_close": float(candle["close"]),
+                    "opening_range_high": or_high, "opening_range_low": or_low,
+                    "trade_state": "OPEN_TRADE", "signal_state": "SKIP_MINUTE",
+                    "action": "HOLD", "reason_code": "DATA_GAP",
+                    "reason_text": "Option price data unavailable for this minute; holding.",
+                    "candidate_structure": None,
+                    "computed_max_loss": active_trade["total_max_loss"],
+                    "computed_target": active_trade["target_profit"],
+                    "session_state": current_session_state, "signal_substate": None,
+                    "rejection_gate": None, "price_freshness_json": price_freshness_json,
+                    "candidate_ranking_json": None, "selected_candidate_rank": None,
+                    "selected_candidate_score": None,
+                    "selected_candidate_score_breakdown_json": None,
+                })
+                continue
+
+            estimated_charges = _compute_charges(
+                entry_long_price=active_trade["_entry_long_price"],
+                entry_short_price=active_trade["_entry_short_price"],
+                exit_long_price=round(long_p, 2), exit_short_price=round(short_p, 2),
+                lot_size=active_trade["lot_size"], approved_lots=active_trade["approved_lots"],
+            )
+
+            ev = evaluate_exit(
+                current_time=current_time, long_price=long_p, short_price=short_p,
+                entry_debit=active_trade["entry_debit"], lot_size=active_trade["lot_size"],
+                approved_lots=active_trade["approved_lots"],
+                total_max_loss=active_trade["total_max_loss"],
+                target_profit=active_trade["target_profit"],
+                estimated_charges=estimated_charges,
+            )
+
+            if ev.action != "HOLD":
+                current_session_state = "TRADE_CLOSED"
+
+            decisions.append({
+                "session_id": session_id, "timestamp": ts,
+                "spot_close": float(candle["close"]),
+                "opening_range_high": or_high, "opening_range_low": or_low,
+                "trade_state": "OPEN_TRADE", "signal_state": "EVALUATE",
+                "action": ev.action, "reason_code": ev.action, "reason_text": ev.reason,
+                "candidate_structure": None,
+                "computed_max_loss": active_trade["total_max_loss"],
+                "computed_target": active_trade["target_profit"],
+                "session_state": current_session_state, "signal_substate": None,
+                "rejection_gate": None, "price_freshness_json": price_freshness_json,
+                "candidate_ranking_json": None, "selected_candidate_rank": None,
+                "selected_candidate_score": None,
+                "selected_candidate_score_breakdown_json": None,
+            })
+
+            minute_marks.append({
+                "trade_id": active_trade["id"], "timestamp": ts,
+                "long_leg_price": round(long_p, 2), "short_leg_price": round(short_p, 2),
+                "current_spread_value": round(ev.current_spread, 2),
+                "mtm_per_lot": round(ev.mtm_per_lot, 2), "total_mtm": round(ev.total_mtm, 2),
+                "distance_to_target": round(ev.distance_to_target, 2),
+                "distance_to_stop": round(ev.distance_to_stop, 2),
+                "action": ev.action, "reason": ev.reason[:200],
+                "gross_mtm": round(ev.gross_mtm, 2),
+                "estimated_exit_charges": round(ev.estimated_exit_charges, 2),
+                "estimated_net_mtm": round(ev.estimated_net_mtm, 2),
+                "price_freshness_json": price_freshness_json,
+            })
+
+            if ev.action != "HOLD":
+                realized_gross = round(ev.total_mtm, 2)
+                charges_breakdown = _compute_charges_breakdown(
+                    entry_long_price=active_trade["_entry_long_price"],
+                    entry_short_price=active_trade["_entry_short_price"],
+                    exit_long_price=round(long_p, 2), exit_short_price=round(short_p, 2),
+                    lot_size=active_trade["lot_size"], approved_lots=active_trade["approved_lots"],
+                )
+                charges = charges_breakdown["total"]
+                realized_net = round(realized_gross - charges, 2)
+
+                for leg in trade_legs:
+                    if leg["leg_side"] == "LONG":
+                        leg["exit_price"] = round(long_p, 2)
+                    else:
+                        leg["exit_price"] = round(short_p, 2)
+
+                trade_header = {
+                    "id": active_trade["id"], "session_id": session_id,
+                    "entry_time": active_trade["entry_time"], "exit_time": ts,
+                    "bias": active_trade["bias"], "expiry": active_trade["expiry"],
+                    "lot_size": active_trade["lot_size"],
+                    "approved_lots": active_trade["approved_lots"],
+                    "entry_debit": active_trade["entry_debit"],
+                    "total_max_loss": active_trade["total_max_loss"],
+                    "target_profit": active_trade["target_profit"],
+                    "realized_gross_pnl": realized_gross, "realized_net_pnl": realized_net,
+                    "charges": charges, "charges_breakdown_json": charges_breakdown,
+                    "status": "CLOSED", "exit_reason": ev.action,
+                    "long_strike": active_trade["long_strike"],
+                    "short_strike": active_trade["short_strike"],
+                    "option_type": active_trade["opt_type"],
+                    "strategy_name": _CFG["strategy_name"],
+                    "strategy_version": _CFG["strategy_version"],
+                    "strategy_params_json": active_trade["_strategy_params"],
+                    "risk_cap": active_trade["_risk_cap"],
+                    "entry_reason_code": active_trade["_entry_reason_code"],
+                    "entry_reason_text": active_trade["_entry_reason_text"],
+                    "selection_method": active_trade["_selection_method"],
+                    "selected_candidate_rank": active_trade["_selected_candidate_rank"],
+                    "selected_candidate_score": active_trade["_selected_candidate_score"],
+                    "selected_candidate_score_breakdown_json": active_trade["_selected_candidate_score_breakdown"],
+                }
+                active_trade = None
+                trade_closed_this_session = True
+
+    # Trade still open at end of data (failsafe)
+    if active_trade is not None and trade_header is None:
+        last_candle = spot_candles[-1]
+        _, last_ts = _candle_time(last_candle)
+        long_p, _ = opt_price(active_trade["long_strike"], active_trade["opt_type"])
+        short_p, _ = opt_price(active_trade["short_strike"], active_trade["opt_type"])
+
+        if long_p and short_p:
+            spread = float(long_p) - float(short_p)
+            realized_gross = round(
+                (spread - active_trade["entry_debit"])
+                * active_trade["lot_size"] * active_trade["approved_lots"], 2,
+            )
+            charges_breakdown = _compute_charges_breakdown(
+                entry_long_price=active_trade["_entry_long_price"],
+                entry_short_price=active_trade["_entry_short_price"],
+                exit_long_price=round(long_p, 2), exit_short_price=round(short_p, 2),
+                lot_size=active_trade["lot_size"], approved_lots=active_trade["approved_lots"],
+            )
+            charges = charges_breakdown["total"]
+            realized_net = round(realized_gross - charges, 2)
+        else:
+            realized_gross = realized_net = charges = 0.0
+            charges_breakdown = {"brokerage": 0.0, "stt": 0.0, "exchange_charges": 0.0, "gst": 0.0, "total": 0.0}
+
+        for leg in trade_legs:
+            leg["exit_price"] = (
+                round(long_p, 2) if (leg["leg_side"] == "LONG" and long_p)
+                else (round(short_p, 2) if short_p else None)
+            )
+
+        trade_header = {
+            "id": active_trade["id"], "session_id": session_id,
+            "entry_time": active_trade["entry_time"], "exit_time": last_ts,
+            "bias": active_trade["bias"], "expiry": active_trade["expiry"],
+            "lot_size": active_trade["lot_size"], "approved_lots": active_trade["approved_lots"],
+            "entry_debit": active_trade["entry_debit"],
+            "total_max_loss": active_trade["total_max_loss"],
+            "target_profit": active_trade["target_profit"],
+            "realized_gross_pnl": realized_gross, "realized_net_pnl": realized_net,
+            "charges": charges, "charges_breakdown_json": charges_breakdown,
+            "status": "CLOSED", "exit_reason": "EXIT_TIME",
+            "long_strike": active_trade["long_strike"],
+            "short_strike": active_trade["short_strike"],
+            "option_type": active_trade["opt_type"],
+            "strategy_name": _CFG["strategy_name"],
+            "strategy_version": _CFG["strategy_version"],
+            "strategy_params_json": active_trade["_strategy_params"],
+            "risk_cap": active_trade["_risk_cap"],
+            "entry_reason_code": active_trade["_entry_reason_code"],
+            "entry_reason_text": active_trade["_entry_reason_text"],
+            "selection_method": active_trade["_selection_method"],
+            "selected_candidate_rank": active_trade["_selected_candidate_rank"],
+            "selected_candidate_score": active_trade["_selected_candidate_score"],
+            "selected_candidate_score_breakdown_json": active_trade["_selected_candidate_score_breakdown"],
+        }
+        current_session_state = "TRADE_CLOSED"
+
+    # Build candle series
+    candle_series: List[Dict] = [{
+        "session_id": session_id, "series_type": "SPOT",
+        "candles": _serialize_candles(spot_candles),
+    }]
+
+    if trade_header:
+        long_s = trade_header["long_strike"]
+        short_s = trade_header["short_strike"]
+        opt_type = trade_header["option_type"]
+        for strike in (long_s, short_s):
+            raw = option_candles_raw.get((strike, opt_type))
+            if raw:
+                candle_series.append({
+                    "session_id": session_id,
+                    "series_type": f"{strike}_{opt_type}_WEEKLY",
+                    "candles": _serialize_candles(raw),
+                })
+
+        # Monthly candles (only available for live path with instruments_master + access_token)
+        if monthly_expiry and instruments_master and access_token:
+            monthly_legs: set = set()
+            for strike in (long_s, short_s):
+                token = resolve_instrument_token(
+                    instrument, monthly_expiry, strike, opt_type, instruments_master
+                )
+                if token and (strike, opt_type, monthly_expiry) not in monthly_legs:
+                    monthly_legs.add((strike, opt_type, monthly_expiry))
+                    try:
+                        from app.services.zerodha_client import fetch_candles_with_token, DataUnavailableError
+                        m_candles = fetch_candles_with_token(token, trade_date, access_token)
+                        candle_series.append({
+                            "session_id": session_id,
+                            "series_type": f"{strike}_{opt_type}_MONTHLY",
+                            "candles": _serialize_candles(m_candles),
+                        })
+                    except Exception as exc:
+                        log.warning("Monthly option data unavailable for %s%s: %s", strike, opt_type, exc)
+
+    log.info(
+        "Engine core complete: %d decisions, trade=%s, %d marks, %d series, state=%s",
+        len(decisions), "YES" if trade_header else "NO",
+        len(minute_marks), len(candle_series), current_session_state,
+    )
+
+    return {
+        "decisions": decisions, "trade_header": trade_header,
+        "minute_marks": minute_marks, "trade_legs": trade_legs,
+        "candle_series": candle_series, "final_session_state": current_session_state,
+    }
+
+
 # ── Main engine ───────────────────────────────────────────────────────────────
 
 def run_paper_engine(
@@ -334,545 +784,19 @@ def run_paper_engine(
         except DataUnavailableError as exc:
             log.warning("Option data unavailable for %s%s: %s", strike, opt_type, exc)
 
-    # ── 5. Replay loop ────────────────────────────────────────────────────────
-    decisions: List[Dict] = []
-    minute_marks: List[Dict] = []
-    trade_header: Optional[Dict] = None
-    trade_legs: List[Dict] = []
-    active_trade: Optional[Dict] = None
-
-    # Phase 1 session state machine
-    current_session_state = "OBSERVING"
-    trade_closed_this_session = False
-    prev_was_tentative_breakout = False
-
-    for idx, candle in enumerate(spot_candles):
-        current_time, ts = _candle_time(candle)
-        or_ready = idx >= OR_WINDOW_MINUTES   # True from index 15 (09:30)
-
-        prev_candle_close: Optional[float] = (
-            float(spot_candles[idx - 1]["close"]) if idx > 0 else None
-        )
-
-        def opt_market(
-            strike,
-            otype,
-            _idx=idx,
-            lookback: Optional[int] = _MAX_PRICE_STALENESS,
-        ) -> Tuple[Optional[Dict[str, Any]], int]:
-            return _get_market_at(option_market_index.get((strike, otype), {}), _idx, lookback=lookback)
-
-        def opt_price(strike, otype, _idx=idx) -> Tuple[Optional[float], int]:
-            snapshot, stale = opt_market(strike, otype, _idx)
-            return (snapshot["price"], stale) if snapshot is not None else (None, stale)
-
-        # ── SESSION_COMPLETE: trade already closed — no re-entry ──────────────
-        if trade_closed_this_session:
-            current_session_state = "SESSION_COMPLETE"
-            decisions.append({
-                "session_id":          session_id,
-                "timestamp":           ts,
-                "spot_close":          float(candle["close"]),
-                "opening_range_high":  or_high,
-                "opening_range_low":   or_low,
-                "trade_state":         "NO_OPEN_TRADE",
-                "signal_state":        "SKIP_MINUTE",
-                "action":              "NO_TRADE",
-                "reason_code":         "SESSION_COMPLETE",
-                "reason_text":         "Trade already closed for this session. No re-entry.",
-                "candidate_structure": None,
-                "computed_max_loss":   None,
-                "computed_target":     None,
-                "session_state":       current_session_state,
-                "signal_substate":     None,
-                "rejection_gate":      None,
-                "price_freshness_json": None,
-                "candidate_ranking_json": None,
-                "selected_candidate_rank": None,
-                "selected_candidate_score": None,
-                "selected_candidate_score_breakdown_json": None,
-            })
-            continue
-
-        if active_trade is None:
-            # ── No open trade: run entry gates ────────────────────────────────
-            prices: Dict[Tuple[int, str], float] = {}
-            market_snapshots: Dict[Tuple[int, str], Dict[str, Any]] = {}
-            price_staleness_map: Dict[str, int] = {}
-
-            for (s, t) in legs_to_fetch:
-                snapshot, stale = opt_market(s, t, lookback=None)
-                if snapshot is not None:
-                    prices[(s, t)] = snapshot["price"]
-                    market_snapshots[(s, t)] = snapshot
-                    if stale > 0:
-                        price_staleness_map[f"{s}_{t}_age_min"] = stale
-
-            gate = evaluate_gates(
-                candle=candle,
-                or_high=or_high,
-                or_low=or_low,
-                or_ready=or_ready,
-                has_open_trade=False,
-                option_prices=prices,
-                instrument=instrument,
-                capital=capital,
-                expiry=expiry,
-                prev_candle_close=prev_candle_close,
-                lot_size=lot_size,
-                current_time=current_time,
-                option_market=market_snapshots,
-            )
-
-            # ── Derive signal_substate ────────────────────────────────────────
-            signal_substate: Optional[str] = None
-            if gate.reason_code == "FAILED_BREAKOUT_OR_NO_FOLLOWTHROUGH":
-                signal_substate = "TENTATIVE_BREAKOUT"
-            elif prev_was_tentative_breakout:
-                if gate.reason_code == "NO_BREAKOUT_CONFIRMATION":
-                    signal_substate = "FAILED_FIRST_BREAKOUT"
-                else:
-                    # Breakout held through G4 (may or may not have entered)
-                    signal_substate = "CONFIRMED_BREAKOUT"
-
-            # ── Update session state ──────────────────────────────────────────
-            if not or_ready:
-                current_session_state = "OBSERVING"
-            elif gate.action == "ENTER":
-                current_session_state = "OPEN_TRADE"
-            elif signal_substate == "TENTATIVE_BREAKOUT":
-                current_session_state = "TENTATIVE_SIGNAL"
-            elif signal_substate in ("FAILED_FIRST_BREAKOUT", None):
-                current_session_state = "OBSERVING"
-            # CONFIRMED_BREAKOUT but no entry (G6/G7 blocked) → still OBSERVING
-            elif signal_substate == "CONFIRMED_BREAKOUT" and gate.action != "ENTER":
-                current_session_state = "OBSERVING"
-
-            # ── Advance tentative-breakout tracker for next minute ────────────
-            prev_was_tentative_breakout = (
-                gate.reason_code == "FAILED_BREAKOUT_OR_NO_FOLLOWTHROUGH"
-            )
-
-            effective_action      = gate.action
-            effective_reason_code = gate.reason_code
-            effective_reason_text = gate.reason_text
-            effective_selected_candidate_rank = gate.selected_candidate_rank
-            effective_selected_candidate_score = gate.selected_candidate_score
-            effective_selected_candidate_score_breakdown = gate.selected_candidate_score_breakdown
-            stale_entry_rejected = False
-
-            if gate.action == "ENTER":
-                long_age = price_staleness_map.get(f"{gate.long_strike}_{gate.opt_type}_age_min", 0)
-                short_age = price_staleness_map.get(f"{gate.short_strike}_{gate.opt_type}_age_min", 0)
-                if max(long_age, short_age) > 0:
-                    stale_entry_rejected = True
-                    effective_action = "NO_TRADE"
-                    effective_reason_code = "STALE_OPTION_PRICE"
-                    effective_reason_text = (
-                        "Confirmed breakout, but entry requires current-minute option prices "
-                        f"(long age={long_age}, short age={short_age})."
-                    )
-                    effective_selected_candidate_rank = None
-                    effective_selected_candidate_score = None
-                    effective_selected_candidate_score_breakdown = None
-                    current_session_state = "OBSERVING"
-                    if signal_substate is None:
-                        signal_substate = "CONFIRMED_BREAKOUT"
-
-            rejection_gate = (
-                None if effective_action == "ENTER" else _REASON_TO_GATE.get(effective_reason_code)
-            )
-
-            # ── Build audit structure ─────────────────────────────────────────
-            audit_structure = gate.candidate_structure if gate.action == "ENTER" else gate.pre_entry_snapshot
-
-            # ── price_freshness_json ──────────────────────────────────────────
-            price_freshness_json = price_staleness_map if price_staleness_map else None
-
-            decisions.append({
-                "session_id":          session_id,
-                "timestamp":           ts,
-                "spot_close":          float(candle["close"]),
-                "opening_range_high":  or_high,
-                "opening_range_low":   or_low,
-                "trade_state":         "NO_OPEN_TRADE",
-                "signal_state":        "EVALUATE" if or_ready else "SKIP_MINUTE",
-                "action":              effective_action,
-                "reason_code":         effective_reason_code,
-                "reason_text":         effective_reason_text,
-                "candidate_structure": audit_structure,
-                "computed_max_loss":   gate.computed_max_loss,
-                "computed_target":     gate.computed_target,
-                "session_state":       current_session_state,
-                "signal_substate":     signal_substate,
-                "rejection_gate":      rejection_gate,
-                "price_freshness_json": price_freshness_json,
-                "candidate_ranking_json": gate.candidate_ranking_json,
-                "selected_candidate_rank": effective_selected_candidate_rank,
-                "selected_candidate_score": effective_selected_candidate_score,
-                "selected_candidate_score_breakdown_json": effective_selected_candidate_score_breakdown,
-            })
-
-            if gate.action == "ENTER" and not stale_entry_rejected:
-                trade_id = uuid.uuid4()
-                long_ep, _ = opt_price(gate.long_strike, gate.opt_type)
-                short_ep, _ = opt_price(gate.short_strike, gate.opt_type)
-
-                active_trade = {
-                    "id":               trade_id,
-                    "entry_time":       ts,
-                    "bias":             gate.bias,
-                    "long_strike":      gate.long_strike,
-                    "short_strike":     gate.short_strike,
-                    "opt_type":         gate.opt_type,
-                    "entry_debit":      gate.entry_debit,
-                    "approved_lots":    gate.approved_lots,
-                    "lot_size":         lot_size,
-                    "total_max_loss":   gate.computed_max_loss,
-                    "target_profit":    gate.computed_target,
-                    "expiry":           expiry,
-                    "_entry_long_price":  round(long_ep, 2) if long_ep else 0.0,
-                    "_entry_short_price": round(short_ep, 2) if short_ep else 0.0,
-                    # Immutable context frozen at entry
-                    "_entry_reason_code": gate.reason_code,
-                    "_entry_reason_text": gate.reason_text,
-                    "_risk_cap":          capital * _CFG["max_risk_pct"],
-                    "_selection_method":  gate.selection_method,
-                    "_selected_candidate_rank": gate.selected_candidate_rank,
-                    "_selected_candidate_score": gate.selected_candidate_score,
-                    "_selected_candidate_score_breakdown": gate.selected_candidate_score_breakdown,
-                    "_strategy_params": {
-                        "strategy_name":            _CFG["strategy_name"],
-                        "strategy_version":         _CFG["strategy_version"],
-                        "or_window_minutes":        _CFG["or_window_minutes"],
-                        "breakout_buffer_pct":      _CFG["breakout_buffer_pct"],
-                        "max_risk_pct":             _CFG["max_risk_pct"],
-                        "target_profit_pct":        _CFG["target_profit_pct"],
-                        "square_off_time":          str(_CFG["square_off_time"]),
-                        "min_minutes_left_to_enter": _CFG["min_minutes_left_to_enter"],
-                        "n_candidate_spreads":      _CFG["n_candidate_spreads"],
-                        "selection_method":         _CFG["selection_method"],
-                        "lot_size":                 lot_size,
-                        "capital":                  capital,
-                    },
-                }
-                trade_legs = [
-                    {
-                        "trade_id":    trade_id,
-                        "leg_side":    "LONG",
-                        "option_type": gate.opt_type,
-                        "strike":      gate.long_strike,
-                        "expiry":      expiry,
-                        "entry_price": round(long_ep, 2) if long_ep else None,
-                        "exit_price":  None,
-                    },
-                    {
-                        "trade_id":    trade_id,
-                        "leg_side":    "SHORT",
-                        "option_type": gate.opt_type,
-                        "strike":      gate.short_strike,
-                        "expiry":      expiry,
-                        "entry_price": round(short_ep, 2) if short_ep else None,
-                        "exit_price":  None,
-                    },
-                ]
-
-        else:
-            # ── Trade open: run exit engine ───────────────────────────────────
-            current_session_state = "OPEN_TRADE"
-            long_p, long_stale   = opt_price(active_trade["long_strike"],  active_trade["opt_type"])
-            short_p, short_stale = opt_price(active_trade["short_strike"], active_trade["opt_type"])
-
-            price_freshness_json: Optional[Dict] = None
-            if long_stale > 0 or short_stale > 0:
-                price_freshness_json = {
-                    "long_age_min":  long_stale,
-                    "short_age_min": short_stale,
-                }
-
-            if long_p is None or short_p is None:
-                decisions.append({
-                    "session_id":          session_id,
-                    "timestamp":           ts,
-                    "spot_close":          float(candle["close"]),
-                    "opening_range_high":  or_high,
-                    "opening_range_low":   or_low,
-                    "trade_state":         "OPEN_TRADE",
-                    "signal_state":        "SKIP_MINUTE",
-                    "action":              "HOLD",
-                    "reason_code":         "DATA_GAP",
-                    "reason_text":         "Option price data unavailable for this minute; holding.",
-                    "candidate_structure": None,
-                    "computed_max_loss":   active_trade["total_max_loss"],
-                    "computed_target":     active_trade["target_profit"],
-                    "session_state":       current_session_state,
-                    "signal_substate":     None,
-                    "rejection_gate":      None,
-                    "price_freshness_json": price_freshness_json,
-                    "candidate_ranking_json": None,
-                    "selected_candidate_rank": None,
-                    "selected_candidate_score": None,
-                    "selected_candidate_score_breakdown_json": None,
-                })
-                continue
-
-            # Estimate round-trip charges using current market prices as exit proxy
-            estimated_charges = _compute_charges(
-                entry_long_price=active_trade["_entry_long_price"],
-                entry_short_price=active_trade["_entry_short_price"],
-                exit_long_price=round(long_p, 2),
-                exit_short_price=round(short_p, 2),
-                lot_size=active_trade["lot_size"],
-                approved_lots=active_trade["approved_lots"],
-            )
-
-            ev = evaluate_exit(
-                current_time=current_time,
-                long_price=long_p,
-                short_price=short_p,
-                entry_debit=active_trade["entry_debit"],
-                lot_size=active_trade["lot_size"],
-                approved_lots=active_trade["approved_lots"],
-                total_max_loss=active_trade["total_max_loss"],
-                target_profit=active_trade["target_profit"],
-                estimated_charges=estimated_charges,
-            )
-
-            if ev.action != "HOLD":
-                current_session_state = "TRADE_CLOSED"
-
-            decisions.append({
-                "session_id":          session_id,
-                "timestamp":           ts,
-                "spot_close":          float(candle["close"]),
-                "opening_range_high":  or_high,
-                "opening_range_low":   or_low,
-                "trade_state":         "OPEN_TRADE",
-                "signal_state":        "EVALUATE",
-                "action":              ev.action,
-                "reason_code":         ev.action,
-                "reason_text":         ev.reason,
-                "candidate_structure": None,
-                "computed_max_loss":   active_trade["total_max_loss"],
-                "computed_target":     active_trade["target_profit"],
-                "session_state":       current_session_state,
-                "signal_substate":     None,
-                "rejection_gate":      None,
-                "price_freshness_json": price_freshness_json,
-                "candidate_ranking_json": None,
-                "selected_candidate_rank": None,
-                "selected_candidate_score": None,
-                "selected_candidate_score_breakdown_json": None,
-            })
-
-            minute_marks.append({
-                "trade_id":                active_trade["id"],
-                "timestamp":               ts,
-                "long_leg_price":          round(long_p, 2),
-                "short_leg_price":         round(short_p, 2),
-                "current_spread_value":    round(ev.current_spread, 2),
-                "mtm_per_lot":             round(ev.mtm_per_lot, 2),
-                "total_mtm":               round(ev.total_mtm, 2),
-                "distance_to_target":      round(ev.distance_to_target, 2),
-                "distance_to_stop":        round(ev.distance_to_stop, 2),
-                "action":                  ev.action,
-                "reason":                  ev.reason[:200],
-                "gross_mtm":               round(ev.gross_mtm, 2),
-                "estimated_exit_charges":  round(ev.estimated_exit_charges, 2),
-                "estimated_net_mtm":       round(ev.estimated_net_mtm, 2),
-                "price_freshness_json":    price_freshness_json,
-            })
-
-            if ev.action != "HOLD":
-                # ── Close trade: final gross + net P&L + charges breakdown ────
-                realized_gross = round(ev.total_mtm, 2)
-                charges_breakdown = _compute_charges_breakdown(
-                    entry_long_price=active_trade["_entry_long_price"],
-                    entry_short_price=active_trade["_entry_short_price"],
-                    exit_long_price=round(long_p, 2),
-                    exit_short_price=round(short_p, 2),
-                    lot_size=active_trade["lot_size"],
-                    approved_lots=active_trade["approved_lots"],
-                )
-                charges = charges_breakdown["total"]
-                realized_net = round(realized_gross - charges, 2)
-
-                for leg in trade_legs:
-                    if leg["leg_side"] == "LONG":
-                        leg["exit_price"] = round(long_p, 2)
-                    else:
-                        leg["exit_price"] = round(short_p, 2)
-
-                trade_header = {
-                    "id":                     active_trade["id"],
-                    "session_id":             session_id,
-                    "entry_time":             active_trade["entry_time"],
-                    "exit_time":              ts,
-                    "bias":                   active_trade["bias"],
-                    "expiry":                 active_trade["expiry"],
-                    "lot_size":               active_trade["lot_size"],
-                    "approved_lots":          active_trade["approved_lots"],
-                    "entry_debit":            active_trade["entry_debit"],
-                    "total_max_loss":         active_trade["total_max_loss"],
-                    "target_profit":          active_trade["target_profit"],
-                    "realized_gross_pnl":     realized_gross,
-                    "realized_net_pnl":       realized_net,
-                    "charges":                charges,
-                    "charges_breakdown_json": charges_breakdown,
-                    "status":                 "CLOSED",
-                    "exit_reason":            ev.action,
-                    "long_strike":            active_trade["long_strike"],
-                    "short_strike":           active_trade["short_strike"],
-                    "option_type":            active_trade["opt_type"],
-                    # Immutable strategy context
-                    "strategy_name":          _CFG["strategy_name"],
-                    "strategy_version":       _CFG["strategy_version"],
-                    "strategy_params_json":   active_trade["_strategy_params"],
-                    "risk_cap":               active_trade["_risk_cap"],
-                    "entry_reason_code":      active_trade["_entry_reason_code"],
-                    "entry_reason_text":      active_trade["_entry_reason_text"],
-                    "selection_method":       active_trade["_selection_method"],
-                    "selected_candidate_rank": active_trade["_selected_candidate_rank"],
-                    "selected_candidate_score": active_trade["_selected_candidate_score"],
-                    "selected_candidate_score_breakdown_json": active_trade["_selected_candidate_score_breakdown"],
-                }
-                active_trade = None
-                trade_closed_this_session = True  # lock: no re-entry
-
-    # ── 6. Trade still open at end of data (failsafe) ────────────────────────
-    if active_trade is not None and trade_header is None:
-        last_candle = spot_candles[-1]
-        _, last_ts = _candle_time(last_candle)
-        long_p, _ = opt_price(active_trade["long_strike"], active_trade["opt_type"])
-        short_p, _ = opt_price(active_trade["short_strike"], active_trade["opt_type"])
-
-        if long_p and short_p:
-            spread = float(long_p) - float(short_p)
-            realized_gross = round(
-                (spread - active_trade["entry_debit"])
-                * active_trade["lot_size"]
-                * active_trade["approved_lots"],
-                2,
-            )
-            charges_breakdown = _compute_charges_breakdown(
-                entry_long_price=active_trade["_entry_long_price"],
-                entry_short_price=active_trade["_entry_short_price"],
-                exit_long_price=round(long_p, 2),
-                exit_short_price=round(short_p, 2),
-                lot_size=active_trade["lot_size"],
-                approved_lots=active_trade["approved_lots"],
-            )
-            charges = charges_breakdown["total"]
-            realized_net = round(realized_gross - charges, 2)
-        else:
-            realized_gross     = 0.0
-            realized_net       = 0.0
-            charges            = 0.0
-            charges_breakdown  = {"brokerage": 0.0, "stt": 0.0, "exchange_charges": 0.0, "gst": 0.0, "total": 0.0}
-
-        for leg in trade_legs:
-            leg["exit_price"] = (
-                round(long_p, 2)
-                if (leg["leg_side"] == "LONG" and long_p)
-                else (round(short_p, 2) if short_p else None)
-            )
-
-        trade_header = {
-            "id":                     active_trade["id"],
-            "session_id":             session_id,
-            "entry_time":             active_trade["entry_time"],
-            "exit_time":              last_ts,
-            "bias":                   active_trade["bias"],
-            "expiry":                 active_trade["expiry"],
-            "lot_size":               active_trade["lot_size"],
-            "approved_lots":          active_trade["approved_lots"],
-            "entry_debit":            active_trade["entry_debit"],
-            "total_max_loss":         active_trade["total_max_loss"],
-            "target_profit":          active_trade["target_profit"],
-            "realized_gross_pnl":     realized_gross,
-            "realized_net_pnl":       realized_net,
-            "charges":                charges,
-            "charges_breakdown_json": charges_breakdown,
-            "status":                 "CLOSED",
-            "exit_reason":            "EXIT_TIME",
-            "long_strike":            active_trade["long_strike"],
-            "short_strike":           active_trade["short_strike"],
-            "option_type":            active_trade["opt_type"],
-            # Immutable strategy context
-            "strategy_name":          _CFG["strategy_name"],
-            "strategy_version":       _CFG["strategy_version"],
-            "strategy_params_json":   active_trade["_strategy_params"],
-            "risk_cap":               active_trade["_risk_cap"],
-            "entry_reason_code":      active_trade["_entry_reason_code"],
-            "entry_reason_text":      active_trade["_entry_reason_text"],
-            "selection_method":       active_trade["_selection_method"],
-            "selected_candidate_rank": active_trade["_selected_candidate_rank"],
-            "selected_candidate_score": active_trade["_selected_candidate_score"],
-            "selected_candidate_score_breakdown_json": active_trade["_selected_candidate_score_breakdown"],
-        }
-        current_session_state = "TRADE_CLOSED"
-
-    # ── 7. Build candle series for export ────────────────────────────────────
-    candle_series: List[Dict] = [
-        {
-            "session_id":  session_id,
-            "series_type": "SPOT",
-            "candles":     _serialize_candles(spot_candles),
-        }
-    ]
-
-    if trade_header:
-        long_s   = trade_header["long_strike"]
-        short_s  = trade_header["short_strike"]
-        opt_type = trade_header["option_type"]
-
-        for strike in (long_s, short_s):
-            raw = option_candles_raw.get((strike, opt_type))
-            if raw:
-                candle_series.append({
-                    "session_id":  session_id,
-                    "series_type": f"{strike}_{opt_type}_WEEKLY",
-                    "candles":     _serialize_candles(raw),
-                })
-
-        if monthly_expiry:
-            monthly_legs = set()
-            for strike in (long_s, short_s):
-                token = resolve_instrument_token(
-                    instrument, monthly_expiry, strike, opt_type, instruments_master
-                )
-                if token and (strike, opt_type, monthly_expiry) not in monthly_legs:
-                    monthly_legs.add((strike, opt_type, monthly_expiry))
-                    try:
-                        m_candles = fetch_candles_with_token(token, trade_date, access_token)
-                        candle_series.append({
-                            "session_id":  session_id,
-                            "series_type": f"{strike}_{opt_type}_MONTHLY",
-                            "candles":     _serialize_candles(m_candles),
-                        })
-                        log.info(
-                            "Fetched %d monthly candles for %s%s exp=%s",
-                            len(m_candles), strike, opt_type, monthly_expiry,
-                        )
-                    except DataUnavailableError as exc:
-                        log.warning(
-                            "Monthly option data unavailable for %s%s: %s", strike, opt_type, exc
-                        )
-
-    log.info(
-        "Engine complete: %d decisions, trade=%s, %d marks, %d candle series, final_state=%s",
-        len(decisions),
-        "YES" if trade_header else "NO",
-        len(minute_marks),
-        len(candle_series),
-        current_session_state,
+    # ── 5. Run core replay loop ───────────────────────────────────────────────
+    return run_paper_engine_core(
+        session_id=session_id,
+        trade_date=trade_date,
+        instrument=instrument,
+        capital=capital,
+        spot_candles=spot_candles,
+        option_market_index=option_market_index,
+        option_candles_raw=option_candles_raw,
+        expiry=expiry,
+        lot_size=lot_size,
+        legs_to_fetch=legs_to_fetch,
+        monthly_expiry=monthly_expiry,
+        instruments_master=instruments_master,
+        access_token=access_token,
     )
-
-    return {
-        "decisions":           decisions,
-        "trade_header":        trade_header,
-        "minute_marks":        minute_marks,
-        "trade_legs":          trade_legs,
-        "candle_series":       candle_series,
-        "final_session_state": current_session_state,
-    }
