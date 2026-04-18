@@ -9,9 +9,27 @@ const api = axios.create({
 // ── Auth interceptor: attach access token from in-memory store ────────────────
 // The token is injected by AuthContext via the `setToken` helper below.
 let _accessToken = null
+let _refreshAccessToken = null
+let _clearAuthState = null
+let _refreshPromise = null
 
 export function setToken(token) {
   _accessToken = token
+}
+
+export function setAuthHandlers({ refreshAccessToken, clearAuthState } = {}) {
+  _refreshAccessToken = refreshAccessToken || null
+  _clearAuthState = clearAuthState || null
+}
+
+async function refreshAccessTokenOnce() {
+  if (!_refreshAccessToken) return null
+  if (!_refreshPromise) {
+    _refreshPromise = Promise.resolve(_refreshAccessToken()).finally(() => {
+      _refreshPromise = null
+    })
+  }
+  return _refreshPromise
 }
 
 api.interceptors.request.use(config => {
@@ -20,6 +38,32 @@ api.interceptors.request.use(config => {
   }
   return config
 })
+
+api.interceptors.response.use(
+  response => response,
+  async error => {
+    const status = error?.response?.status
+    const original = error?.config
+    const url = original?.url || ''
+    const isAuthEndpoint = url.includes('/users/login') || url.includes('/users/refresh') || url.includes('/users/logout')
+
+    if (status === 401 && original && !original._retry && !isAuthEndpoint) {
+      original._retry = true
+      const nextToken = await refreshAccessTokenOnce()
+      if (nextToken) {
+        original.headers = original.headers || {}
+        original.headers.Authorization = `Bearer ${nextToken}`
+        return api(original)
+      }
+    }
+
+    if (status === 401 && !url.includes('/users/logout') && _clearAuthState) {
+      _clearAuthState()
+    }
+
+    return Promise.reject(error)
+  }
+)
 
 // ── Backtest ──────────────────────────────────────────────────────────────────
 export const runBacktest = (payload) => api.post('/backtest/run', payload)

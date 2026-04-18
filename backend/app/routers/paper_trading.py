@@ -77,7 +77,8 @@ class RunSessionRequest(BaseModel):
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
-def _session_dict(s: PaperSession) -> dict:
+def _session_dict(s: PaperSession, *, summary_pnl=None) -> dict:
+    pnl_value = s.summary_pnl if s.summary_pnl is not None else summary_pnl
     return {
         "id": str(s.id),
         "instrument": s.instrument,
@@ -88,6 +89,7 @@ def _session_dict(s: PaperSession) -> dict:
         "decision_count": s.decision_count,
         "created_at": str(s.created_at) if s.created_at else None,
         "final_session_state": s.final_session_state,
+        "summary_pnl": float(pnl_value) if pnl_value is not None else None,
     }
 
 
@@ -319,6 +321,8 @@ async def run_session(
     ps.status = "COMPLETED"
     ps.decision_count = len(result["decisions"])
     ps.final_session_state = result.get("final_session_state")
+    if result["trade_header"] and result["trade_header"].get("realized_net_pnl") is not None:
+        ps.summary_pnl = result["trade_header"]["realized_net_pnl"]
     await db.commit()
     await db.refresh(ps)
 
@@ -346,7 +350,22 @@ async def list_sessions(
         q = q.where(PaperSession.instrument == instrument.strip().upper())
     q = q.limit(limit)
     rows = (await db.execute(q)).scalars().all()
-    return [_session_dict(s) for s in rows]
+
+    pnl_by_session = {}
+    unresolved_ids = [s.id for s in rows if s.summary_pnl is None]
+    if unresolved_ids:
+        pnl_rows = (await db.execute(
+            select(PaperTradeHeader.session_id, PaperTradeHeader.realized_net_pnl).where(
+                PaperTradeHeader.session_id.in_(unresolved_ids)
+            )
+        )).all()
+        pnl_by_session = {
+            session_id: realized_net_pnl
+            for session_id, realized_net_pnl in pnl_rows
+            if realized_net_pnl is not None
+        }
+
+    return [_session_dict(s, summary_pnl=pnl_by_session.get(s.id)) for s in rows]
 
 
 @router.get("/paper/session/{session_id}")
@@ -371,7 +390,16 @@ async def get_session(
     )).all()
     action_summary = {row.action: row.cnt for row in action_rows}
 
-    return {**_session_dict(s), "action_summary": action_summary}
+    fallback_pnl = None
+    if s.summary_pnl is None:
+        fallback_pnl = (await db.execute(
+            select(PaperTradeHeader.realized_net_pnl).where(PaperTradeHeader.session_id == sid)
+        )).scalar_one_or_none()
+
+    return {
+        **_session_dict(s, summary_pnl=fallback_pnl),
+        "action_summary": action_summary,
+    }
 
 
 @router.get("/paper/session/{session_id}/decisions")

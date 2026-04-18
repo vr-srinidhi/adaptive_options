@@ -82,40 +82,49 @@ export default function SessionMonitor() {
           <table className="w-full text-xs">
             <thead>
               <tr style={{ borderBottom: '1px solid var(--border)', background: 'var(--surface-tertiary)' }}>
-                {['Date', 'Instrument', 'Capital', 'Status', 'Decisions', 'Created At'].map(h => (
+                {['Date', 'Instrument', 'Capital', 'Status', 'Decisions', 'P/L', 'Created At'].map(h => (
                   <th key={h} className="text-left px-3 py-2.5 font-medium uppercase tracking-wider"
                     style={{ color: 'var(--text-secondary)' }}>{h}</th>
                 ))}
               </tr>
             </thead>
             <tbody>
-              {sessions.map(s => (
-                <tr
-                  key={s.id}
-                  className="table-row-hover"
-                  style={{ borderBottom: '0.5px solid var(--border)', cursor: 'pointer' }}
-                  onClick={() => navigate(`/paper/session/${s.id}`)}
-                >
-                  <td className="px-3 py-2.5 font-medium" style={{ color: 'var(--text-primary)' }}>
-                    {s.session_date}
-                  </td>
-                  <td className="px-3 py-2.5" style={{ color: 'var(--text-secondary)' }}>
-                    {s.instrument}
-                  </td>
-                  <td className="px-3 py-2.5" style={{ color: 'var(--text-secondary)' }}>
-                    {fmtINR(s.capital)}
-                  </td>
-                  <td className="px-3 py-2.5">
-                    <StatusBadge status={s.status} />
-                  </td>
-                  <td className="px-3 py-2.5" style={{ color: 'var(--text-secondary)' }}>
-                    {s.decision_count ?? '—'}
-                  </td>
-                  <td className="px-3 py-2.5" style={{ color: 'var(--text-secondary)' }}>
-                    {s.created_at ? s.created_at.slice(0, 16).replace('T', ' ') : '—'}
-                  </td>
-                </tr>
-              ))}
+              {sessions.map(s => {
+                const pnlColor = s.summary_pnl == null
+                  ? 'var(--text-secondary)'
+                  : s.summary_pnl >= 0 ? '#22c55e' : '#ef4444'
+
+                return (
+                  <tr
+                    key={s.id}
+                    className="table-row-hover"
+                    style={{ borderBottom: '0.5px solid var(--border)', cursor: 'pointer' }}
+                    onClick={() => navigate(`/paper/session/${s.id}`)}
+                  >
+                    <td className="px-3 py-2.5 font-medium" style={{ color: 'var(--text-primary)' }}>
+                      {s.session_date}
+                    </td>
+                    <td className="px-3 py-2.5" style={{ color: 'var(--text-secondary)' }}>
+                      {s.instrument}
+                    </td>
+                    <td className="px-3 py-2.5" style={{ color: 'var(--text-secondary)' }}>
+                      {fmtINR(s.capital)}
+                    </td>
+                    <td className="px-3 py-2.5">
+                      <StatusBadge status={s.status} />
+                    </td>
+                    <td className="px-3 py-2.5" style={{ color: 'var(--text-secondary)' }}>
+                      {s.decision_count ?? '—'}
+                    </td>
+                    <td className="px-3 py-2.5 font-mono" style={{ color: pnlColor }}>
+                      {fmtINR(s.summary_pnl)}
+                    </td>
+                    <td className="px-3 py-2.5" style={{ color: 'var(--text-secondary)' }}>
+                      {s.created_at ? s.created_at.slice(0, 16).replace('T', ' ') : '—'}
+                    </td>
+                  </tr>
+                )
+              })}
             </tbody>
           </table>
         </div>
