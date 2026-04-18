@@ -12,7 +12,7 @@ Tables:
 import uuid
 from sqlalchemy import (
     BigInteger, Boolean, Column, Date, Index, Integer, Numeric,
-    String, TIMESTAMP, Text, func,
+    String, TIMESTAMP, Text, UniqueConstraint, func,
 )
 from sqlalchemy.dialects.postgresql import UUID, JSONB
 from app.database import Base
@@ -66,6 +66,7 @@ class SpotCandle(Base):
     created_at = Column(TIMESTAMP(timezone=True), server_default=func.now())
 
     __table_args__ = (
+        UniqueConstraint("trade_date", "symbol", "timestamp", name="uq_spot_candles_date_sym_ts"),
         Index("ix_spot_candles_date_ts", "trade_date", "timestamp"),
         Index("ix_spot_candles_symbol_date", "symbol", "trade_date"),
     )
@@ -86,6 +87,7 @@ class VixCandle(Base):
     created_at = Column(TIMESTAMP(timezone=True), server_default=func.now())
 
     __table_args__ = (
+        UniqueConstraint("trade_date", "symbol", "timestamp", name="uq_vix_candles_date_sym_ts"),
         Index("ix_vix_candles_date_ts", "trade_date", "timestamp"),
     )
 
@@ -108,6 +110,7 @@ class FuturesCandle(Base):
     created_at = Column(TIMESTAMP(timezone=True), server_default=func.now())
 
     __table_args__ = (
+        UniqueConstraint("trade_date", "symbol", "expiry_date", "timestamp", name="uq_futures_candles_date_sym_exp_ts"),
         Index("ix_futures_candles_date_ts", "trade_date", "timestamp"),
         Index("ix_futures_candles_symbol_expiry_ts", "symbol", "expiry_date", "timestamp"),
     )
@@ -140,6 +143,10 @@ class OptionsCandle(Base):
     created_at = Column(TIMESTAMP(timezone=True), server_default=func.now())
 
     __table_args__ = (
+        UniqueConstraint(
+            "trade_date", "symbol", "expiry_date", "option_type", "strike", "timestamp",
+            name="uq_options_candles_natural",
+        ),
         # Engine lookup: fetch all candles for a specific strike/expiry/type on a date
         Index(
             "ix_options_candles_lookup",

@@ -11,21 +11,22 @@ Key types produced:
   expiry              : date
   lot_size            : int
   legs_to_fetch       : set of (strike, opt_type)
+
+option_price_source: "ltp" | "close"
+  Controls which DB field is used as the option execution price.
+  "ltp"   — last-traded-price (captured live during market hours; most realistic)
+  "close" — OHLCV close (useful for comparison / fallback when ltp is absent)
+  Must be stored in strategy_config_snapshot so results are reproducible.
 """
 import logging
 from datetime import date as date_type, datetime, time
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Literal, Optional, Set, Tuple
 
 from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.historical import OptionsCandle, SpotCandle
-from app.services.opening_range import (
-    generate_bearish_candidates,
-    generate_bullish_candidates,
-    compute_opening_range,
-    OR_WINDOW_MINUTES,
-)
+from app.services.opening_range import OR_WINDOW_MINUTES
 
 log = logging.getLogger(__name__)
 
@@ -51,8 +52,21 @@ def _spot_row_to_candle(row: SpotCandle) -> Dict[str, Any]:
     }
 
 
-def _option_row_to_candle(row: OptionsCandle) -> Dict[str, Any]:
-    price = float(row.ltp if row.ltp is not None else row.close)
+def _option_row_to_candle(
+    row: OptionsCandle,
+    option_price_source: Literal["ltp", "close"] = "ltp",
+) -> Dict[str, Any]:
+    """
+    Convert an OptionsCandle row to the paper-engine candle dict format.
+
+    option_price_source controls the execution price field:
+      "ltp"   — use row.ltp when available, fall back to row.close
+      "close" — always use row.close
+    """
+    if option_price_source == "ltp" and row.ltp is not None:
+        price = float(row.ltp)
+    else:
+        price = float(row.close) if row.close is not None else 0.0
     return {
         "date":   row.timestamp,
         "open":   float(row.open) if row.open is not None else price,
@@ -137,6 +151,7 @@ async def load_option_candles_for_strikes(
     trade_date: date_type,
     expiry: date_type,
     legs_to_fetch: Set[Tuple[int, str]],
+    option_price_source: Literal["ltp", "close"] = "ltp",
 ) -> Tuple[
     Dict[Tuple[int, str], Dict[int, Dict[str, Any]]],   # option_market_index
     Dict[Tuple[int, str], List[Dict[str, Any]]],         # option_candles_raw
@@ -175,7 +190,7 @@ async def load_option_candles_for_strikes(
         key = (int(row.strike), row.option_type)
         if key not in legs_to_fetch:
             continue
-        raw.setdefault(key, []).append(_option_row_to_candle(row))
+        raw.setdefault(key, []).append(_option_row_to_candle(row, option_price_source))
 
     # Build minute index: map candle timestamp → minute offset from 09:15
     session_start_dt = datetime.combine(trade_date, _SESSION_START)
@@ -208,22 +223,25 @@ async def load_option_candles_for_strikes(
     return option_market_index, option_candles_out
 
 
-# ── High-level loader (called by batch runner) ─────────────────────────────────
+# ── High-level loader (called by batch runner / strategy adapters) ─────────────
 
 async def load_historical_session_data(
     db: AsyncSession,
     instrument: str,
     trade_date: date_type,
+    legs_to_fetch: Set[Tuple[int, str]],
+    option_price_source: Literal["ltp", "close"] = "ltp",
 ) -> Optional[Dict[str, Any]]:
     """
-    Load all data needed to call run_paper_engine_core() for one historical day.
+    Generic DB-backed market data loader.  Strategy-agnostic: the caller
+    supplies which (strike, option_type) legs to load.
 
-    Returns None if the day has insufficient data (< OR_WINDOW_MINUTES spot candles
-    or no expiry found in options_candles).
+    Returns None if the day has insufficient data (< OR_WINDOW_MINUTES spot
+    candles or no expiry found in options_candles).
 
     Returns a dict with keys:
       spot_candles, option_market_index, option_candles_raw,
-      expiry, monthly_expiry, lot_size, legs_to_fetch
+      expiry, monthly_expiry, lot_size, legs_to_fetch, option_price_source
     """
     # 1. Spot candles
     spot_candles = await load_spot_candles(db, instrument, trade_date)
@@ -234,21 +252,7 @@ async def load_historical_session_data(
         )
         return None
 
-    # 2. OR + candidate generation
-    or_high, or_low = compute_opening_range(spot_candles)
-
-    bullish_candidates = generate_bullish_candidates(or_high)
-    bearish_candidates = generate_bearish_candidates(or_low)
-
-    legs_to_fetch: Set[Tuple[int, str]] = set()
-    for long_s, short_s in bullish_candidates:
-        legs_to_fetch.add((long_s, "CE"))
-        legs_to_fetch.add((short_s, "CE"))
-    for long_s, short_s in bearish_candidates:
-        legs_to_fetch.add((long_s, "PE"))
-        legs_to_fetch.add((short_s, "PE"))
-
-    # 3. Expiry from options_candles
+    # 2. Expiry from options_candles
     expiry = await resolve_expiry_from_db(db, instrument, trade_date)
     if expiry is None:
         log.warning("No expiry found in options_candles for %s %s", instrument, trade_date)
@@ -258,12 +262,12 @@ async def load_historical_session_data(
     if monthly_expiry == expiry:
         monthly_expiry = None
 
-    # 4. Option candles
+    # 3. Option candles for the requested legs
     option_market_index, option_candles_raw = await load_option_candles_for_strikes(
-        db, instrument, trade_date, expiry, legs_to_fetch
+        db, instrument, trade_date, expiry, legs_to_fetch, option_price_source,
     )
 
-    # 5. Lot size (hardcoded — constant for NIFTY throughout history)
+    # 4. Lot size (hardcoded — constant for NIFTY throughout history)
     lot_size = _NIFTY_LOT_SIZE
 
     return {
@@ -274,4 +278,5 @@ async def load_historical_session_data(
         "monthly_expiry":       monthly_expiry,
         "lot_size":             lot_size,
         "legs_to_fetch":        legs_to_fetch,
+        "option_price_source":  option_price_source,
     }

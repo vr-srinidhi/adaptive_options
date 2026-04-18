@@ -87,6 +87,7 @@ def _build_strategy_snapshot(instrument: str, capital: float) -> Dict[str, Any]:
         "target_pct": _CFG["target_profit_pct"],
         "n_candidate_spreads": _CFG["n_candidate_spreads"],
         "max_price_staleness_min": _CFG["max_price_staleness_min"],
+        "option_price_source": "ltp",   # "ltp" | "close" — stored for reproducibility
     }
 
 

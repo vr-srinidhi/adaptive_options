@@ -119,27 +119,41 @@ def _read_options_csv(path: Path, trade_date: date_type) -> pd.DataFrame:
 
 # ── Bulk insert helpers ───────────────────────────────────────────────────────
 
+# Natural unique constraint names per table — must match models/historical.py
+_CONFLICT_CONSTRAINT = {
+    "spot_candles":     "uq_spot_candles_date_sym_ts",
+    "vix_candles":      "uq_vix_candles_date_sym_ts",
+    "futures_candles":  "uq_futures_candles_date_sym_exp_ts",
+    "options_candles":  "uq_options_candles_natural",
+}
+
+
 async def _bulk_insert(
     session: AsyncSession,
     df: pd.DataFrame,
     table: str,
     chunk: int,
-    conflict_cols: List[str],
+    conflict_cols: List[str],  # kept for API compat; constraint name is looked up internally
 ) -> int:
     """
-    Insert df rows into table using INSERT ... ON CONFLICT DO NOTHING.
+    Insert df rows into table using INSERT ... ON CONFLICT ON CONSTRAINT ... DO NOTHING.
     Returns number of rows inserted.
     """
     if df.empty:
         return 0
 
+    constraint = _CONFLICT_CONSTRAINT.get(table)
+    conflict_clause = (
+        f"ON CONFLICT ON CONSTRAINT {constraint} DO NOTHING"
+        if constraint
+        else "ON CONFLICT DO NOTHING"
+    )
+
     cols = list(df.columns)
     col_names = ", ".join(cols)
     placeholders = ", ".join(f":{c}" for c in cols)
-    conflict = ", ".join(conflict_cols)
     stmt = text(
-        f"INSERT INTO {table} ({col_names}) VALUES ({placeholders}) "
-        f"ON CONFLICT DO NOTHING"
+        f"INSERT INTO {table} ({col_names}) VALUES ({placeholders}) {conflict_clause}"
     )
 
     total = 0

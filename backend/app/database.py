@@ -90,5 +90,12 @@ async def init_db():
             "ALTER TABLE paper_trade_headers ADD COLUMN IF NOT EXISTS selected_candidate_rank INTEGER",
             "ALTER TABLE paper_trade_headers ADD COLUMN IF NOT EXISTS selected_candidate_score NUMERIC(10,4)",
             "ALTER TABLE paper_trade_headers ADD COLUMN IF NOT EXISTS selected_candidate_score_breakdown_json JSONB",
+            # ── paper_sessions SKIPPED status support ─────────────────────────
+            "ALTER TABLE paper_sessions ADD COLUMN IF NOT EXISTS error_message TEXT",
+            # ── Warehouse unique constraints (idempotency) ────────────────────
+            "ALTER TABLE spot_candles ADD CONSTRAINT IF NOT EXISTS uq_spot_candles_date_sym_ts UNIQUE (trade_date, symbol, timestamp)",
+            "ALTER TABLE vix_candles ADD CONSTRAINT IF NOT EXISTS uq_vix_candles_date_sym_ts UNIQUE (trade_date, symbol, timestamp)",
+            "ALTER TABLE futures_candles ADD CONSTRAINT IF NOT EXISTS uq_futures_candles_date_sym_exp_ts UNIQUE (trade_date, symbol, expiry_date, timestamp)",
+            "ALTER TABLE options_candles ADD CONSTRAINT IF NOT EXISTS uq_options_candles_natural UNIQUE (trade_date, symbol, expiry_date, option_type, strike, timestamp)",
         ]:
             await conn.execute(__import__("sqlalchemy").text(stmt))

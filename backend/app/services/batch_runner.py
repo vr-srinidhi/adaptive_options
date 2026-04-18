@@ -15,7 +15,7 @@ from datetime import date as date_type, datetime, timezone
 from typing import Any, Dict, List, Optional
 
 from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession, AsyncSessionLocal  # imported below
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.historical import SessionBatch, TradingDay
 from app.models.paper_trade import (
@@ -27,6 +27,11 @@ from app.models.paper_trade import (
     PaperTradeMinuteMark,
 )
 from app.services.historical_market_data import load_historical_session_data
+from app.services.opening_range import (
+    compute_opening_range,
+    generate_bearish_candidates,
+    generate_bullish_candidates,
+)
 from app.services.paper_engine import run_paper_engine_core
 
 log = logging.getLogger(__name__)
@@ -101,14 +106,8 @@ async def run_historical_day(
     """
     started_at = datetime.now(tz=timezone.utc)
 
-    # Load market data
-    data = await load_historical_session_data(db, instrument, trade_date)
-    if data is None:
-        log.warning("Skipping %s — insufficient historical data", trade_date)
-        return {"status": "skipped", "trade_date": str(trade_date), "summary_pnl": None,
-                "reason": "insufficient_data"}
-
-    # Create PaperSession row
+    # Always create a PaperSession row so the audit trail is complete even for
+    # skipped/insufficient-data days. The session status reflects the outcome.
     session_id = uuid.uuid4()
     session_obj = PaperSession(
         id=session_id,
@@ -126,6 +125,39 @@ async def run_historical_day(
     )
     db.add(session_obj)
     await db.flush()
+
+    # ── ORB leg discovery (strategy-specific, done here not in the data layer) ──
+    # We need spot candles first to compute OR and derive candidate strikes.
+    from app.services.historical_market_data import load_spot_candles
+    from app.services.opening_range import OR_WINDOW_MINUTES
+    spot_pre = await load_spot_candles(db, instrument, trade_date)
+    if len(spot_pre) >= OR_WINDOW_MINUTES:
+        or_high, or_low = compute_opening_range(spot_pre)
+        legs_to_fetch = set()
+        for long_s, short_s in generate_bullish_candidates(or_high):
+            legs_to_fetch.add((long_s, "CE"))
+            legs_to_fetch.add((short_s, "CE"))
+        for long_s, short_s in generate_bearish_candidates(or_low):
+            legs_to_fetch.add((long_s, "PE"))
+            legs_to_fetch.add((short_s, "PE"))
+    else:
+        legs_to_fetch = set()
+
+    option_price_source = strategy_config_snapshot.get("option_price_source", "ltp")
+
+    # Load market data — if insufficient, persist a SKIPPED session and return
+    data = await load_historical_session_data(
+        db, instrument, trade_date, legs_to_fetch, option_price_source
+    )
+    if data is None:
+        log.warning("Skipping %s — insufficient historical data", trade_date)
+        session_obj.status = "SKIPPED"
+        session_obj.final_session_state = "INSUFFICIENT_DATA"
+        session_obj.error_message = "Insufficient historical data for this date"
+        session_obj.completed_at = datetime.now(tz=timezone.utc)
+        await db.commit()
+        return {"status": "skipped", "trade_date": str(trade_date), "summary_pnl": None,
+                "reason": "insufficient_data", "session_id": str(session_id)}
 
     try:
         result = run_paper_engine_core(
