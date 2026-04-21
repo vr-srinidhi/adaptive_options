@@ -11,6 +11,7 @@ from app.database import init_db
 from app.middleware.security_headers import SecurityHeadersMiddleware
 from app.routers import backtest, auth, paper_trading, users
 from app.routers import historical, backtests
+from app.routers import workbench
 
 app = FastAPI(title="Adaptive Options API", version="1.0.0")
 
@@ -49,6 +50,7 @@ app.include_router(paper_trading.router, prefix="/api")
 app.include_router(users.router, prefix="/api")
 app.include_router(historical.router, prefix="/api/historical", tags=["historical"])
 app.include_router(backtests.router, prefix="/api/backtests", tags=["backtests"])
+app.include_router(workbench.router)
 
 
 @app.get("/health")

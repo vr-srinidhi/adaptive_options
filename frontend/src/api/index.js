@@ -116,4 +116,14 @@ export const zerodhaLoginUrl = () => api.get('/auth/zerodha/login-url')
 export const zerodhaSession = (payload) => api.post('/auth/zerodha/session', payload)
 export const zerodhaStatus = () => api.get('/auth/zerodha/status')
 
+// ── Workbench v2 ─────────────────────────────────────────────────────────────
+export const getWorkbenchSummary = () => api.get('/v2/workspace/summary')
+export const getWorkbenchStrategies = () => api.get('/v2/strategies')
+export const getWorkbenchStrategy = (strategyId) => api.get(`/v2/strategies/${strategyId}`)
+export const getWorkbenchRuns = (params) => api.get('/v2/runs', { params })
+export const createWorkbenchRun = (payload) => api.post('/v2/runs', payload)
+export const getWorkbenchRun = (kind, id) => api.get(`/v2/runs/${kind}/${id}`)
+export const getWorkbenchReplay = (kind, id) => api.get(`/v2/runs/${kind}/${id}/replay`)
+export const compareWorkbenchRuns = (refs) => api.get('/v2/runs/compare', { params: { refs } })
+
 export default api

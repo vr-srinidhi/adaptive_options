@@ -14,6 +14,13 @@ import ZerodhaConnect from './pages/ZerodhaConnect'
 import Backtests from './pages/Backtests'
 import BacktestBatchDetail from './pages/BacktestBatchDetail'
 import HistoricalSessionDetail from './pages/HistoricalSessionDetail'
+import WorkspaceHome from './pages/WorkspaceHome'
+import StrategyCatalog from './pages/StrategyCatalog'
+import RunBuilder from './pages/RunBuilder'
+import ReplayDesk from './pages/ReplayDesk'
+import ReplayAnalyzer from './pages/ReplayAnalyzer'
+import RunsLibrary from './pages/RunsLibrary'
+import WorkbenchHistoryDetail from './pages/WorkbenchHistoryDetail'
 
 export default function App() {
   return (
@@ -30,7 +37,15 @@ export default function App() {
                 <TopNav />
                 <main className="flex-1 overflow-auto">
                   <Routes>
-                    <Route path="/" element={<Navigate to="/backtest" replace />} />
+                    <Route path="/" element={<Navigate to="/workbench" replace />} />
+                    {/* Workbench v2 */}
+                    <Route path="/workbench" element={<WorkspaceHome />} />
+                    <Route path="/workbench/strategies" element={<StrategyCatalog />} />
+                    <Route path="/workbench/run" element={<RunBuilder />} />
+                    <Route path="/workbench/replay" element={<ReplayDesk />} />
+                    <Route path="/workbench/replay/:kind/:id" element={<ReplayAnalyzer />} />
+                    <Route path="/workbench/history" element={<RunsLibrary />} />
+                    <Route path="/workbench/history/:kind/:id" element={<WorkbenchHistoryDetail />} />
                     {/* Zerodha connect */}
                     <Route path="/zerodha-connect" element={<ZerodhaConnect />} />
                     {/* Backtest module */}
