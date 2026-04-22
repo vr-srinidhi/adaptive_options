@@ -1,10 +1,23 @@
 import { render, screen } from '@testing-library/react'
 import { MemoryRouter } from 'react-router-dom'
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import { AuthProvider } from '../contexts/AuthContext'
 import TopNav from './TopNav'
 
-function renderInRouter(initialPath = '/backtest') {
+vi.mock('../api', async () => {
+  const actual = await vi.importActual('../api')
+  return {
+    ...actual,
+    setAuthHandlers: vi.fn(),
+    setToken: vi.fn(),
+    default: {
+      post: vi.fn(() => Promise.reject(new Error('skip auth bootstrap'))),
+      get: vi.fn(() => Promise.reject(new Error('skip auth bootstrap'))),
+    },
+  }
+})
+
+function renderInRouter(initialPath = '/workbench') {
   return render(
     <AuthProvider>
       <MemoryRouter initialEntries={[initialPath]}>
@@ -15,7 +28,6 @@ function renderInRouter(initialPath = '/backtest') {
 }
 
 describe('TopNav', () => {
-  // ── Positive tests ───────────────────────────────────────────────────────
   it('renders the brand name', () => {
     renderInRouter()
     expect(screen.getByAltText('Adaptive Options logo')).toBeInTheDocument()
@@ -23,52 +35,40 @@ describe('TopNav', () => {
     expect(screen.getByText('Options')).toBeInTheDocument()
   })
 
-  it('renders backtest nav links (Run and Dashboard)', () => {
+  it('renders the workbench navigation links', () => {
     renderInRouter()
+    expect(screen.getByRole('link', { name: /^home$/i })).toBeInTheDocument()
+    expect(screen.getByRole('link', { name: /^strategies$/i })).toBeInTheDocument()
     expect(screen.getByRole('link', { name: /^run$/i })).toBeInTheDocument()
-    expect(screen.getByRole('link', { name: /dashboard/i })).toBeInTheDocument()
+    expect(screen.getByRole('link', { name: /^replay$/i })).toBeInTheDocument()
+    expect(screen.getByRole('link', { name: /^history$/i })).toBeInTheDocument()
   })
 
-  it('renders paper trading nav links (Replay and Sessions)', () => {
-    renderInRouter()
-    expect(screen.getByRole('link', { name: /replay/i })).toBeInTheDocument()
-    expect(screen.getByRole('link', { name: /sessions/i })).toBeInTheDocument()
-  })
-
-  it('shows the BACKTEST MODE indicator badge', () => {
-    renderInRouter()
-    expect(screen.getByText('BACKTEST MODE')).toBeInTheDocument()
-  })
-
-  it('Run link points to /backtest', () => {
-    renderInRouter()
-    expect(screen.getByRole('link', { name: /^run$/i })).toHaveAttribute('href', '/backtest')
-  })
-
-  it('Dashboard link points to /dashboard', () => {
-    renderInRouter()
-    expect(screen.getByRole('link', { name: /dashboard/i })).toHaveAttribute('href', '/dashboard')
-  })
-
-  it('active link gets the active class when on /backtest', () => {
+  it('renders secondary legacy links', () => {
     renderInRouter('/backtest')
-    const runLink = screen.getByRole('link', { name: /^run$/i })
-    const dashboard = screen.getByRole('link', { name: /dashboard/i })
-    expect(runLink.className).toContain('text-blue-400')
-    expect(dashboard.className).not.toContain('text-blue-400')
+    expect(screen.getByRole('link', { name: /^backtest$/i })).toBeInTheDocument()
+    expect(screen.getByRole('link', { name: /^paper$/i })).toBeInTheDocument()
+    expect(screen.getByRole('link', { name: /^sessions$/i })).toBeInTheDocument()
+    expect(screen.getByRole('link', { name: /^backtests$/i })).toBeInTheDocument()
   })
 
-  // ── Negative tests ───────────────────────────────────────────────────────
-  it('renders nav links including Run, Dashboard, Replay, Sessions, and Zerodha', () => {
+  it('marks the active workbench section label', () => {
+    renderInRouter('/workbench/strategies')
+    expect(screen.getByText('STRATEGIES', { selector: 'span' })).toBeInTheDocument()
+  })
+
+  it('home link points to /workbench', () => {
     renderInRouter()
-    const links = screen.getAllByRole('link')
-    // Run, Dashboard, Replay, Sessions, Zerodha
-    expect(links.length).toBeGreaterThanOrEqual(5)
+    expect(screen.getByRole('link', { name: /^home$/i })).toHaveAttribute('href', '/workbench')
   })
 
-  it('Dashboard link is not active when on /backtest', () => {
-    renderInRouter('/backtest')
-    const dashboard = screen.getByRole('link', { name: /dashboard/i })
-    expect(dashboard.className).not.toContain('text-blue-400')
+  it('run link points to /workbench/run', () => {
+    renderInRouter()
+    expect(screen.getByRole('link', { name: /^run$/i })).toHaveAttribute('href', '/workbench/run')
+  })
+
+  it('zerodha link is still present', () => {
+    renderInRouter()
+    expect(screen.getByRole('link', { name: /zerodha/i })).toHaveAttribute('href', '/zerodha-connect')
   })
 })
