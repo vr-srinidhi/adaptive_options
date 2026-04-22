@@ -45,7 +45,7 @@ describe('TopNav', () => {
   })
 
   it('renders secondary legacy links', () => {
-    renderInRouter()
+    renderInRouter('/backtest')
     expect(screen.getByRole('link', { name: /^backtest$/i })).toBeInTheDocument()
     expect(screen.getByRole('link', { name: /^paper$/i })).toBeInTheDocument()
     expect(screen.getByRole('link', { name: /^sessions$/i })).toBeInTheDocument()
@@ -54,7 +54,7 @@ describe('TopNav', () => {
 
   it('marks the active workbench section label', () => {
     renderInRouter('/workbench/strategies')
-    expect(screen.getByText('Strategies', { selector: 'span' })).toBeInTheDocument()
+    expect(screen.getByText('STRATEGIES', { selector: 'span' })).toBeInTheDocument()
   })
 
   it('home link points to /workbench', () => {

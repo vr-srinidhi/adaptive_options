@@ -41,6 +41,7 @@ function renderCatalog() {
       <Routes>
         <Route path="/workbench/strategies" element={<StrategyCatalog />} />
         <Route path="/workbench/run" element={<div>Run builder route</div>} />
+        <Route path="/paper" element={<div>Paper route</div>} />
       </Routes>
     </MemoryRouter>
   )
@@ -56,18 +57,32 @@ describe('StrategyCatalog', () => {
     renderCatalog()
     expect(await screen.findByText('Opening Range Spread')).toBeInTheDocument()
     expect(screen.getByText('Buy Call')).toBeInTheDocument()
-    expect(screen.getByText('Adaptive setups')).toBeInTheDocument()
-    expect(screen.getByText('Bullish setups')).toBeInTheDocument()
+    expect(screen.getByText('Paper Trade Replay')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /others/i })).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /bullish/i })).toBeInTheDocument()
   })
 
   it('filters the catalog by search text', async () => {
     renderCatalog()
     await screen.findByText('Opening Range Spread')
-    await userEvent.type(screen.getByPlaceholderText(/search by strategy/i), 'buy call')
+    await userEvent.type(screen.getByPlaceholderText(/search/i), 'buy call')
 
     await waitFor(() => {
       expect(screen.queryByText('Opening Range Spread')).not.toBeInTheDocument()
     })
     expect(screen.getByText('Buy Call')).toBeInTheDocument()
+  })
+
+  it('routes the paper replay entry to /paper', async () => {
+    renderCatalog()
+    const title = await screen.findByText('Paper Trade Replay')
+    const card = title.closest('article')
+    expect(card).not.toBeNull()
+    const useButton = card.querySelector('button')
+    expect(useButton).not.toBeNull()
+
+    await userEvent.click(useButton)
+
+    expect(await screen.findByText('Paper route')).toBeInTheDocument()
   })
 })
