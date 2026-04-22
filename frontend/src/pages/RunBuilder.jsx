@@ -302,7 +302,7 @@ function StrategyPicker({ strategies, strategyId, onChange, visual }) {
           aria-label="Strategy"
           value={strategyId}
           onChange={event => onChange(event.target.value)}
-          className="appearance-none bg-transparent pr-5 text-[11px] font-semibold outline-none"
+          className="appearance-none bg-transparent pr-5 text-[10px] font-semibold outline-none"
           style={{ color: '#60a5fa' }}
         >
           {strategies.map(item => (
@@ -312,7 +312,7 @@ function StrategyPicker({ strategies, strategyId, onChange, visual }) {
           ))}
         </select>
         <span
-          className="pointer-events-none absolute right-0 top-1/2 -translate-y-1/2 text-[10px]"
+          className="pointer-events-none absolute right-0 top-1/2 -translate-y-1/2 text-[9px]"
           style={{ color: '#60a5fa' }}
         >
           v
@@ -365,7 +365,7 @@ function InputShell({ children }) {
 function FieldControl({ field, value, onChange }) {
   if (field.type === 'boolean') {
     return (
-      <label className="flex items-center gap-3 text-[11px]" style={{ color: SURFACE.text }}>
+      <label className="flex items-center gap-3 text-[10px]" style={{ color: SURFACE.text }}>
         <input
           id={field.key}
           type="checkbox"
@@ -384,7 +384,7 @@ function FieldControl({ field, value, onChange }) {
           id={field.key}
           value={value ?? ''}
           onChange={event => onChange(event.target.value)}
-          className="w-full appearance-none bg-transparent pr-5 text-[11px] outline-none"
+          className="w-full appearance-none bg-transparent pr-5 text-[10px] outline-none"
           style={{ color: SURFACE.text }}
         >
           {(field.options || []).map(option => (
@@ -393,7 +393,7 @@ function FieldControl({ field, value, onChange }) {
             </option>
           ))}
         </select>
-        <span className="pointer-events-none absolute right-0 top-1/2 -translate-y-1/2 text-[10px]" style={{ color: SURFACE.muted }}>
+        <span className="pointer-events-none absolute right-0 top-1/2 -translate-y-1/2 text-[9px]" style={{ color: SURFACE.muted }}>
           v
         </span>
       </div>
@@ -408,7 +408,7 @@ function FieldControl({ field, value, onChange }) {
       max={field.max}
       value={value ?? ''}
       onChange={event => onChange(event.target.value)}
-      className="w-full bg-transparent text-[11px] outline-none"
+      className="w-full bg-transparent text-[10px] outline-none"
       style={{ color: SURFACE.text }}
     />
   )
@@ -417,12 +417,12 @@ function FieldControl({ field, value, onChange }) {
 function BuilderField({ label, field, value, onChange, displayValue, hint, className = '' }) {
   const control = field
     ? <FieldControl field={field} value={value} onChange={onChange} />
-    : <div className="text-[11px] leading-5" style={{ color: SURFACE.muted }}>{displayValue}</div>
+    : <div className="text-[10px] leading-5" style={{ color: SURFACE.muted }}>{displayValue}</div>
 
   return (
     <div className={className}>
       <label
-        className="block text-[10px] font-medium uppercase tracking-[0.09em] mb-1.5"
+      className="block text-[9px] font-medium uppercase tracking-[0.09em] mb-1.5"
         htmlFor={field?.key}
         style={{ color: SURFACE.muted }}
       >
@@ -430,7 +430,7 @@ function BuilderField({ label, field, value, onChange, displayValue, hint, class
       </label>
       <InputShell>{control}</InputShell>
       {hint ? (
-        <div className="mt-1 text-[10px]" style={{ color: SURFACE.muted }}>
+        <div className="mt-1 text-[9px]" style={{ color: SURFACE.muted }}>
           {hint}
         </div>
       ) : null}
@@ -441,7 +441,7 @@ function BuilderField({ label, field, value, onChange, displayValue, hint, class
 function StepCrumbs() {
   return (
     <div
-      className="flex items-center gap-2 px-1 pb-3 text-[11px]"
+      className="flex items-center gap-2 px-1 pb-3 text-[10px]"
       style={{ color: SURFACE.muted, borderBottom: `0.5px solid ${SURFACE.border}` }}
     >
       {RUN_STEPS.map((step, index) => {
@@ -465,7 +465,7 @@ function ReadinessRail({ preview, strategy }) {
   return (
     <aside className="space-y-4">
       <div className="rounded-[10px] p-5" style={{ background: SURFACE.card, border: `1px solid ${SURFACE.border}` }}>
-        <div className="mb-4 text-[10px] font-medium uppercase tracking-[0.1em]" style={{ color: SURFACE.muted }}>
+        <div className="mb-4 text-[10px] font-medium uppercase tracking-[0.08em]" style={{ color: SURFACE.muted }}>
           Data Readiness
         </div>
         <div className="space-y-4">
@@ -480,8 +480,8 @@ function ReadinessRail({ preview, strategy }) {
                   {tone.icon}
                 </span>
                 <div>
-                  <div className="text-[12px] font-semibold" style={{ color: SURFACE.text }}>{item.label}</div>
-                  <div className="mt-1 text-[11px] leading-5" style={{ color: SURFACE.muted }}>{item.detail}</div>
+                  <div className="text-[10px] font-semibold" style={{ color: SURFACE.text }}>{item.label}</div>
+                  <div className="mt-1 text-[9px] leading-5" style={{ color: SURFACE.muted }}>{item.detail}</div>
                 </div>
               </div>
             )
@@ -490,12 +490,12 @@ function ReadinessRail({ preview, strategy }) {
       </div>
 
       <div className="rounded-[10px] p-4" style={{ background: SURFACE.amberSoft, border: '1px solid rgba(245,158,11,0.24)' }}>
-        <div className="mb-2 text-[12px] font-semibold" style={{ color: SURFACE.amber }}>Assumption</div>
-        <div className="text-[11px] leading-5" style={{ color: SURFACE.muted }}>{preview.visual.assumption}</div>
+        <div className="mb-2 text-[10px] font-semibold" style={{ color: SURFACE.amber }}>Assumption</div>
+        <div className="text-[10px] leading-5" style={{ color: SURFACE.muted }}>{preview.visual.assumption}</div>
       </div>
 
       <div className="rounded-[10px] p-4" style={{ background: SURFACE.card, border: `1px solid ${SURFACE.border}` }}>
-        <div className="mb-3 text-[10px] font-medium uppercase tracking-[0.1em]" style={{ color: SURFACE.muted }}>
+        <div className="mb-3 text-[10px] font-medium uppercase tracking-[0.08em]" style={{ color: SURFACE.muted }}>
           {preview.visual.summaryTitle}
         </div>
         <div
@@ -504,7 +504,7 @@ function ReadinessRail({ preview, strategy }) {
         >
           <PayoffChart shape={preview.visual.shape} compact />
         </div>
-        <div className="mt-3 text-[11px] leading-5" style={{ color: SURFACE.muted }}>
+        <div className="mt-3 text-[9px] leading-5" style={{ color: SURFACE.muted }}>
           {preview.visual.summaryCopy}
         </div>
         <div className="mt-3 flex flex-wrap gap-2">
@@ -534,28 +534,28 @@ function SummaryCard({ canSubmit, submitting, runType, preview, onSubmit }) {
       className="rounded-[10px] p-4 flex flex-col gap-5"
       style={{ background: SURFACE.card, border: `1px solid ${SURFACE.border}`, minHeight: 100 }}
     >
-      <div className="text-[10px] font-medium uppercase tracking-[0.1em]" style={{ color: SURFACE.muted }}>
+      <div className="text-[10px] font-medium uppercase tracking-[0.08em]" style={{ color: SURFACE.muted }}>
         Risk / Reward
       </div>
 
       <div className="space-y-4">
         <div>
-          <div className="text-[11px]" style={{ color: SURFACE.muted }}>Max Profit</div>
-          <div className="mt-1 text-[1.05rem] leading-none font-bold" style={{ color: SURFACE.green }}>
+          <div className="text-[10px]" style={{ color: SURFACE.muted }}>Max Profit</div>
+          <div className="mt-1 text-[15px] leading-none font-bold" style={{ color: SURFACE.green }}>
             {preview.metrics.maxProfitValue}
           </div>
         </div>
 
         <div>
-          <div className="text-[11px]" style={{ color: SURFACE.muted }}>Max Loss</div>
-          <div className="mt-1 text-[1.05rem] leading-none font-bold" style={{ color: SURFACE.red }}>
+          <div className="text-[10px]" style={{ color: SURFACE.muted }}>Max Loss</div>
+          <div className="mt-1 text-[15px] leading-none font-bold" style={{ color: SURFACE.red }}>
             {preview.metrics.maxLossValue}
           </div>
         </div>
 
         <div>
-          <div className="text-[11px]" style={{ color: SURFACE.muted }}>Est. Margin</div>
-          <div className="mt-1 text-[13px] font-semibold" style={{ color: SURFACE.text }}>
+          <div className="text-[10px]" style={{ color: SURFACE.muted }}>Est. Margin</div>
+          <div className="mt-1 text-[11px] font-semibold" style={{ color: SURFACE.text }}>
             {preview.metrics.marginValue}
           </div>
         </div>
@@ -563,7 +563,7 @@ function SummaryCard({ canSubmit, submitting, runType, preview, onSubmit }) {
 
       <div className="mt-auto space-y-3">
         <div
-          className="rounded-md px-3 py-2 text-center text-[11px] font-semibold"
+          className="rounded-md px-3 py-2 text-center text-[10px] font-semibold"
           style={{
             background: preview.validated ? 'var(--surface-tertiary)' : SURFACE.amberSoft,
             border: preview.validated ? `1px solid ${SURFACE.border}` : '1px solid rgba(245,158,11,0.28)',
@@ -578,7 +578,7 @@ function SummaryCard({ canSubmit, submitting, runType, preview, onSubmit }) {
           onClick={onSubmit}
           disabled={!canSubmit || submitting}
           aria-label={accessibleLabel}
-          className="w-full rounded-md px-4 py-2.5 text-[12px] font-bold"
+          className="w-full rounded-md px-4 py-2.5 text-[11px] font-bold"
           style={{
             background: canSubmit ? '#2563eb' : 'var(--surface-tertiary)',
             color: canSubmit ? '#ffffff' : SURFACE.muted,
@@ -741,7 +741,7 @@ export default function RunBuilder() {
   }
 
   return (
-    <div className="mx-auto max-w-[1360px] px-4 pb-10 pt-4" style={{ fontSize: 12 }}>
+    <div className="mx-auto max-w-[1360px] px-4 pb-10 pt-4" style={{ fontSize: 11 }}>
       <StepCrumbs />
 
       <div className="mt-4 grid items-start gap-4 xl:grid-cols-[232px_minmax(0,1fr)]">
@@ -749,7 +749,7 @@ export default function RunBuilder() {
 
         <div className="space-y-3">
           <div className="flex flex-wrap items-center gap-3">
-            <h1 className="text-[1.15rem] font-bold leading-none" style={{ color: SURFACE.text }}>
+            <h1 className="text-[15px] font-bold leading-none" style={{ color: SURFACE.text }}>
               Run Builder
             </h1>
             <StrategyPicker
@@ -811,7 +811,7 @@ export default function RunBuilder() {
               {secondaryFields.length ? (
                 <>
                   <div className="my-4" style={{ borderTop: `0.5px solid ${SURFACE.border}` }} />
-                  <div className="mb-3 text-[11px] font-medium uppercase tracking-[0.1em]" style={{ color: SURFACE.muted }}>
+                  <div className="mb-3 text-[10px] font-medium uppercase tracking-[0.08em]" style={{ color: SURFACE.muted }}>
                     {guidedMode ? 'Additional Fields' : 'Advanced Controls'}
                   </div>
                   <div className="grid gap-3 lg:grid-cols-3">
@@ -831,7 +831,7 @@ export default function RunBuilder() {
               <div className="my-4" style={{ borderTop: `0.5px solid ${SURFACE.border}` }} />
 
               <div>
-                <div className="mb-3 text-[10px] font-medium uppercase tracking-[0.1em]" style={{ color: SURFACE.muted }}>
+                <div className="mb-3 text-[10px] font-medium uppercase tracking-[0.08em]" style={{ color: SURFACE.muted }}>
                   Legs
                 </div>
                 <div className="space-y-2">
@@ -845,24 +845,24 @@ export default function RunBuilder() {
                         style={{ background: SURFACE.bg, border: `1px solid ${SURFACE.border}` }}
                       >
                         <span
-                          className="rounded px-2 py-1 text-[11px] font-semibold uppercase tracking-[0.08em]"
+                          className="rounded px-2 py-1 text-[10px] font-semibold uppercase tracking-[0.08em]"
                           style={{ color: side.color, border: `1px solid ${side.border}`, background: side.background }}
                         >
                           {leg.side}
                         </span>
                         <span
-                          className="rounded px-2 py-1 text-[11px] font-semibold uppercase tracking-[0.08em]"
+                          className="rounded px-2 py-1 text-[10px] font-semibold uppercase tracking-[0.08em]"
                           style={{ color: option.color, border: `1px solid ${option.border}`, background: option.background }}
                         >
                           {leg.optionType}
                         </span>
-                        <span className="text-[12px] font-semibold" style={{ color: SURFACE.text }}>
+                        <span className="text-[11px] font-semibold" style={{ color: SURFACE.text }}>
                           Strike: {leg.strike}
                         </span>
-                        <span className="text-[11px]" style={{ color: SURFACE.muted }}>
+                        <span className="text-[10px]" style={{ color: SURFACE.muted }}>
                           Expiry: {leg.expiry}
                         </span>
-                        <span className="ml-auto text-[11px]" style={{ color: SURFACE.muted }}>
+                        <span className="ml-auto text-[10px]" style={{ color: SURFACE.muted }}>
                           Premium: {leg.premium}
                         </span>
                       </div>
@@ -881,18 +881,18 @@ export default function RunBuilder() {
 
             <div className="grid gap-3 xl:grid-cols-[minmax(0,1fr)_260px]">
               <div className="rounded-[10px] p-4" style={{ background: SURFACE.card, border: `1px solid ${SURFACE.border}` }}>
-                <div className="mb-3 text-[10px] font-medium uppercase tracking-[0.1em]" style={{ color: SURFACE.muted }}>
+                <div className="mb-3 text-[10px] font-medium uppercase tracking-[0.08em]" style={{ color: SURFACE.muted }}>
                   Payoff at Expiry
                 </div>
                 <div style={{ height: 208 }}>
                   <PayoffChart shape={preview.visual.shape} />
                 </div>
-                <div className="mt-2 flex items-center justify-between text-[11px]" style={{ color: SURFACE.muted }}>
+                <div className="mt-2 flex items-center justify-between text-[10px]" style={{ color: SURFACE.muted }}>
                   <span>← Bearish move</span>
                   <span style={{ color: SURFACE.green }}>Profit zone</span>
                   <span>Bullish move →</span>
                 </div>
-                <div className="mt-3 text-[11px] leading-5" style={{ color: SURFACE.muted }}>
+                <div className="mt-3 text-[10px] leading-5" style={{ color: SURFACE.muted }}>
                   {preview.visual.payoffHint}
                 </div>
               </div>
@@ -908,7 +908,7 @@ export default function RunBuilder() {
 
             {!guidedMode ? (
               <div className="rounded-[10px] p-5" style={{ background: SURFACE.card, border: `1px solid ${SURFACE.border}` }}>
-                <div className="mb-3 text-[11px] font-medium uppercase tracking-[0.1em]" style={{ color: SURFACE.muted }}>
+                <div className="mb-3 text-[10px] font-medium uppercase tracking-[0.08em]" style={{ color: SURFACE.muted }}>
                   Payload Preview
                 </div>
                 <pre

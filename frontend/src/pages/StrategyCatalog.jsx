@@ -81,7 +81,7 @@ function toTabKey(strategy) {
 function stepsCrumb() {
   return (
     <div
-      className="flex items-center gap-2 px-1 pb-3 text-[11px]"
+      className="flex items-center gap-2 px-1 pb-3 text-[10px]"
       style={{ color: PALETTE.muted, borderBottom: `0.5px solid ${PALETTE.border}` }}
     >
       {STEP_LABELS.map((step, index) => {
@@ -170,10 +170,10 @@ function StrategyCard({ strategy, onUse, dimmed = false }) {
       <MiniPayoff payoff={meta.payoff} />
 
       <div>
-        <div className="text-[13px] font-bold" style={{ color: PALETTE.text }}>
+        <div className="text-[12px] font-bold" style={{ color: PALETTE.text }}>
           {strategy.name}
         </div>
-        <div className="mt-1 text-[11px]" style={{ color: PALETTE.muted }}>
+        <div className="mt-1 text-[10px]" style={{ color: PALETTE.muted }}>
           {meta.view}
         </div>
       </div>
@@ -192,7 +192,7 @@ function StrategyCard({ strategy, onUse, dimmed = false }) {
         <button
           type="button"
           onClick={() => onUse(strategy.id)}
-          className="flex-1 rounded-md px-3 py-2 text-[12px] font-bold"
+          className="flex-1 rounded-md px-3 py-2 text-[11px] font-bold"
           style={{ background: PALETTE.blue, color: '#fff', cursor: 'pointer' }}
         >
           Use →
@@ -200,7 +200,7 @@ function StrategyCard({ strategy, onUse, dimmed = false }) {
         <button
           type="button"
           onClick={() => onUse(strategy.id)}
-          className="rounded-md px-3 py-2 text-[12px] font-semibold"
+          className="rounded-md px-3 py-2 text-[11px] font-semibold"
           style={{ background: 'transparent', color: PALETTE.muted, border: `1px solid ${PALETTE.border}`, cursor: 'pointer' }}
         >
           Info
@@ -292,26 +292,26 @@ export default function StrategyCatalog() {
   }
 
   return (
-    <div className="mx-auto max-w-[1360px] px-4 pb-10 pt-4" style={{ fontSize: 12 }}>
+    <div className="mx-auto max-w-[1360px] px-4 pb-10 pt-4" style={{ fontSize: 11 }}>
       {stepsCrumb()}
 
       <div className="pt-6">
         <div className="mb-4 flex flex-wrap items-end justify-between gap-4">
           <div>
-            <div className="text-[1.65rem] font-bold leading-none" style={{ color: PALETTE.text }}>
+            <div className="text-[15px] font-bold leading-none" style={{ color: PALETTE.text }}>
               Strategy Catalog
             </div>
-            <div className="mt-2 text-[12px]" style={{ color: PALETTE.muted }}>
+            <div className="mt-2 text-[10px]" style={{ color: PALETTE.muted }}>
               Select a strategy template to open the Run Builder
             </div>
           </div>
 
           <div className="flex flex-wrap items-center gap-2">
-            <div className="text-[11px]" style={{ color: '#64748b' }}>Recently used:</div>
+            <div className="text-[10px]" style={{ color: '#64748b' }}>Recently used:</div>
             {RECENTLY_USED.map(item => (
               <span
                 key={item}
-                className="rounded-md px-3 py-1 text-[11px] font-medium"
+                className="rounded-md px-3 py-1 text-[10px] font-medium"
                 style={{ background: PALETTE.card, border: `1px solid ${PALETTE.border}`, color: PALETTE.muted }}
               >
                 {item}
@@ -322,7 +322,7 @@ export default function StrategyCatalog() {
               value={query}
               onChange={event => setQuery(event.target.value)}
               placeholder="Search..."
-              className="rounded-md px-3 py-2 text-[12px] outline-none"
+              className="rounded-md px-3 py-2 text-[10px] outline-none"
               style={{ width: 190, background: PALETTE.card, border: `1px solid ${PALETTE.border}`, color: PALETTE.text }}
             />
           </div>
@@ -337,7 +337,7 @@ export default function StrategyCatalog() {
                 key={tab.key}
                 type="button"
                 onClick={() => setActiveTab(tab.key)}
-                className="mb-[-1px] inline-flex items-center gap-2 px-6 py-3 text-[12px] font-semibold"
+                className="mb-[-1px] inline-flex items-center gap-2 px-5 py-2.5 text-[10px] font-semibold"
                 style={{
                   color: active ? tab.badgeColor : '#64748b',
                   borderBottom: active ? `2px solid ${tab.badgeColor}` : '2px solid transparent',
@@ -347,7 +347,7 @@ export default function StrategyCatalog() {
               >
                 {tab.label}
                 <span
-                  className="rounded-full px-2 py-0.5 text-[10px]"
+                  className="rounded-full px-2 py-0.5 text-[9px]"
                   style={{
                     color: tab.badgeColor,
                     background: `${tab.badgeColor}18`,
@@ -368,7 +368,7 @@ export default function StrategyCatalog() {
 
         {previewStrategies.length ? (
           <section className="mt-6 border-t pt-4" style={{ borderColor: PALETTE.border }}>
-            <div className="mb-3 text-[10px] uppercase tracking-[0.08em]" style={{ color: '#64748b' }}>
+            <div className="mb-3 text-[10px] uppercase tracking-[0.08em]" style={{ color: '#64748b', fontWeight: 500 }}>
               {TAB_ORDER.find(tab => tab.key === previewTab)?.label} — {previewStrategies.length} strategies
             </div>
             <div className="grid gap-4 xl:grid-cols-4 lg:grid-cols-3 md:grid-cols-2">
@@ -379,7 +379,7 @@ export default function StrategyCatalog() {
           </section>
         ) : null}
 
-        <div className="pt-8 text-center text-[11px]" style={{ color: '#475569' }}>
+        <div className="pt-8 text-center text-[10px]" style={{ color: '#475569' }}>
           For educational and backtesting purposes only · Not financial advice
         </div>
       </div>
