@@ -6,10 +6,12 @@ This file gives Claude Code full context about the project so it can assist effe
 
 ## Project Summary
 
-**Adaptive Options** is a full-stack options backtesting + paper-trading platform for NSE index options (Nifty 50, Bank Nifty). It has two distinct modules:
+**Adaptive Options** is a full-stack options backtesting + paper-trading platform for NSE index options (Nifty 50, Bank Nifty). It has four modules:
 
 1. **Synthetic Backtest** — simulates Iron Condor, Bull Put Spread, and Bear Call Spread strategies using deterministic synthetic candle data with auto-regime detection (EMA/RSI/IV Rank).
 2. **Paper Trading ORB Replay** — replays a real historical trading day using **live Zerodha market data**. Evaluates the Opening Range Breakout (ORB) strategy through a G1–G7 gate stack, records every minute decision, and produces full audit logs + candle data.
+3. **Historical Backtest** — runs the ORB engine against a DB-backed warehouse of real 1-min candle data (spot + options). Batches span multiple trading days; results persist alongside paper trading sessions.
+4. **V2 Workbench** — strategy-agnostic shell (Strategy Catalog → Run Builder → Replay Analyzer → Runs Library) aligned to the product PRD. The ORB executor is the only live strategy; 12 further strategies are catalogued as `planned`/`research`.
 
 Scope: **backtesting and paper trading only** — no live order placement.
 
@@ -80,41 +82,85 @@ Adaptive_options/
 ├── backend/
 │   ├── Dockerfile
 │   ├── requirements.txt
+│   ├── alembic.ini           ← Alembic migration config
 │   └── app/
 │       ├── main.py              ← FastAPI app entry point
 │       ├── database.py          ← async engine, Base, get_db(), init_db()
+│       ├── core/
+│       │   ├── config.py        ← settings (env vars, CORS, secrets)
+│       │   ├── security.py      ← JWT helpers, password hashing
+│       │   └── rate_limit.py    ← slowapi limiter
+│       ├── dependencies/
+│       │   └── auth.py          ← get_current_active_user dependency
+│       ├── middleware/
+│       │   └── security_headers.py ← HSTS, CSP, X-Frame-Options
+│       ├── migrations/
+│       │   └── versions/        ← Alembic migration scripts
 │       ├── models/
 │       │   ├── session.py       ← BacktestSession SQLAlchemy model
-│       │   └── paper_trade.py   ← 6 paper trading ORM models
+│       │   ├── paper_trade.py   ← 6 paper trading ORM models
+│       │   ├── historical.py    ← TradingDay, SpotCandle, VixCandle, FuturesCandle, OptionsCandle, SessionBatch
+│       │   ├── user.py          ← User model
+│       │   ├── broker_token.py  ← encrypted Zerodha token storage
+│       │   └── audit_log.py     ← security audit events
 │       ├── routers/
 │       │   ├── backtest.py      ← synthetic backtest endpoints
+│       │   ├── backtests.py     ← historical batch CRUD (/api/backtests/*)
 │       │   ├── paper_trading.py ← paper trading endpoints
-│       │   └── auth.py          ← Zerodha OAuth flow
+│       │   ├── historical.py    ← data ingestion + trading-days catalogue (/api/historical/*)
+│       │   ├── workbench.py     ← v2 workbench endpoints (/api/v2/*)
+│       │   ├── auth.py          ← Zerodha OAuth flow
+│       │   └── users.py         ← user register/login/refresh/logout
 │       └── services/
-│           ├── simulator.py     ← candle gen, EMA, RSI, option pricing, day runner
-│           ├── strategy.py      ← regime detection, leg builder
-│           ├── position_sizer.py ← 2% capital risk sizing
-│           ├── paper_engine.py  ← ORB replay orchestrator
-│           ├── entry_gates.py   ← G1–G7 gate stack
-│           ├── exit_engine.py   ← MTM exit conditions
-│           ├── opening_range.py ← OR computation + candidate spread generators
-│           ├── option_resolver.py ← Zerodha instrument token lookup
-│           ├── zerodha_client.py ← Zerodha API wrappers
-│           └── calendar.py      ← NSE trading calendar helpers
+│           ├── simulator.py          ← candle gen, EMA, RSI, option pricing, day runner
+│           ├── strategy.py           ← regime detection, leg builder
+│           ├── strategy_config.py    ← central ORB config, build_strategy_snapshot(), latest_weekday()
+│           ├── position_sizer.py     ← 2% capital risk sizing
+│           ├── paper_engine.py       ← ORB replay orchestrator (run_paper_engine / run_paper_engine_core)
+│           ├── entry_gates.py        ← G1–G7 gate stack
+│           ├── exit_engine.py        ← MTM exit conditions
+│           ├── opening_range.py      ← OR computation + candidate spread generators
+│           ├── spread_selector.py    ← ranked candidate selection (Phase 2)
+│           ├── option_resolver.py    ← Zerodha instrument token lookup
+│           ├── zerodha_client.py     ← Zerodha API wrappers
+│           ├── calendar.py           ← NSE trading calendar helpers
+│           ├── batch_runner.py       ← historical batch executor (background task)
+│           ├── historical_ingestion.py  ← CSV → DB ingestion
+│           ├── historical_market_data.py ← load warehouse data for engine
+│           ├── workbench_catalog.py  ← strategy catalog (13 strategies with visual_hints)
+│           ├── workbench_views.py    ← serializers: replay_payload, paper_session_library_item, etc.
+│           ├── token_store.py        ← broker token encrypt/decrypt
+│           └── audit.py              ← audit log helpers
 └── frontend/
     ├── Dockerfile
     ├── nginx.conf               ← SPA fallback + /api proxy
     └── src/
-        ├── App.jsx              ← router + layout
-        ├── api/index.js         ← axios wrappers
-        ├── components/          ← TopNav, MetricCard, RegimeBadge, PnlChart
+        ├── App.jsx              ← router + layout (default / → /workbench)
+        ├── api/index.js         ← axios wrappers for all endpoints incl. /v2
+        ├── components/          ← TopNav, MetricCard, RegimeBadge, PnlChart, BrandLogo, ProtectedRoute
+        ├── contexts/
+        │   └── AuthContext.jsx  ← JWT auth context
+        ├── utils/
+        │   └── workbench.js     ← fmtINR, fmtDateTime, runStatusTone, strategyStatusTone
         └── pages/
-            ├── Backtest.jsx     ← Synthetic backtest form
-            ├── Dashboard.jsx    ← Backtest results dashboard
-            ├── TradeBook.jsx    ← Per-day backtest drill-down
-            ├── PaperTrading.jsx ← Paper trading session launcher
-            ├── SessionMonitor.jsx ← Session list
-            └── PaperTradeBook.jsx ← Session detail: audit log, candle data, CSV/PDF
+            ├── Login.jsx             ← email/password login
+            ├── ZerodhaConnect.jsx    ← Zerodha OAuth connect
+            ├── WorkspaceHome.jsx     ← Workbench home: recent runs, data health, quick start
+            ├── StrategyCatalog.jsx   ← Browse strategy cards (Bullish/Bearish/Neutral/Others)
+            ├── RunBuilder.jsx        ← Configure + launch a run (guided + advanced mode)
+            ├── ReplayDesk.jsx        ← Paper session list + replay entry point
+            ├── ReplayAnalyzer.jsx    ← Per-session replay: charts, decision stream, legs
+            ├── RunsLibrary.jsx       ← Saved runs list with compare + history
+            ├── WorkbenchHistoryDetail.jsx ← Batch or session history detail
+            ├── Backtest.jsx          ← (legacy) Synthetic backtest form
+            ├── Dashboard.jsx         ← (legacy) Backtest results dashboard
+            ├── TradeBook.jsx         ← (legacy) Per-day backtest drill-down
+            ├── PaperTrading.jsx      ← (legacy) Paper trading session launcher
+            ├── SessionMonitor.jsx    ← (legacy) Session list
+            ├── PaperTradeBook.jsx    ← (legacy) Session detail: audit log, candle data, CSV/PDF
+            ├── Backtests.jsx         ← Historical batch list + create form
+            ├── BacktestBatchDetail.jsx ← Batch progress + session drill-down
+            └── HistoricalSessionDetail.jsx ← Historical session detail
 ```
 
 ---
@@ -153,7 +199,7 @@ Each minute after OR window closes, `entry_gates.py::evaluate_gates()` runs in s
 | G6 | Max loss ≤ 2% of capital (approved_lots ≥ 1) |
 | G7 | Max possible gain ≥ session target (0.5% of capital) |
 
-Candidate spreads: 5 strike pairs per direction tried in ATM-first order (offsets 0, ±1, ±2). First pair passing G5–G7 wins.
+Candidate spreads: 5 strike pairs per direction tried in ATM-first order (offsets 0, ±1, ±2). First pair passing G5–G7 wins (Phase 2: ranked by `spread_selector.py`).
 
 ### ORB Paper Trading — Exit Conditions (exit_engine.py)
 
@@ -161,7 +207,7 @@ Candidate spreads: 5 strike pairs per direction tried in ATM-first order (offset
 |-----------|---------|
 | `EXIT_TARGET` | total MTM ≥ session target (0.5% capital) |
 | `EXIT_STOP` | total MTM ≤ −max_loss (spread fully lost) |
-| `EXIT_TIME` | 15:15 or end of candle data reached |
+| `EXIT_TIME` | 15:20 (strategy_config `square_off_time`) or end of candle data |
 
 ### ORB Paper Trading — Charges
 
@@ -185,6 +231,22 @@ The minimum is always 1 lot. Never remove this floor.
 - Index 15 = 09:30 (OR complete; first entry evaluation minute)
 - Index 360 = 15:15 (EOD trigger)
 - Index 374 = 15:29 (last candle)
+
+### Workbench Strategy Catalog
+
+`workbench_catalog.py` is the single source of truth for strategy metadata. Each entry contains:
+- `id`, `name`, `bias`, `status` (`available` | `planned` | `research`)
+- `executor` — which backend engine handles it (only `"orb_v1"` is live)
+- `modes` — `paper_replay` and/or `historical_backtest`
+- `params_schema` — field definitions consumed by the Run Builder form
+- `defaults` — live-computed via `_current_replay_defaults()` using `latest_weekday()`
+- `visual_hints` — payoff shape, constraint fields, leg descriptions, metric ratios consumed by `RunBuilder.jsx` via `normalizeVisual()`
+
+`supported_strategy_ids()` returns only `status == "available"` entries. The `create_run` endpoint rejects execution of non-available strategies.
+
+### build_strategy_snapshot
+
+`strategy_config.py::build_strategy_snapshot(instrument, capital, *, strategy_id, strategy_name, run_type, input_config)` is the canonical way to freeze strategy config at run creation. Both `backtests.py` and `workbench.py` must use it — do not add a third local copy.
 
 ---
 
@@ -214,6 +276,45 @@ All under `/api`:
 | GET | `/paper/session/{id}/trade/marks` | Per-minute MTM array |
 | GET | `/paper/session/{id}/candles` | Raw OHLCV candle series (SPOT + options) |
 
+### Historical Backtest
+
+| Method | Path | Purpose |
+|--------|------|---------|
+| POST | `/backtests/batches` | Create + optionally launch a batch |
+| GET | `/backtests/batches` | List all batches |
+| GET | `/backtests/batches/{id}` | Batch detail + progress counters |
+| POST | `/backtests/batches/{id}/run` | (Re-)trigger batch execution |
+| DELETE | `/backtests/batches/{id}` | Cancel / delete batch |
+| GET | `/backtests/batches/{id}/sessions` | Sessions belonging to a batch |
+| GET | `/backtests/sessions/{id}` | Historical session detail |
+| GET | `/backtests/sessions/{id}/decisions` | Minute audit log (paginated) |
+| GET | `/backtests/sessions/{id}/trade` | Trade header + legs |
+| GET | `/backtests/sessions/{id}/trade/marks` | Per-minute MTM |
+
+### Historical Data Ingestion
+
+| Method | Path | Purpose |
+|--------|------|---------|
+| POST | `/historical/ingest/day/{date}` | Ingest one day from CSV files |
+| POST | `/historical/ingest/bulk` | Queue bulk ingestion (background) |
+| POST | `/historical/catalogue/sync` | Scan disk → populate trading_days rows |
+| GET | `/historical/trading-days` | List trading_days catalogue |
+
+### V2 Workbench
+
+All under `/api/v2`. Strategy catalog endpoints are intentionally public (no auth); all run/replay endpoints require Bearer token.
+
+| Method | Path | Purpose |
+|--------|------|---------|
+| GET | `/v2/workspace/summary` | Home metrics, recent runs, data readiness, featured strategies |
+| GET | `/v2/strategies` | Strategy catalog (public) |
+| GET | `/v2/strategies/{id}` | Strategy detail with visual_hints and defaults (public) |
+| GET | `/v2/runs` | Unified run list: paper_session + historical_batch (`kind`, `limit`, `offset`) |
+| POST | `/v2/runs` | Create and execute a run (`run_type`, `strategy_id`, `config`) |
+| GET | `/v2/runs/{kind}/{id}` | Run detail; `kind` ∈ `paper_session`, `historical_batch`, `historical_session` |
+| GET | `/v2/runs/{kind}/{id}/replay` | Full replay payload: session, trade, decisions, marks, candle_series, explainability |
+| GET | `/v2/runs/compare` | Compare up to 4 runs by comma-separated `refs` (`kind:uuid,...`) |
+
 ### Zerodha Auth
 
 | Method | Path | Purpose |
@@ -221,11 +322,21 @@ All under `/api`:
 | GET | `/auth/zerodha/login-url` | Returns Zerodha OAuth URL |
 | POST | `/auth/zerodha/session` | Exchanges request_token → access_token |
 
+### User Auth
+
+| Method | Path | Purpose |
+|--------|------|---------|
+| POST | `/users/register` | Register email + password |
+| POST | `/users/login` | Returns access_token + sets HttpOnly refresh cookie |
+| POST | `/users/refresh` | Exchange refresh cookie for new access_token |
+| POST | `/users/logout` | Clears refresh cookie |
+| GET | `/users/me` | Profile (requires Bearer token) |
+
 ---
 
 ## Database
 
-Schema is auto-created at startup via `init_db()` (SQLAlchemy `create_all`). No Alembic migrations.
+Schema is auto-created at startup via `init_db()` (SQLAlchemy `create_all`). Alembic migrations in `app/migrations/versions/` handle additive changes.
 
 ### Synthetic backtest
 
@@ -237,16 +348,50 @@ JSONB columns: `legs` (option leg objects), `min_data` (`{time, spot, pnl}` per 
 
 | Table | Description |
 |-------|-------------|
-| `paper_sessions` | One row per replay run |
+| `paper_sessions` | One row per replay run (`session_type`: `paper_replay` or `historical_backtest`) |
 | `strategy_minute_decisions` | One row per market minute — full G1–G7 audit ledger |
 | `paper_trade_headers` | One row per trade opened (entry/exit prices, P&L, bias) |
 | `paper_trade_legs` | Long + short option legs with entry/exit prices |
 | `paper_trade_minute_marks` | Per-minute MTM while trade is open |
 | `paper_candle_series` | Raw 1-min OHLCV candles: SPOT + weekly/monthly option legs |
 
+### Historical Data Warehouse (6 tables)
+
+| Table | Description |
+|-------|-------------|
+| `trading_days` | One row per trading date — availability flags, ingestion status, `backtest_ready` |
+| `spot_candles` | 1-min OHLCV for NIFTY spot |
+| `vix_candles` | 1-min OHLCV for India VIX |
+| `futures_candles` | 1-min OHLCV+OI for NIFTY futures |
+| `options_candles` | 1-min OHLCV+ltp+OI for NIFTY options (~67 M rows); lookup index on `(trade_date, expiry_date, option_type, strike, timestamp)` |
+| `session_batches` | Groups multiple historical backtest sessions into one batch run |
+
 ---
 
 ## Frontend Routes
+
+### V2 Workbench (primary navigation — default entry point)
+
+| Path | Component | Screen |
+|------|-----------|--------|
+| `/` | → `/workbench` | Redirect |
+| `/workbench` | `WorkspaceHome.jsx` | Home: recent runs, data readiness, quick start |
+| `/workbench/strategies` | `StrategyCatalog.jsx` | Browse strategy cards by bucket |
+| `/workbench/run` | `RunBuilder.jsx` | Configure + launch a run |
+| `/workbench/replay` | `ReplayDesk.jsx` | Paper session list + replay entry |
+| `/workbench/replay/:kind/:id` | `ReplayAnalyzer.jsx` | Per-session: charts, decisions, legs |
+| `/workbench/history` | `RunsLibrary.jsx` | All saved runs with filters |
+| `/workbench/history/:kind/:id` | `WorkbenchHistoryDetail.jsx` | Batch or session detail |
+
+### Historical Backtest
+
+| Path | Component | Screen |
+|------|-----------|--------|
+| `/backtests` | `Backtests.jsx` | Batch list + create form |
+| `/backtests/:batchId` | `BacktestBatchDetail.jsx` | Batch progress + session list |
+| `/backtests/sessions/:sessionId` | `HistoricalSessionDetail.jsx` | Session detail |
+
+### Legacy (still accessible via TopNav LEGACY section)
 
 | Path | Component | Screen |
 |------|-----------|--------|
@@ -275,7 +420,7 @@ Email/password auth with JWT.
 | Logout | POST `/api/users/logout` | clears cookie |
 | Profile | GET `/api/users/me` | requires Bearer token |
 
-All business endpoints (`/backtest/*`, `/paper/*`, `/auth/zerodha/*`) require `Authorization: Bearer <access_token>`.
+All business endpoints (`/backtest/*`, `/paper/*`, `/auth/zerodha/*`, `/backtests/*`, `/api/v2/runs*`, `/api/v2/workspace/*`) require `Authorization: Bearer <access_token>`. The strategy catalog endpoints (`/api/v2/strategies`) are intentionally public.
 
 ### Broker Token Storage
 
@@ -283,7 +428,7 @@ Zerodha access tokens are stored **server-side** — never sent to or stored in 
 
 1. Authenticate with app (login)
 2. POST `/api/auth/zerodha/session` with `request_token` → backend encrypts + stores in `broker_tokens` table
-3. POST `/api/paper/session/run` — no `access_token` in body; backend retrieves from DB for the current user
+3. POST `/api/paper/session/run` or POST `/api/v2/runs` — no `access_token` in body; backend retrieves from DB for the current user (or exchanges a fresh `request_token` inline if provided in the workbench run config)
 
 Encryption uses Fernet (symmetric). Key priority: `BROKER_TOKEN_ENCRYPTION_KEY` env var → fallback derived from `SECRET_KEY` (dev only).
 
@@ -323,6 +468,9 @@ The runtime `create_all` + idempotent `ALTER TABLE IF NOT EXISTS` in `init_db()`
 - `MAX_RISK_PCT = 0.02` and `TARGET_PCT = 0.005` in `entry_gates.py` — these define the core ORB risk/reward parameters
 - `OR_WINDOW_MINUTES = 15` in `opening_range.py` — opening range is always 09:15–09:29
 - `N_CANDIDATE_SPREADS = 5` in `opening_range.py` — number of strike pairs tried per direction
+- `build_strategy_snapshot()` signature in `strategy_config.py` — both `backtests.py` and `workbench.py` depend on it; the snapshot schema is stored in DB
+- `_STRATEGIES` list in `workbench_catalog.py` — strategy IDs are stored in `strategy_config_snapshot` JSONB in the DB; renaming an `id` will break `resolve_strategy_identity()` lookups on old rows
+- `visual_hints` keys in `workbench_catalog.py` — `RunBuilder.jsx::normalizeVisual()` maps snake_case keys directly; renaming requires updating both files
 
 ---
 
@@ -345,6 +493,41 @@ docker exec -it adaptive_options_db psql -U postgres -d adaptive_options
 SELECT count(*) FROM backtest_sessions;
 SELECT count(*) FROM paper_sessions;
 SELECT session_date, status, decision_count FROM paper_sessions ORDER BY created_at DESC;
+SELECT trade_date, backtest_ready, ingestion_status FROM trading_days ORDER BY trade_date DESC LIMIT 10;
+SELECT count(*) FROM options_candles;
+```
+
+### Ingest historical data
+```bash
+# Sync catalogue (scan data directory)
+curl -X POST http://localhost:8000/api/historical/catalogue/sync \
+  -H "Authorization: Bearer <token>"
+
+# Ingest a single day
+curl -X POST http://localhost:8000/api/historical/ingest/day/2026-04-07 \
+  -H "Authorization: Bearer <token>"
+
+# Bulk ingest all available dates (background)
+curl -X POST http://localhost:8000/api/historical/ingest/bulk \
+  -H "Authorization: Bearer <token>"
+```
+
+### Run a historical backtest batch via API
+```bash
+curl -s -X POST http://localhost:8000/api/backtests/batches \
+  -H "Authorization: Bearer <token>" \
+  -H "Content-Type: application/json" \
+  -d '{"name":"NIFTY Apr replay","instrument":"NIFTY","capital":2500000,"start_date":"2026-04-01","end_date":"2026-04-15","autorun":true}' \
+  | python3 -m json.tool
+```
+
+### Run a workbench paper replay via v2 API
+```bash
+curl -s -X POST http://localhost:8000/api/v2/runs \
+  -H "Authorization: Bearer <token>" \
+  -H "Content-Type: application/json" \
+  -d '{"run_type":"paper_replay","strategy_id":"orb_intraday_spread","config":{"instrument":"NIFTY","date":"2026-04-07","capital":2500000}}' \
+  | python3 -m json.tool
 ```
 
 ### Reset paper trading data
@@ -373,7 +556,7 @@ curl -s -X POST http://localhost:8000/api/auth/zerodha/session \
 
 Zerodha access tokens expire at 6 AM IST daily and must be refreshed each day.
 
-### Run a paper trading session via API
+### Run a paper trading session via legacy API
 ```bash
 curl -s -X POST http://localhost:8000/api/paper/session/run \
   -H "Content-Type: application/json" \
@@ -398,3 +581,6 @@ Do not implement the following in this repo without updating the PRD:
 - Real-time WebSocket market data
 - Multi-user auth
 - Email/push notifications
+- Animated minute-by-minute replay player (PRD Phase 1 gap — next workbench milestone)
+- Adjustment Lab (PRD Phase 2)
+- Expiry-cycle backtests (PRD Phase 3)

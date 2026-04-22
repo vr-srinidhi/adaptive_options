@@ -1,9 +1,11 @@
-# Adaptive Options — Backtesting + Paper Trading Platform
+# Adaptive Options — Options Strategy Platform
 
-A production-quality options strategy platform for Nifty 50 and Bank Nifty with two independent modules:
+A production-quality options strategy platform for Nifty 50 and Bank Nifty with four independent modules:
 
-1. **Synthetic Backtest** — simulates Iron Condor, Bull Put Spread, and Bear Call Spread strategies using deterministic synthetic candle data with auto-regime detection (EMA/RSI/IV Rank).
-2. **Paper Trading ORB Replay** — replays any historical trading day using **live Zerodha market data**, evaluates an Opening Range Breakout strategy through a seven-gate decision engine, and produces full per-minute audit logs, trade detail, and raw candle exports.
+1. **V2 Workbench** — strategy-agnostic shell for running, replaying, and comparing any supported ORB strategy. Primary UI entry point.
+2. **Synthetic Backtest** — simulates Iron Condor, Bull Put Spread, and Bear Call Spread strategies using deterministic synthetic candle data with auto-regime detection (EMA/RSI/IV Rank).
+3. **Historical Backtest** — batch-runs any registered strategy over real Zerodha candle data stored in a local warehouse. Supports multi-day runs with full per-session audit trails.
+4. **Paper Trading ORB Replay** — replays any historical trading day using **live Zerodha market data**, evaluates an Opening Range Breakout strategy through a seven-gate decision engine, and produces full per-minute audit logs, trade detail, and raw candle exports.
 
 > **For educational and research purposes only. Not financial advice. No live order placement.**
 
@@ -13,6 +15,8 @@ A production-quality options strategy platform for Nifty 50 and Bank Nifty with 
 
 - [Quick Start](#quick-start)
 - [Architecture Overview](#architecture-overview)
+- [V2 Workbench Module](#v2-workbench-module)
+- [Historical Backtest Module](#historical-backtest-module)
 - [Paper Trading Module](#paper-trading-module)
 - [Synthetic Backtest Module](#synthetic-backtest-module)
 - [Backend Deep Dive](#backend-deep-dive)
@@ -38,7 +42,7 @@ docker compose up -d
 
 | Service   | URL                         | Description                      |
 |-----------|-----------------------------|----------------------------------|
-| Frontend  | http://localhost:3000       | React dashboard (6 screens)      |
+| Frontend  | http://localhost:3000       | React SPA — defaults to Workbench |
 | Backend   | http://localhost:8000       | FastAPI REST API                 |
 | API Docs  | http://localhost:8000/docs  | Auto-generated OpenAPI (Swagger) |
 | Database  | localhost:5432              | PostgreSQL 15                    |
@@ -68,12 +72,81 @@ docker compose up -d
 │                          └──────────────────┘                  │
 └─────────────────────────────────────────────────────────────────┘
                                     │
-                      (paper trading only)
+                      (paper trading + historical only)
                                     │ HTTPS
                                     ▼
                           Zerodha Kite API
                           Historical candle data
 ```
+
+---
+
+## V2 Workbench Module
+
+The workbench is a unified, strategy-agnostic shell that guides users through a four-step workflow for any supported ORB strategy.
+
+```
+Strategy Catalog → Run Builder → [Run] → Replay Analyzer
+                                              │
+                                         Runs Library
+```
+
+### Workflow
+
+1. **Strategy Catalog** (`/workbench`) — browse all registered strategies (available, planned, research). Cards show badge, assumption, payoff hint, and leg diagram.
+2. **Run Builder** (`/workbench/strategy/:id`) — configure instrument, capital, and date range. Validates historical data availability before enabling run submission.
+3. **Replay Analyzer** (`/workbench/replay/:kind/:id`) — per-session charts, minute audit log, trade detail, and explainability block.
+4. **Runs Library** (`/workbench/runs`) — all saved runs across all strategies and run types, with filtering and pagination.
+
+### Strategy States
+
+| State | Description |
+|-------|-------------|
+| `available` | Fully implemented; can run now |
+| `planned` | On roadmap; UI shows "coming soon" |
+| `research` | Under investigation; shown in catalog but not runnable |
+
+Currently available: **orb_intraday_spread** (Opening Range Spread).
+
+### Run Types
+
+| Kind | Source | Notes |
+|------|--------|-------|
+| `paper_session` | Live Zerodha API → single-day replay | Requires Zerodha access token |
+| `historical_batch` | Warehoused candle data → multi-day batch | Requires pre-ingested data |
+| `historical_session` | Single session within a batch | Navigation only |
+
+---
+
+## Historical Backtest Module
+
+Batch-runs a registered strategy over multiple days of real candle data stored in a local warehouse.
+
+### Data Warehouse Ingestion
+
+```bash
+# Ingest spot + options candles for a date range
+POST /api/historical/ingest
+Body: {"instrument": "NIFTY", "start_date": "2026-01-01", "end_date": "2026-03-31"}
+
+# Check warehouse coverage
+GET /api/historical/coverage?instrument=NIFTY
+```
+
+### Batch Run
+
+```bash
+POST /api/backtests/batch
+Body: {
+  "instrument": "NIFTY",
+  "strategy_id": "orb_intraday_spread",
+  "start_date": "2026-01-01",
+  "end_date": "2026-03-31",
+  "capital": 2500000
+}
+```
+
+The batch runner iterates over each trading day in the warehouse, runs the full gate stack + exit engine, and persists per-session results. Results are accessible via the Runs Library and Workbench History Detail pages.
 
 ---
 
@@ -141,7 +214,7 @@ Bear Put:  [(base, base-50), (base+50, base), (base-50, base-100), ...]
 |-----------|---------|
 | `EXIT_TARGET` | Total MTM ≥ 0.5% of capital |
 | `EXIT_STOP` | Total MTM ≤ −max_loss |
-| `EXIT_TIME` | Candle time reaches 15:15 |
+| `EXIT_TIME` | Candle time reaches 15:20 |
 
 ### Round-trip Charges
 
@@ -169,15 +242,14 @@ Body: {"request_token": "<token>"}
 Returns: {"access_token": "..."}
 ```
 
-### Session Detail Page (`/paper/session/:id`)
+### Session Detail Page (`/workbench/replay/paper_session/:id`)
 
 - Session summary (date, capital, status, minutes audited)
 - **Trade detail** — contract breakdown table: BUY/SELL badge, full contract name (`NIFTY 22900 CE exp 13 Apr 2026`), lots, lot size, total qty, entry/exit price
 - MTM progression chart (while trade was open)
 - **Raw candle data** — scrollable OHLCV tables for SPOT + weekly and monthly option legs
 - Minute audit log with action filter tabs; ENTER rows show inline contract details
-- **↓ CSV** — full dataset including candle series sections
-- **↓ PDF** — browser print with print-optimised stylesheet
+- **Explainability block** — gate-by-gate pass/fail trace for the entry candle
 
 ---
 
@@ -215,27 +287,39 @@ Simulates NSE options strategies over a date range using deterministic synthetic
 backend/
 ├── Dockerfile
 ├── requirements.txt
+├── alembic.ini
 └── app/
-    ├── main.py              # FastAPI app, CORS, startup hook
+    ├── main.py              # FastAPI app, CORS, rate limiting, startup hook
     ├── database.py          # Async engine, session factory, Base, init_db()
+    ├── migrations/          # Alembic migration versions
     ├── models/
     │   ├── session.py       # BacktestSession model
-    │   └── paper_trade.py   # 6 paper trading ORM models
+    │   ├── paper_trade.py   # 6 paper trading ORM models
+    │   ├── historical.py    # Historical warehouse + batch ORM models
+    │   ├── workbench.py     # WorkbenchRun model
+    │   └── users.py         # User + BrokerToken models
     ├── routers/
     │   ├── backtest.py      # Synthetic backtest endpoints
+    │   ├── backtests.py     # Historical batch backtest endpoints
     │   ├── paper_trading.py # Paper trading endpoints
-    │   └── auth.py          # Zerodha OAuth
+    │   ├── auth.py          # Zerodha OAuth
+    │   ├── historical.py    # Historical data ingestion + coverage
+    │   ├── users.py         # User register/login/refresh/logout
+    │   └── workbench.py     # V2 workbench endpoints (/api/v2/*)
     └── services/
-        ├── simulator.py       # Candle gen, indicators, option pricing, day runner
-        ├── strategy.py        # Regime detection, leg builder
-        ├── position_sizer.py  # 2% capital risk sizing
-        ├── paper_engine.py    # ORB replay orchestrator
-        ├── entry_gates.py     # G1–G7 gate evaluator
-        ├── exit_engine.py     # MTM exit conditions
-        ├── opening_range.py   # OR computation + candidate spread generators
-        ├── option_resolver.py # Zerodha instrument token lookup
-        ├── zerodha_client.py  # Zerodha API wrappers
-        └── calendar.py        # NSE trading calendar helpers
+        ├── simulator.py         # Candle gen, indicators, option pricing, day runner
+        ├── strategy.py          # Regime detection, leg builder
+        ├── strategy_config.py   # build_strategy_snapshot(), workbench constants, date helpers
+        ├── position_sizer.py    # 2% capital risk sizing
+        ├── paper_engine.py      # ORB replay orchestrator
+        ├── entry_gates.py       # G1–G7 gate evaluator
+        ├── exit_engine.py       # MTM exit conditions
+        ├── opening_range.py     # OR computation + candidate spread generators
+        ├── option_resolver.py   # Zerodha instrument token lookup
+        ├── zerodha_client.py    # Zerodha API wrappers
+        ├── calendar.py          # NSE trading calendar helpers
+        ├── workbench_catalog.py # Strategy catalog + visual_hints
+        └── workbench_views.py   # Serializers: replay_payload, library items, resolve_strategy_identity
 ```
 
 ### Tech Stack — Backend
@@ -248,6 +332,9 @@ backend/
 | DB driver | asyncpg | 0.29 |
 | Broker API | kiteconnect | 5.x |
 | Validation | Pydantic v2 | 2.7 |
+| Rate limiting | slowapi | 0.1.9 |
+| Auth | python-jose (JWT) + cryptography (Fernet) | — |
+| Migrations | Alembic | 1.13 |
 
 ---
 
@@ -255,14 +342,43 @@ backend/
 
 ### Screen Map
 
+**V2 Workbench (primary)**
+
 ```
-/backtest       Run synthetic backtest (instrument, capital, date range)
-/dashboard      Metrics + cumulative P&L chart + results table
-/tradebook/:id  Synthetic backtest day drill-down (legs, 1-min chart)
-/paper          ORB replay launcher (instrument, capital, date, access token)
-/paper/sessions Session list with status and decision counts
+/workbench                      Strategy Catalog — browse all strategies
+/workbench/strategy/:id         Run Builder — configure + submit a run
+/workbench/replay/:kind/:id     Replay Analyzer — session detail, charts, audit log
+/workbench/runs                 Runs Library — all saved runs with pagination
+/workbench/history/:batchId     Workbench History Detail — batch summary + sessions
+```
+
+**Historical Backtest**
+
+```
+/historical                     Historical batch launcher (instrument, dates, strategy)
+/historical/batch/:id           Batch detail with per-session breakdown
+```
+
+**Legacy (Synthetic Backtest + Paper Trading)**
+
+```
+/backtest           Run synthetic backtest (instrument, capital, date range)
+/dashboard          Metrics + cumulative P&L chart + results table
+/tradebook/:id      Synthetic backtest day drill-down (legs, 1-min chart)
+/paper              ORB replay launcher (instrument, capital, date, access token)
+/paper/sessions     Session list with status and decision counts
 /paper/session/:id  Full session detail: audit log, trade, candles, CSV/PDF
 ```
+
+### Key Frontend Services
+
+| File | Purpose |
+|------|---------|
+| `src/api/index.js` | All API calls — axios wrappers for every endpoint group |
+| `src/pages/RunBuilder.jsx` | Run config form with `normalizeVisual()`, `countWeekdaysInRange()` |
+| `src/pages/ReplayAnalyzer.jsx` | Gate-by-gate audit, MTM chart, explainability block |
+| `src/components/TopNav.jsx` | Primary workbench nav + legacy links (hidden on workbench) |
+| `src/index.css` | `wb-*` CSS token classes (wb-card, wb-kicker, wb-grid, wb-chip, etc.) |
 
 ### Tech Stack — Frontend
 
@@ -280,7 +396,7 @@ backend/
 
 ## Database Schema
 
-Schema auto-created at startup via `create_all`. No Alembic migrations.
+Schema auto-created at startup via `create_all` + Alembic migrations for schema changes.
 
 ### `backtest_sessions`
 
@@ -306,18 +422,68 @@ Schema auto-created at startup via `create_all`. No Alembic migrations.
 | `paper_trade_minute_marks` | Per-minute MTM: spread value, mtm_per_lot, total_mtm, distance_to_target/stop |
 | `paper_candle_series` | Raw OHLCV candles: `series_type` (SPOT / `{strike}_{type}_WEEKLY` / `_MONTHLY`) + `candles` JSONB |
 
+### Historical Data Warehouse (6 tables)
+
+| Table | Description |
+|-------|-------------|
+| `trading_days` | NSE calendar: date, instrument, data availability flags |
+| `spot_candles` | 1-min OHLCV spot candles per day |
+| `vix_candles` | 1-min India VIX candles per day |
+| `futures_candles` | 1-min near-month futures candles |
+| `options_candles` | 1-min candles for each option series needed |
+| `session_batches` | Batch run metadata: strategy, date range, status, aggregate stats |
+
 ---
 
 ## API Reference
 
 Base URL: `http://localhost:8000/api`
 
+### User Auth
+
+| Method | Path | Description |
+|--------|------|-------------|
+| POST | `/users/register` | Register with email + password |
+| POST | `/users/login` | Returns `access_token` (15 min) + sets HttpOnly `refresh_token` cookie |
+| POST | `/users/refresh` | Reads cookie, returns new access_token |
+| POST | `/users/logout` | Clears refresh cookie |
+| GET | `/users/me` | Current user profile (requires Bearer) |
+
 ### Zerodha Auth
 
 | Method | Path | Description |
 |--------|------|-------------|
 | GET | `/auth/zerodha/login-url` | Returns Zerodha OAuth URL |
-| POST | `/auth/zerodha/session` | Exchanges `request_token` → `access_token` |
+| POST | `/auth/zerodha/session` | Exchanges `request_token` → encrypted token stored server-side |
+
+### V2 Workbench
+
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/v2/workspace/summary` | Workspace overview: run counts, recent activity |
+| GET | `/v2/strategies` | Strategy catalog (public, no auth required) |
+| GET | `/v2/strategies/:id` | Single strategy with `visual_hints` |
+| GET | `/v2/runs` | Paginated runs list (`kind`, `limit`, `offset` params) |
+| POST | `/v2/runs` | Create a new run (paper or historical) |
+| GET | `/v2/runs/:kind/:id` | Run detail (`kind`: `paper_session`, `historical_batch`, `historical_session`) |
+| GET | `/v2/runs/:kind/:id/replay` | Full replay payload: decisions, marks, candles, explainability |
+| POST | `/v2/runs/compare` | Compare two runs side-by-side |
+
+### Historical Backtest
+
+| Method | Path | Description |
+|--------|------|-------------|
+| POST | `/backtests/batch` | Start a batch backtest run |
+| GET | `/backtests/batches` | List all batches |
+| GET | `/backtests/batch/:id` | Batch detail + per-session stats |
+| GET | `/backtests/session/:id` | Single historical session detail |
+
+### Historical Data Ingestion
+
+| Method | Path | Description |
+|--------|------|-------------|
+| POST | `/historical/ingest` | Ingest candles for a date range |
+| GET | `/historical/coverage` | Warehouse coverage by instrument |
 
 ### Paper Trading
 
@@ -330,16 +496,6 @@ Base URL: `http://localhost:8000/api`
 | GET | `/paper/session/{id}/trade` | Trade header + legs |
 | GET | `/paper/session/{id}/trade/marks` | Per-minute MTM array |
 | GET | `/paper/session/{id}/candles` | Raw OHLCV candle series |
-
-**POST `/paper/session/run` body:**
-```json
-{
-  "instrument": "NIFTY",
-  "date": "2026-04-07",
-  "capital": 2500000,
-  "access_token": "<zerodha_token>"
-}
-```
 
 ### Synthetic Backtest
 
@@ -360,16 +516,24 @@ Copy `.env.example` to `.env`:
 ```
 ZERODHA_API_KEY=your_api_key
 ZERODHA_API_SECRET=your_api_secret
+SECRET_KEY=<openssl rand -hex 32>
+BROKER_TOKEN_ENCRYPTION_KEY=<Fernet.generate_key()>
 ```
 
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `DATABASE_URL` | `postgresql+asyncpg://postgres:postgres@db:5432/adaptive_options` | Async DB URL |
+| `SECRET_KEY` | — | JWT signing key (required in production) |
+| `BROKER_TOKEN_ENCRYPTION_KEY` | — | Fernet key for broker token encryption (required in production) |
+| `ALLOWED_ORIGINS` | `*` | Comma-separated CORS origins |
+| `ENVIRONMENT` | `development` | Set to `production` to enable HSTS + strict secret validation |
 | `ZERODHA_API_KEY` | — | Required for paper trading |
 | `ZERODHA_API_SECRET` | — | Required for token exchange |
 | `POSTGRES_DB` | `adaptive_options` | |
 | `POSTGRES_USER` | `postgres` | |
 | `POSTGRES_PASSWORD` | `postgres` | |
+
+> In production the app will **refuse to start** if `SECRET_KEY` is the default placeholder or `BROKER_TOKEN_ENCRYPTION_KEY` is unset.
 
 ---
 
@@ -378,7 +542,7 @@ ZERODHA_API_SECRET=your_api_secret
 ### Prerequisites
 
 - Docker Desktop 4.x+
-- Zerodha Kite Connect API credentials (for paper trading)
+- Zerodha Kite Connect API credentials (for paper trading and historical ingestion)
 - (Optional) Python 3.11+, Node 20+, PostgreSQL 15
 
 ### Docker (recommended)
@@ -409,6 +573,15 @@ uvicorn app.main:app --reload --port 8000
 cd frontend && npm install && npm run dev   # :5173, proxies /api → localhost:8000
 ```
 
+### Apply Alembic Migrations
+
+```bash
+cd backend
+alembic upgrade head       # apply pending migrations
+alembic current            # show current revision
+alembic revision --autogenerate -m "description"  # generate new migration
+```
+
 ---
 
 ## Testing
@@ -425,6 +598,8 @@ cd backend && python -m pytest tests/ -v
 | `test_strategy.py` | All regime matrix cells, leg builder |
 | `test_position_sizer.py` | 2% risk rule, minimum lot floor |
 | `test_router_helpers.py` | `_trading_days`, `_to_dict` helpers |
+| `test_workbench_services.py` | `workbench_catalog` and `workbench_views` unit tests |
+| `test_workbench_router.py` | HTTP-level workbench endpoint tests (ASGI transport) |
 
 ### Frontend (Vitest)
 
@@ -434,11 +609,11 @@ cd frontend && npm test
 
 | File | What's tested |
 |------|--------------|
-| `TopNav.test.jsx` | 4-link nav (Run, Dashboard, Replay, Sessions), active state |
+| `TopNav.test.jsx` | Primary + legacy nav links, active state, workbench visibility rules |
 | `Backtest.test.jsx` | Single-date form, API call, loading state |
 | `Dashboard.test.jsx` | Data render, navigation, empty/error states |
 | `RegimeBadge / MetricCard / PnlChart` | Component rendering |
-| `api/index.test.js` | Export contract, base URL, timeout |
+| `api/index.test.js` | Export contract, base URL, timeout, workbench API functions |
 
 ---
 
@@ -453,6 +628,7 @@ Internet
    └─▶ Backend service   (FastAPI, public URL)
          DATABASE_URL  ← Railway PostgreSQL plugin
          ZERODHA_API_KEY / SECRET ← set manually
+         SECRET_KEY / BROKER_TOKEN_ENCRYPTION_KEY ← set manually
          ▼
        PostgreSQL plugin  (managed, private)
 ```
@@ -461,7 +637,7 @@ Internet
 
 1. Create a Railway project
 2. Add PostgreSQL plugin — auto-sets `DATABASE_URL` on backend
-3. Create **Backend** service — root dir `backend/`, set `ZERODHA_API_KEY` + `ZERODHA_API_SECRET`
+3. Create **Backend** service — root dir `backend/`, set `ZERODHA_API_KEY`, `ZERODHA_API_SECRET`, `SECRET_KEY`, `BROKER_TOKEN_ENCRYPTION_KEY`, `ENVIRONMENT=production`, `ALLOWED_ORIGINS=https://<frontend>.up.railway.app`
 4. Create **Frontend** service — root dir `frontend/`, set `VITE_API_URL = https://<backend>.up.railway.app`
 5. Verify: `curl https://<backend>.up.railway.app/health` → `{"status":"ok"}`
 
