@@ -36,7 +36,7 @@ from app.models.paper_trade import (
 )
 from app.models.user import User
 from app.services.batch_runner import run_batch
-from app.services.strategy_config import STRATEGY_CONFIG as _CFG
+from app.services.strategy_config import build_strategy_snapshot
 
 router = APIRouter()
 
@@ -73,24 +73,6 @@ class BatchOut(BaseModel):
         from_attributes = True
 
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
-
-def _build_strategy_snapshot(instrument: str, capital: float) -> Dict[str, Any]:
-    """Freeze the current strategy config at batch-creation time."""
-    return {
-        "instrument": instrument,
-        "capital": capital,
-        "strategy_id": _CFG["strategy_name"],
-        "strategy_version": _CFG["strategy_version"],
-        "or_window_minutes": _CFG["or_window_minutes"],
-        "max_risk_pct": _CFG["max_risk_pct"],
-        "target_pct": _CFG["target_profit_pct"],
-        "n_candidate_spreads": _CFG["n_candidate_spreads"],
-        "max_price_staleness_min": _CFG["max_price_staleness_min"],
-        "option_price_source": "ltp",   # "ltp" | "close" — stored for reproducibility
-    }
-
-
 async def _get_owned_batch(
     batch_id: uuid.UUID,
     user: User,
@@ -121,7 +103,7 @@ async def create_batch(
     if body.start_date > body.end_date:
         raise HTTPException(status_code=422, detail="start_date must be ≤ end_date")
 
-    snapshot = _build_strategy_snapshot(body.instrument, body.capital)
+    snapshot = build_strategy_snapshot(body.instrument, body.capital)
     batch = SessionBatch(
         name=body.name,
         strategy_id=snapshot["strategy_id"],   # stored as strategy_name value

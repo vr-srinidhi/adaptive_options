@@ -26,7 +26,11 @@ from app.models.user import User
 from app.services import zerodha_client
 from app.services.audit import log_event
 from app.services.paper_engine import run_paper_engine
-from app.services.strategy_config import STRATEGY_CONFIG as _CFG
+from app.services.strategy_config import (
+    WORKBENCH_STRATEGY_ID,
+    WORKBENCH_STRATEGY_NAME,
+    build_strategy_snapshot,
+)
 from app.services.token_store import get_broker_token, store_broker_token
 from app.services.workbench_catalog import get_strategy, list_strategies, supported_strategy_ids
 from app.services.workbench_views import (
@@ -34,6 +38,7 @@ from app.services.workbench_views import (
     paper_session_library_item,
     parse_compare_refs,
     replay_payload,
+    resolve_strategy_identity,
     serialize_strategy_metrics,
 )
 from app.services.zerodha_client import DataUnavailableError
@@ -45,21 +50,6 @@ class CreateRunRequest(BaseModel):
     run_type: str = Field(..., pattern="^(paper_replay|historical_backtest)$")
     strategy_id: str
     config: dict[str, Any]
-
-
-def _strategy_snapshot(instrument: str, capital: float) -> dict[str, Any]:
-    return {
-        "instrument": instrument,
-        "capital": capital,
-        "strategy_id": _CFG["strategy_name"],
-        "strategy_version": _CFG["strategy_version"],
-        "or_window_minutes": _CFG["or_window_minutes"],
-        "max_risk_pct": _CFG["max_risk_pct"],
-        "target_pct": _CFG["target_profit_pct"],
-        "n_candidate_spreads": _CFG["n_candidate_spreads"],
-        "max_price_staleness_min": _CFG["max_price_staleness_min"],
-        "option_price_source": "ltp",
-    }
 
 
 def _parse_uuid(value: str) -> uuid.UUID:
@@ -174,11 +164,14 @@ async def get_workspace_summary(
 
 @router.get("/strategies")
 async def get_strategies():
+    # Catalog metadata is intentionally public so the workbench shell can render
+    # before login; run creation and replay data remain authenticated.
     return {"strategies": list_strategies()}
 
 
 @router.get("/strategies/{strategy_id}")
 async def get_strategy_detail(strategy_id: str):
+    # Same rationale as /strategies: metadata is public, execution data is not.
     strategy = get_strategy(strategy_id)
     if strategy is None:
         raise HTTPException(status_code=404, detail="Strategy not found.")
@@ -189,20 +182,28 @@ async def get_strategy_detail(strategy_id: str):
 async def list_runs(
     kind: Optional[str] = Query(None, pattern="^(paper_session|historical_batch)$"),
     limit: int = Query(40, ge=1, le=200),
+    offset: int = Query(0, ge=0),
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_active_user),
 ):
     items = []
+    fetch_limit = limit + offset
 
     if kind in (None, "paper_session"):
-        paper_rows = (await db.execute(
+        paper_query = (
             select(PaperSession)
             .where(
                 PaperSession.session_type == "paper_replay",
                 (PaperSession.user_id == current_user.id) | (PaperSession.user_id.is_(None)),
             )
             .order_by(PaperSession.created_at.desc())
-            .limit(limit)
+        )
+        if kind == "paper_session":
+            paper_query = paper_query.offset(offset).limit(limit)
+        else:
+            paper_query = paper_query.limit(fetch_limit)
+        paper_rows = (await db.execute(
+            paper_query
         )).scalars().all()
         trade_by_session = {}
         if paper_rows:
@@ -213,15 +214,23 @@ async def list_runs(
         items.extend(paper_session_library_item(row, trade_by_session.get(row.id)) for row in paper_rows)
 
     if kind in (None, "historical_batch"):
-        batch_rows = (await db.execute(
+        batch_query = (
             select(SessionBatch)
             .where((SessionBatch.created_by == current_user.id) | (SessionBatch.created_by.is_(None)))
             .order_by(SessionBatch.created_at.desc())
-            .limit(limit)
+        )
+        if kind == "historical_batch":
+            batch_query = batch_query.offset(offset).limit(limit)
+        else:
+            batch_query = batch_query.limit(fetch_limit)
+        batch_rows = (await db.execute(
+            batch_query
         )).scalars().all()
         items.extend(historical_batch_library_item(row) for row in batch_rows)
 
     items.sort(key=lambda item: item.get("created_at") or "", reverse=True)
+    if kind is None:
+        items = items[offset:offset + limit]
     return {"runs": items[:limit]}
 
 
@@ -262,23 +271,18 @@ async def create_run(
         request_token = str(config.get("request_token", "") or "").strip()
         if request_token:
             try:
-                session_data = await asyncio.get_event_loop().run_in_executor(
-                    None,
-                    zerodha_client.generate_session,
-                    request_token,
-                )
+                session_data = await asyncio.to_thread(zerodha_client.generate_session, request_token)
             except RuntimeError as exc:
                 raise HTTPException(status_code=500, detail=str(exc))
             except Exception as exc:
                 raise HTTPException(status_code=400, detail=f"Zerodha token exchange failed: {exc}")
             access_token = session_data.get("access_token", "")
             await store_broker_token(db, current_user.id, access_token)
-            asyncio.ensure_future(
-                log_event(
-                    "ZERODHA_CONNECT",
-                    user_id=current_user.id,
-                    ip_address=request.client.host if request.client else "unknown",
-                )
+            background_tasks.add_task(
+                log_event,
+                "ZERODHA_CONNECT",
+                user_id=current_user.id,
+                ip_address=request.client.host if request.client else "unknown",
             )
         else:
             access_token = await get_broker_token(db, current_user.id) or ""
@@ -290,32 +294,32 @@ async def create_run(
             )
 
         session_id = uuid.uuid4()
-        paper_session = PaperSession(
-            id=session_id,
-            instrument=instrument,
-            session_date=trade_date,
-            capital=capital,
-            status="RUNNING",
-            user_id=current_user.id,
-            session_type="paper_replay",
-            execution_mode="interactive",
-            source_mode="live_like",
-            strategy_config_snapshot={
-                "strategy_id": body.strategy_id,
-                "strategy_name": strategy["name"],
-                "run_type": body.run_type,
-                "input": config,
-            },
+        session_snapshot = build_strategy_snapshot(
+            instrument,
+            capital,
+            strategy_id=body.strategy_id,
+            strategy_name=strategy["name"],
+            run_type=body.run_type,
+            input_config=config,
         )
+        session_kwargs = {
+            "id": session_id,
+            "instrument": instrument,
+            "session_date": trade_date,
+            "capital": capital,
+            "status": "RUNNING",
+            "user_id": current_user.id,
+            "session_type": "paper_replay",
+            "execution_mode": "interactive",
+            "source_mode": "live_like",
+            "strategy_config_snapshot": session_snapshot,
+        }
+        paper_session = PaperSession(**session_kwargs)
         db.add(paper_session)
-        await db.commit()
+        await db.flush()
 
         try:
-            result = await asyncio.get_event_loop().run_in_executor(
-                None,
-                run_paper_engine,
-                session_id, trade_date, instrument, capital, access_token,
-            )
+            result = await asyncio.to_thread(run_paper_engine, session_id, trade_date, instrument, capital, access_token)
         except DataUnavailableError as exc:
             paper_session.status = "ERROR"
             paper_session.error_message = str(exc)
@@ -327,40 +331,44 @@ async def create_run(
             await db.commit()
             raise HTTPException(status_code=500, detail=f"Engine error: {exc}")
 
-        for decision in result["decisions"]:
-            db.add(MinuteDecision(**decision))
-
-        trade_db_id = None
-        if result["trade_header"]:
-            header_data = {k: v for k, v in result["trade_header"].items() if k != "id"}
-            header = PaperTradeHeader(**header_data)
-            db.add(header)
-            await db.flush()
-            trade_db_id = header.id
-            await db.commit()
-            for leg in result["trade_legs"]:
-                db.add(PaperTradeLeg(**{**leg, "trade_id": trade_db_id}))
-            for mark in result["minute_marks"]:
-                db.add(PaperTradeMinuteMark(**{**mark, "trade_id": trade_db_id}))
-            await db.commit()
-        else:
-            await db.commit()
-
-        for candle in result.get("candle_series", []):
-            db.add(PaperCandleSeries(**candle))
-        await db.commit()
-
-        paper_session.status = "COMPLETED"
-        paper_session.decision_count = len(result["decisions"])
-        paper_session.final_session_state = result.get("final_session_state")
-        if result["trade_header"] and result["trade_header"].get("realized_net_pnl") is not None:
-            paper_session.summary_pnl = result["trade_header"]["realized_net_pnl"]
-        await db.commit()
-        await db.refresh(paper_session)
-
         trade = None
-        if trade_db_id:
-            trade = (await db.execute(select(PaperTradeHeader).where(PaperTradeHeader.id == trade_db_id))).scalar_one_or_none()
+        try:
+            for decision in result["decisions"]:
+                db.add(MinuteDecision(**decision))
+
+            if result["trade_header"]:
+                header_data = {k: v for k, v in result["trade_header"].items() if k != "id"}
+                trade = PaperTradeHeader(**header_data)
+                db.add(trade)
+                await db.flush()
+                for leg in result["trade_legs"]:
+                    db.add(PaperTradeLeg(**{**leg, "trade_id": trade.id}))
+                for mark in result["minute_marks"]:
+                    db.add(PaperTradeMinuteMark(**{**mark, "trade_id": trade.id}))
+
+            for candle in result.get("candle_series", []):
+                db.add(PaperCandleSeries(**candle))
+
+            paper_session.status = "COMPLETED"
+            paper_session.decision_count = len(result["decisions"])
+            paper_session.final_session_state = result.get("final_session_state")
+            if result["trade_header"] and result["trade_header"].get("realized_net_pnl") is not None:
+                paper_session.summary_pnl = result["trade_header"]["realized_net_pnl"]
+            await db.commit()
+        except Exception as exc:
+            await db.rollback()
+            error_session = PaperSession(
+                **{
+                    **session_kwargs,
+                    "status": "ERROR",
+                    "error_message": f"Persistence error: {exc}",
+                }
+            )
+            db.add(error_session)
+            await db.commit()
+            raise HTTPException(status_code=500, detail=f"Persistence error: {exc}")
+
+        await db.refresh(paper_session)
         return {
             "run": paper_session_library_item(paper_session, trade),
             "navigate_to": f"/workbench/replay/paper_session/{session_id}",
@@ -386,7 +394,14 @@ async def create_run(
     name = str(config.get("name", "")).strip() or "ORB historical replay"
     execution_order = str(config.get("execution_order", "latest_first"))
     autorun = bool(config.get("autorun", True))
-    snapshot = _strategy_snapshot(instrument, capital)
+    snapshot = build_strategy_snapshot(
+        instrument,
+        capital,
+        strategy_id=body.strategy_id,
+        strategy_name=strategy["name"],
+        run_type=body.run_type,
+        input_config=config,
+    )
 
     batch = SessionBatch(
         name=name,
@@ -455,6 +470,11 @@ async def get_run_detail(
 
     if kind == "historical_session":
         session = await _owned_paper_session(_parse_uuid(item_id), current_user, db, session_type="historical_backtest")
+        strategy_id, strategy_name = resolve_strategy_identity(
+            session.strategy_config_snapshot,
+            fallback_id=WORKBENCH_STRATEGY_ID,
+            fallback_name=WORKBENCH_STRATEGY_NAME,
+        )
         return {
             "run": {
                 "kind": "historical_session",
@@ -462,8 +482,8 @@ async def get_run_detail(
                 "title": f"{session.instrument} historical session",
                 "subtitle": session.session_date.isoformat(),
                 "status": session.status,
-                "strategy_id": (session.strategy_config_snapshot or {}).get("strategy_id") or "orb_intraday_spread",
-                "strategy_name": "Opening Range Spread",
+                "strategy_id": strategy_id,
+                "strategy_name": strategy_name,
                 "run_mode": "historical_session",
                 "instrument": session.instrument,
                 "date_label": session.session_date.isoformat(),

@@ -103,4 +103,14 @@ describe('RunBuilder', () => {
       })
     })
   })
+
+  it('does not mark historical spot readiness green when the selected range is not ready', async () => {
+    renderBuilder()
+    await screen.findByDisplayValue('NIFTY')
+
+    await userEvent.click(screen.getByRole('button', { name: /historical/i }))
+
+    expect(await screen.findByText(/0 \/ 23 warehouse-ready sessions in selected range/i)).toBeInTheDocument()
+    expect(screen.getByText(/requires validated session date/i)).toBeInTheDocument()
+  })
 })

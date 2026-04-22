@@ -30,91 +30,6 @@ const PAYOFF_SHAPES = {
   put: '4,24 28,24 44,70 60,88 96,88',
 }
 
-const STRATEGY_VISUALS = {
-  orb_intraday_spread: {
-    badge: 'Opening Range Spread',
-    assumption: 'Fills use candle close price and ranked ORB spread candidates. Bid/ask is not available in the current executor.',
-    summaryTitle: 'Opening Range Spread',
-    summaryCopy: 'Breakout confirms after the OR window. The executor selects the directional debit spread and replays the session minute by minute.',
-    shape: 'adaptive',
-    expiryLabel: 'Weekly (auto)',
-    exitRule: 'Stop / Target / Time',
-    constraintFields: [
-      { label: 'Target %', value: '45', hint: 'of max profit' },
-      { label: 'Stop %', value: '100', hint: 'of max loss' },
-      { label: 'VIX Min', value: '14', hint: '' },
-      { label: 'VIX Max', value: '22', hint: '' },
-    ],
-    legs: [
-      { side: 'BUY', optionType: 'ENTRY', strike: 'ATM', expiry: 'Weekly', premium: 'auto' },
-      { side: 'SELL', optionType: 'HEDGE', strike: 'ATM ± 200', expiry: 'Weekly', premium: 'auto' },
-    ],
-    payoffHint: 'Defined-risk breakout profile: capped downside, capped upside once the spread reaches max value.',
-    metrics: { maxProfitRatio: 0.008, maxRiskRatio: 0.02, marginRatio: 0.12, maxLossText: 'Defined risk' },
-  },
-  short_strangle: {
-    badge: 'Short Strangle',
-    assumption: 'Fills use candle close price. Bid/ask not available. Results may overestimate entry quality.',
-    summaryTitle: 'Short Strangle',
-    summaryCopy: 'Sell OTM CE + OTM PE. Profit when spot stays within short strikes. Loss if spot moves sharply beyond either strike.',
-    shape: 'tent',
-    expiryLabel: 'Weekly (10 Apr)',
-    exitRule: 'Stop / Target / Time',
-    constraintFields: [
-      { label: 'Target %', value: '45', hint: 'of max profit' },
-      { label: 'Stop %', value: '100', hint: 'of max loss' },
-      { label: 'VIX Min', value: '14', hint: '' },
-      { label: 'VIX Max', value: '22', hint: '' },
-    ],
-    legs: [
-      { side: 'SELL', optionType: 'CE', strike: 'ATM+200', expiry: 'Weekly', premium: 'auto' },
-      { side: 'SELL', optionType: 'PE', strike: 'ATM-200', expiry: 'Weekly', premium: 'auto' },
-    ],
-    payoffHint: 'Tent-shaped expiry payoff: premium decay wins, large moves hurt.',
-    metrics: { maxProfitRatio: 0.02, maxRiskRatio: 0.02, marginRatio: 0.28, maxLossText: 'Unlimited' },
-  },
-  buy_call: {
-    badge: 'Buy Call',
-    assumption: 'Single-leg debit setup. Preview shell matches the workbench, while execution remains pending.',
-    summaryTitle: 'Buy Call',
-    summaryCopy: 'Long bullish delta with fixed debit risk and convex upside exposure.',
-    shape: 'call',
-    expiryLabel: 'Weekly',
-    exitRule: 'Stop / Target / Time',
-    constraintFields: [
-      { label: 'Target %', value: '60', hint: 'of max profit' },
-      { label: 'Stop %', value: '100', hint: 'premium paid' },
-      { label: 'VIX Min', value: '12', hint: '' },
-      { label: 'VIX Max', value: '28', hint: '' },
-    ],
-    legs: [
-      { side: 'BUY', optionType: 'CE', strike: 'ATM', expiry: 'Weekly', premium: 'auto' },
-    ],
-    payoffHint: 'Limited downside to premium paid with open-ended upside.',
-    metrics: { maxProfitRatio: 0.018, maxRiskRatio: 0.01, marginRatio: 0.06, maxLossText: 'Premium paid' },
-  },
-  buy_put: {
-    badge: 'Buy Put',
-    assumption: 'Single-leg debit setup. Preview shell matches the workbench, while execution remains pending.',
-    summaryTitle: 'Buy Put',
-    summaryCopy: 'Long bearish delta with fixed debit risk and convex downside exposure.',
-    shape: 'put',
-    expiryLabel: 'Weekly',
-    exitRule: 'Stop / Target / Time',
-    constraintFields: [
-      { label: 'Target %', value: '60', hint: 'of max profit' },
-      { label: 'Stop %', value: '100', hint: 'premium paid' },
-      { label: 'VIX Min', value: '12', hint: '' },
-      { label: 'VIX Max', value: '28', hint: '' },
-    ],
-    legs: [
-      { side: 'BUY', optionType: 'PE', strike: 'ATM', expiry: 'Weekly', premium: 'auto' },
-    ],
-    payoffHint: 'Limited downside to premium paid with accelerated profit on downside expansion.',
-    metrics: { maxProfitRatio: 0.018, maxRiskRatio: 0.01, marginRatio: 0.06, maxLossText: 'Premium paid' },
-  },
-}
-
 function defaultRunTypeFor(strategy) {
   return strategy?.modes?.[0] || 'paper_replay'
 }
@@ -155,13 +70,69 @@ function fallbackVisual(strategy) {
   }
 }
 
+function normalizeVisual(strategy) {
+  const raw = strategy?.visual_hints
+  if (!raw) return fallbackVisual(strategy)
+
+  return {
+    badge: raw.badge || strategy?.name || 'Strategy',
+    assumption: raw.assumption || fallbackVisual(strategy).assumption,
+    summaryTitle: raw.summary_title || strategy?.name || 'Strategy',
+    summaryCopy: raw.summary_copy || strategy?.description || 'Choose a strategy to load its preview shell.',
+    shape: raw.shape || 'spread',
+    expiryLabel: raw.expiry_label || 'Weekly',
+    exitRule: raw.exit_rule || 'Stop / Target / Time',
+    constraintFields: (raw.constraint_fields || []).map(item => ({
+      label: item.label,
+      value: item.value,
+      hint: item.hint || '',
+    })),
+    legs: (raw.legs || []).map(item => ({
+      side: item.side,
+      optionType: item.option_type || item.optionType,
+      strike: item.strike,
+      expiry: item.expiry,
+      premium: item.premium || 'auto',
+    })),
+    payoffHint: raw.payoff_hint || 'Payoff preview will align once strategy-specific execution is added.',
+    metrics: {
+      maxProfitRatio: raw.metrics?.max_profit_ratio ?? 0.005,
+      maxRiskRatio: raw.metrics?.max_risk_ratio ?? 0.02,
+      marginRatio: raw.metrics?.margin_ratio ?? 0.1,
+      maxLossText: raw.metrics?.max_loss_text || 'Strategy dependent',
+    },
+  }
+}
+
+function countWeekdaysInRange(startDate, endDate) {
+  if (!startDate || !endDate || startDate > endDate) return 0
+
+  const current = new Date(`${startDate}T00:00:00`)
+  const end = new Date(`${endDate}T00:00:00`)
+  let total = 0
+
+  while (current <= end) {
+    const day = current.getDay()
+    if (day !== 0 && day !== 6) total += 1
+    current.setDate(current.getDate() + 1)
+  }
+  return total
+}
+
 function buildPreview(strategy, runType, config, readyDays) {
   const capital = Number(config.capital || 0)
   const capitalValid = Number.isFinite(capital) && capital > 0
-  const visual = STRATEGY_VISUALS[strategy?.id] || fallbackVisual(strategy)
+  const visual = normalizeVisual(strategy)
   const readySet = new Set((readyDays || []).map(item => item.trade_date))
   const selectedDate = config.date || config.start_date
   const exactDayReady = selectedDate ? readySet.has(selectedDate) : false
+  const expectedRangeDays = runType === 'historical_backtest'
+    ? countWeekdaysInRange(config.start_date, config.end_date)
+    : 0
+  const readyRangeDays = runType === 'historical_backtest'
+    ? (readyDays || []).filter(item => item.trade_date >= config.start_date && item.trade_date <= config.end_date).length
+    : 0
+  const historicalReady = expectedRangeDays > 0 && readyRangeDays >= expectedRangeDays
   const tone = strategyStatusTone(strategy?.status)
 
   const readinessItems = [
@@ -169,8 +140,10 @@ function buildPreview(strategy, runType, config, readyDays) {
       label: 'Spot candles',
       detail: runType === 'paper_replay'
         ? `${config.instrument || 'NIFTY'} 1-min · ${config.date || 'Pick a session date'}`
-        : `${readyDays.length} warehouse-ready sessions`,
-      level: runType === 'historical_backtest' || exactDayReady ? 'good' : 'warn',
+        : `${readyRangeDays} / ${expectedRangeDays || 0} warehouse-ready sessions in selected range`,
+      level: runType === 'historical_backtest'
+        ? (historicalReady ? 'good' : 'warn')
+        : (exactDayReady ? 'good' : 'warn'),
     },
     {
       label: 'Option chain',
@@ -200,7 +173,7 @@ function buildPreview(strategy, runType, config, readyDays) {
   const maxRisk = capitalValid ? capital * (visual.metrics?.maxRiskRatio || 0.02) : 0
   const estMargin = capitalValid ? capital * (visual.metrics?.marginRatio || 0.1) : 0
   const validated = runType === 'historical_backtest'
-    ? Boolean(config.start_date && config.end_date && config.instrument)
+    ? Boolean(config.start_date && config.end_date && config.instrument && historicalReady)
     : exactDayReady
 
   return {

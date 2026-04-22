@@ -6,6 +6,7 @@ from app.services.workbench_views import (
     historical_batch_library_item,
     paper_session_library_item,
     parse_compare_refs,
+    resolve_strategy_identity,
 )
 
 
@@ -54,6 +55,8 @@ def test_paper_session_library_item_normalizes_session_fields():
         final_session_state="TRADE_CLOSED",
         decision_count=42,
         created_at=datetime(2026, 4, 7, 15, 30),
+        strategy_config_snapshot={"strategy_id": "orb_intraday_spread", "strategy_name": "Opening Range Spread", "strategy_version": "v2.0"},
+        session_type="paper_replay",
     )
     trade = SimpleNamespace(realized_net_pnl=1250.5, strategy_version="v1.0")
 
@@ -62,6 +65,7 @@ def test_paper_session_library_item_normalizes_session_fields():
     assert item["kind"] == "paper_session"
     assert item["pnl"] == 1250.5
     assert item["metrics"]["trade_opened"] is True
+    assert item["strategy_id"] == "orb_intraday_spread"
     assert item["route"].endswith("/paper_session/sess-1")
 
 
@@ -74,7 +78,7 @@ def test_historical_batch_library_item_adds_win_rate_when_session_count_known():
         status="completed",
         strategy_id="orb_intraday_spread",
         strategy_version="v1.0",
-        strategy_config_snapshot={"instrument": "NIFTY", "capital": 2500000},
+        strategy_config_snapshot={"instrument": "NIFTY", "capital": 2500000, "strategy_id": "orb_intraday_spread", "strategy_name": "Opening Range Spread"},
         created_at=datetime(2026, 2, 1, 10, 0),
         total_pnl=10000,
         completed_sessions=19,
@@ -88,3 +92,14 @@ def test_historical_batch_library_item_adds_win_rate_when_session_count_known():
     assert item["kind"] == "historical_batch"
     assert item["metrics"]["win_rate"] == 60.0
     assert item["route"].endswith("/historical_batch/batch-1")
+
+
+def test_resolve_strategy_identity_uses_snapshot_before_fallbacks():
+    strategy_id, strategy_name = resolve_strategy_identity(
+        {"strategy_id": "buy_call", "strategy_name": "Buy Call"},
+        fallback_id="orb_intraday_spread",
+        fallback_name="Opening Range Spread",
+    )
+
+    assert strategy_id == "buy_call"
+    assert strategy_name == "Buy Call"

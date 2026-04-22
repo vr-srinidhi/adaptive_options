@@ -2,6 +2,29 @@ from __future__ import annotations
 
 from copy import deepcopy
 
+from app.services.strategy_config import latest_weekday, shift_weekdays
+
+
+def _current_replay_defaults() -> dict:
+    anchor = latest_weekday()
+    return {
+        "paper_replay": {
+            "instrument": "NIFTY",
+            "capital": 2500000,
+            "date": anchor.isoformat(),
+            "request_token": "",
+        },
+        "historical_backtest": {
+            "name": "ORB historical replay",
+            "instrument": "NIFTY",
+            "capital": 2500000,
+            "start_date": shift_weekdays(anchor, -22).isoformat(),
+            "end_date": anchor.isoformat(),
+            "execution_order": "latest_first",
+            "autorun": True,
+        },
+    }
+
 
 _STRATEGIES = [
     {
@@ -29,22 +52,27 @@ _STRATEGIES = [
             {"key": "execution_order", "label": "Execution order", "type": "select", "required": True, "modes": ["historical_backtest"], "options": ["latest_first", "oldest_first"]},
             {"key": "autorun", "label": "Auto run", "type": "boolean", "required": False, "modes": ["historical_backtest"]},
         ],
-        "defaults": {
-            "paper_replay": {
-                "instrument": "NIFTY",
-                "capital": 2500000,
-                "date": "2026-04-07",
-                "request_token": "",
-            },
-            "historical_backtest": {
-                "name": "ORB historical replay",
-                "instrument": "NIFTY",
-                "capital": 2500000,
-                "start_date": "2026-03-01",
-                "end_date": "2026-04-01",
-                "execution_order": "latest_first",
-                "autorun": True,
-            },
+        "defaults": _current_replay_defaults(),
+        "visual_hints": {
+            "badge": "Opening Range Spread",
+            "assumption": "Fills use candle close price and ranked ORB spread candidates. Bid/ask is not available in the current executor.",
+            "summary_title": "Opening Range Spread",
+            "summary_copy": "Breakout confirms after the OR window. The executor selects the directional debit spread and replays the session minute by minute.",
+            "shape": "adaptive",
+            "expiry_label": "Weekly (auto)",
+            "exit_rule": "Stop / Target / Time",
+            "constraint_fields": [
+                {"label": "Target %", "value": "45", "hint": "of max profit"},
+                {"label": "Stop %", "value": "100", "hint": "of max loss"},
+                {"label": "VIX Min", "value": "14", "hint": ""},
+                {"label": "VIX Max", "value": "22", "hint": ""},
+            ],
+            "legs": [
+                {"side": "BUY", "option_type": "ENTRY", "strike": "ATM", "expiry": "Weekly", "premium": "auto"},
+                {"side": "SELL", "option_type": "HEDGE", "strike": "ATM ± 200", "expiry": "Weekly", "premium": "auto"},
+            ],
+            "payoff_hint": "Defined-risk breakout profile: capped downside, capped upside once the spread reaches max value.",
+            "metrics": {"max_profit_ratio": 0.008, "max_risk_ratio": 0.02, "margin_ratio": 0.12, "max_loss_text": "Defined risk"},
         },
         "notes": [
             "Only fully executable strategy in this release.",
@@ -64,6 +92,26 @@ _STRATEGIES = [
         "chips": ["Single leg", "Bullish", "Planned"],
         "params_schema": [],
         "defaults": {},
+        "visual_hints": {
+            "badge": "Buy Call",
+            "assumption": "Single-leg debit setup. Preview shell matches the workbench, while execution remains pending.",
+            "summary_title": "Buy Call",
+            "summary_copy": "Long bullish delta with fixed debit risk and convex upside exposure.",
+            "shape": "call",
+            "expiry_label": "Weekly",
+            "exit_rule": "Stop / Target / Time",
+            "constraint_fields": [
+                {"label": "Target %", "value": "60", "hint": "of max profit"},
+                {"label": "Stop %", "value": "100", "hint": "premium paid"},
+                {"label": "VIX Min", "value": "12", "hint": ""},
+                {"label": "VIX Max", "value": "28", "hint": ""},
+            ],
+            "legs": [
+                {"side": "BUY", "option_type": "CE", "strike": "ATM", "expiry": "Weekly", "premium": "auto"},
+            ],
+            "payoff_hint": "Limited downside to premium paid with open-ended upside.",
+            "metrics": {"max_profit_ratio": 0.018, "max_risk_ratio": 0.01, "margin_ratio": 0.06, "max_loss_text": "Premium paid"},
+        },
         "notes": ["Included in the catalog so the workbench can grow without redesigning navigation."],
     },
     {
@@ -124,6 +172,26 @@ _STRATEGIES = [
         "chips": ["Single leg", "Bearish", "Planned"],
         "params_schema": [],
         "defaults": {},
+        "visual_hints": {
+            "badge": "Buy Put",
+            "assumption": "Single-leg debit setup. Preview shell matches the workbench, while execution remains pending.",
+            "summary_title": "Buy Put",
+            "summary_copy": "Long bearish delta with fixed debit risk and convex downside exposure.",
+            "shape": "put",
+            "expiry_label": "Weekly",
+            "exit_rule": "Stop / Target / Time",
+            "constraint_fields": [
+                {"label": "Target %", "value": "60", "hint": "of max profit"},
+                {"label": "Stop %", "value": "100", "hint": "premium paid"},
+                {"label": "VIX Min", "value": "12", "hint": ""},
+                {"label": "VIX Max", "value": "28", "hint": ""},
+            ],
+            "legs": [
+                {"side": "BUY", "option_type": "PE", "strike": "ATM", "expiry": "Weekly", "premium": "auto"},
+            ],
+            "payoff_hint": "Limited downside to premium paid with accelerated profit on downside expansion.",
+            "metrics": {"max_profit_ratio": 0.018, "max_risk_ratio": 0.01, "margin_ratio": 0.06, "max_loss_text": "Premium paid"},
+        },
         "notes": [],
     },
     {
@@ -199,6 +267,27 @@ _STRATEGIES = [
         "chips": ["Neutral", "Short vol", "Research"],
         "params_schema": [],
         "defaults": {},
+        "visual_hints": {
+            "badge": "Short Strangle",
+            "assumption": "Fills use candle close price. Bid/ask not available. Results may overestimate entry quality.",
+            "summary_title": "Short Strangle",
+            "summary_copy": "Sell OTM CE + OTM PE. Profit when spot stays within short strikes. Loss if spot moves sharply beyond either strike.",
+            "shape": "tent",
+            "expiry_label": "Weekly (10 Apr)",
+            "exit_rule": "Stop / Target / Time",
+            "constraint_fields": [
+                {"label": "Target %", "value": "45", "hint": "of max profit"},
+                {"label": "Stop %", "value": "100", "hint": "of max loss"},
+                {"label": "VIX Min", "value": "14", "hint": ""},
+                {"label": "VIX Max", "value": "22", "hint": ""},
+            ],
+            "legs": [
+                {"side": "SELL", "option_type": "CE", "strike": "ATM+200", "expiry": "Weekly", "premium": "auto"},
+                {"side": "SELL", "option_type": "PE", "strike": "ATM-200", "expiry": "Weekly", "premium": "auto"},
+            ],
+            "payoff_hint": "Tent-shaped expiry payoff: premium decay wins, large moves hurt.",
+            "metrics": {"max_profit_ratio": 0.02, "max_risk_ratio": 0.02, "margin_ratio": 0.28, "max_loss_text": "Unlimited"},
+        },
         "notes": [],
     },
     {
@@ -234,8 +323,15 @@ _STRATEGIES = [
 ]
 
 
+def _materialize_strategy(strategy: dict) -> dict:
+    item = deepcopy(strategy)
+    if item["id"] == "orb_intraday_spread":
+        item["defaults"] = _current_replay_defaults()
+    return item
+
+
 def list_strategies() -> list[dict]:
-    return [deepcopy(item) for item in _STRATEGIES]
+    return [_materialize_strategy(item) for item in _STRATEGIES]
 
 
 def get_strategy(strategy_id: str | None) -> dict | None:
@@ -243,7 +339,7 @@ def get_strategy(strategy_id: str | None) -> dict | None:
         return None
     for strategy in _STRATEGIES:
         if strategy["id"] == strategy_id:
-            return deepcopy(strategy)
+            return _materialize_strategy(strategy)
     return None
 
 

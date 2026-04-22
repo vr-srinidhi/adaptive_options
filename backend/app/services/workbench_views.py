@@ -14,6 +14,7 @@ from app.models.paper_trade import (
     PaperTradeLeg,
     PaperTradeMinuteMark,
 )
+from app.services.strategy_config import WORKBENCH_STRATEGY_ID, WORKBENCH_STRATEGY_NAME
 
 
 def _to_float(value):
@@ -30,6 +31,18 @@ def _iso_datetime(value: datetime | None) -> str | None:
 
 def _iso_date(value: date | None) -> str | None:
     return value.isoformat() if value else None
+
+
+def resolve_strategy_identity(
+    snapshot: dict | None,
+    *,
+    fallback_id: str | None = None,
+    fallback_name: str | None = None,
+) -> tuple[str, str]:
+    payload = snapshot or {}
+    strategy_id = payload.get("strategy_id") or fallback_id or WORKBENCH_STRATEGY_ID
+    strategy_name = payload.get("strategy_name") or fallback_name or WORKBENCH_STRATEGY_NAME
+    return strategy_id, strategy_name
 
 
 def serialize_strategy_metrics(trading_days: Iterable[TradingDay]) -> dict:
@@ -49,6 +62,11 @@ def paper_session_library_item(session: PaperSession, trade: PaperTradeHeader | 
     if pnl is None and trade is not None:
         pnl = trade.realized_net_pnl
 
+    strategy_id, strategy_name = resolve_strategy_identity(
+        session.strategy_config_snapshot,
+        fallback_id=WORKBENCH_STRATEGY_ID if session.session_type == "paper_replay" else None,
+        fallback_name=WORKBENCH_STRATEGY_NAME,
+    )
     title = f"{session.instrument} replay"
     subtitle = session.session_date.isoformat()
     return {
@@ -57,9 +75,9 @@ def paper_session_library_item(session: PaperSession, trade: PaperTradeHeader | 
         "title": title,
         "subtitle": subtitle,
         "status": session.status,
-        "strategy_id": "orb_intraday_spread",
-        "strategy_name": "Opening Range Spread",
-        "strategy_version": trade.strategy_version if trade else None,
+        "strategy_id": strategy_id,
+        "strategy_name": strategy_name,
+        "strategy_version": (session.strategy_config_snapshot or {}).get("strategy_version") or (trade.strategy_version if trade else None),
         "instrument": session.instrument,
         "run_mode": "paper_replay",
         "date_label": session.session_date.isoformat(),
@@ -87,15 +105,20 @@ def historical_batch_library_item(
     if total:
         win_rate = round((wins / total) * 100, 1)
 
+    strategy_id, strategy_name = resolve_strategy_identity(
+        batch.strategy_config_snapshot,
+        fallback_id=batch.strategy_id,
+        fallback_name=WORKBENCH_STRATEGY_NAME,
+    )
     return {
         "kind": "historical_batch",
         "id": str(batch.id),
         "title": batch.name,
         "subtitle": f"{batch.start_date.isoformat()} → {batch.end_date.isoformat()}",
         "status": batch.status,
-        "strategy_id": batch.strategy_id,
-        "strategy_name": "Opening Range Spread",
-        "strategy_version": batch.strategy_version,
+        "strategy_id": strategy_id,
+        "strategy_name": strategy_name,
+        "strategy_version": (batch.strategy_config_snapshot or {}).get("strategy_version") or batch.strategy_version,
         "instrument": (batch.strategy_config_snapshot or {}).get("instrument"),
         "run_mode": "historical_backtest",
         "date_label": f"{batch.start_date.isoformat()} → {batch.end_date.isoformat()}",
