@@ -25,7 +25,7 @@ from typing import Any, Dict, List, Literal, Optional, Set, Tuple
 from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models.historical import OptionsCandle, SpotCandle
+from app.models.historical import OptionsCandle, SpotCandle, VixCandle
 from app.services.opening_range import OR_WINDOW_MINUTES
 
 log = logging.getLogger(__name__)
@@ -122,6 +122,39 @@ async def resolve_monthly_expiry_from_db(
     )
     row = result.fetchone()
     return row[0] if row else None
+
+
+# ── VIX candles ───────────────────────────────────────────────────────────────
+
+async def load_vix_candles(
+    db: AsyncSession,
+    trade_date: date_type,
+) -> List[Dict[str, Any]]:
+    """Load 1-min VIX candles for the day, sorted by timestamp."""
+    result = await db.execute(
+        select(VixCandle)
+        .where(VixCandle.trade_date == trade_date)
+        .order_by(VixCandle.timestamp)
+    )
+    rows = result.scalars().all()
+    return [
+        {
+            "date":  row.timestamp,
+            "open":  float(row.open) if row.open is not None else None,
+            "high":  float(row.high) if row.high is not None else None,
+            "low":   float(row.low)  if row.low  is not None else None,
+            "close": float(row.close) if row.close is not None else None,
+        }
+        for row in rows
+    ]
+
+
+def vix_at_time(vix_candles: List[Dict[str, Any]], ts: "datetime") -> Optional[float]:
+    """Return the VIX close at the given timestamp, or None if not available."""
+    for c in vix_candles:
+        if c["date"] == ts:
+            return c["close"]
+    return None
 
 
 # ── Spot candles ──────────────────────────────────────────────────────────────

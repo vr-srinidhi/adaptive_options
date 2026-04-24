@@ -243,16 +243,73 @@ _STRATEGIES = [
         "id": "short_straddle",
         "name": "Short Straddle",
         "bias": "neutral",
-        "status": "research",
-        "executor": None,
-        "modes": ["historical_backtest"],
+        "status": "available",
+        "executor": "generic_v1",
+        "entry_rule_id": "timed_entry",
+        "leg_template": [
+            {"side": "SELL", "option_type": "CE", "strike_offset_steps": 0},
+            {"side": "SELL", "option_type": "PE", "strike_offset_steps": 0},
+        ],
+        "exit_rule": {
+            "target_pct":    0.30,
+            "stop_multiple": 1.5,
+            "time_exit":     "15:25",
+            "data_gap_exit": True,
+        },
+        "modes": ["single_session_backtest"],
         "family": "neutral",
-        "playbook": "Short volatility expression for compression days.",
-        "description": "Deferred until the platform has richer neutral-risk controls and margin awareness.",
-        "chips": ["Neutral", "Short vol", "Research"],
-        "params_schema": [],
-        "defaults": {},
-        "notes": [],
+        "playbook": "Sell ATM CE + ATM PE at a fixed entry time. Profit from premium decay if NIFTY stays range-bound.",
+        "description": (
+            "Sells the ATM call and put at a configurable entry time. "
+            "Profits when combined premium decays. "
+            "Risk is theoretically unlimited — always runs with stop, target, and time exits."
+        ),
+        "chips": ["Neutral", "Short vol", "Intraday", "Undefined risk"],
+        "params_schema": [
+            {"key": "trade_date",  "label": "Trade Date",   "type": "date",    "required": True},
+            {"key": "entry_time",  "label": "Entry Time",   "type": "time",    "required": True, "default": "09:50"},
+            {"key": "capital",     "label": "Capital",      "type": "number",  "required": True, "min": 100000, "max": 50000000},
+            {"key": "vix_guardrail_enabled", "label": "VIX Guardrail", "type": "boolean", "required": False, "default": True},
+            {"key": "vix_min",     "label": "VIX Min",      "type": "number",  "required": False, "default": 14, "depends_on": "vix_guardrail_enabled"},
+            {"key": "vix_max",     "label": "VIX Max",      "type": "number",  "required": False, "default": 22, "depends_on": "vix_guardrail_enabled"},
+        ],
+        "defaults": {
+            "single_session_backtest": {
+                "instrument": "NIFTY",
+                "trade_date": None,
+                "entry_time": "09:50",
+                "capital": 2500000,
+                "vix_guardrail_enabled": True,
+                "vix_min": 14,
+                "vix_max": 22,
+            },
+        },
+        "visual_hints": {
+            "badge": "Short Straddle",
+            "assumption": "Fills use candle close price. Bid/ask not available. Results may slightly overestimate entry quality.",
+            "summary_title": "Short Straddle",
+            "summary_copy": "Sell ATM CE + ATM PE. Profit when spot stays near the strike. Loss accelerates if spot moves sharply in either direction.",
+            "shape": "tent",
+            "expiry_label": "Weekly (auto)",
+            "exit_rule": "Target 30% / Stop 1.5× / Time 15:25",
+            "constraint_fields": [
+                {"label": "Target",     "value": "30%",   "hint": "of entry credit"},
+                {"label": "Stop",       "value": "1.5×",  "hint": "entry credit loss"},
+                {"label": "Time exit",  "value": "15:25", "hint": ""},
+                {"label": "VIX Min",    "value": "14",    "hint": ""},
+                {"label": "VIX Max",    "value": "22",    "hint": ""},
+            ],
+            "legs": [
+                {"side": "SELL", "option_type": "CE", "strike": "ATM", "expiry": "Weekly", "premium": "auto"},
+                {"side": "SELL", "option_type": "PE", "strike": "ATM", "expiry": "Weekly", "premium": "auto"},
+            ],
+            "payoff_hint": "Tent-shaped payoff: max profit at ATM strike, unlimited loss on large moves.",
+            "metrics": {"max_profit_ratio": 0.006, "max_risk_ratio": None, "margin_ratio": 0.07, "max_loss_text": "Unlimited"},
+        },
+        "notes": [
+            "First strategy on the generic workbench executor (generic_v1).",
+            "Adding new timed_entry strategies requires only a catalog entry — no new executor code.",
+        ],
     },
     {
         "id": "short_strangle",
@@ -327,6 +384,13 @@ def _materialize_strategy(strategy: dict) -> dict:
     item = deepcopy(strategy)
     if item["id"] == "orb_intraday_spread":
         item["defaults"] = _current_replay_defaults()
+    elif item["id"] == "short_straddle":
+        # Inject a live default trade_date (latest weekday)
+        anchor = latest_weekday()
+        defaults = deepcopy(item.get("defaults", {}))
+        if "single_session_backtest" in defaults:
+            defaults["single_session_backtest"]["trade_date"] = anchor.isoformat()
+        item["defaults"] = defaults
     return item
 
 

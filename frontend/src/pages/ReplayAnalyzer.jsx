@@ -52,6 +52,140 @@ function AnalyzerChart({ title, data, lineKey, color, valueFormatter }) {
   )
 }
 
+function StrategyRunAnalyzer({ payload, kind, id, navigate }) {
+  const run = payload?.run || {}
+  const legs = payload?.legs || []
+  const spotSeries = payload?.spot_series || []
+  const mtmSeries = payload?.mtm_series || []
+  const events = payload?.events || []
+
+  const [eventsOnly, setEventsOnly] = useState(false)
+
+  const visibleEvents = useMemo(() => {
+    if (!eventsOnly) return events
+    return events.filter(e => e.event_type !== 'HOLD')
+  }, [events, eventsOnly])
+
+  const chartSpot = useMemo(
+    () => spotSeries.map(r => ({ label: timeLabel(r.timestamp), spot: Number(r.close) })),
+    [spotSeries]
+  )
+  const chartMtm = useMemo(
+    () => mtmSeries.map(r => ({ label: timeLabel(r.timestamp), net_mtm: Number(r.net_mtm ?? 0) })),
+    [mtmSeries]
+  )
+
+  const tone = runStatusTone(run.status)
+  const pnl = run.realized_net_pnl
+
+  return (
+    <div className="wb-page">
+      <section className="wb-card p-6">
+        <div className="flex items-start justify-between gap-5 flex-wrap">
+          <div>
+            <div className="flex items-center gap-3 flex-wrap">
+              <button className="wb-link" onClick={() => navigate('/workbench/history')}>← Back</button>
+              <span className="wb-chip">Session Backtest</span>
+              <span className="wb-chip" style={{ background: tone.background, borderColor: tone.border, color: tone.color }}>
+                {run.status}
+              </span>
+            </div>
+            <h1 className="mt-4 text-3xl font-semibold text-[var(--text-primary)]">
+              {run.instrument} · {run.trade_date}
+            </h1>
+            <p className="mt-2 text-sm wb-muted">
+              {run.strategy_id} · exit: {run.exit_reason || '—'} · {events.length} events
+            </p>
+          </div>
+          <div className="text-right">
+            <div className="wb-kicker">Net P/L</div>
+            <div className="mt-2 text-4xl font-semibold" style={{ color: pnl == null ? 'var(--text-secondary)' : pnl >= 0 ? 'var(--green)' : 'var(--red)' }}>
+              {fmtINR(pnl)}
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section className="wb-grid wb-grid-3 mt-6">
+        <div className="wb-card p-4">
+          <div className="wb-kicker">Execution</div>
+          <div className="mt-3 space-y-3 text-sm">
+            <div className="wb-stat-row"><span>Capital</span><strong>{fmtINR(run.capital)}</strong></div>
+            <div className="wb-stat-row"><span>Lots</span><strong>{run.lots}</strong></div>
+            <div className="wb-stat-row"><span>Lot size</span><strong>{run.lot_size}</strong></div>
+            <div className="wb-stat-row"><span>Entry time</span><strong>{run.entry_time || '—'}</strong></div>
+            <div className="wb-stat-row"><span>Exit time</span><strong>{run.exit_time || '—'}</strong></div>
+          </div>
+        </div>
+        <div className="wb-card p-4">
+          <div className="wb-kicker">P&amp;L Breakdown</div>
+          <div className="mt-3 space-y-3 text-sm">
+            <div className="wb-stat-row"><span>Entry credit</span><strong>{fmtINR(run.entry_credit_total)}</strong></div>
+            <div className="wb-stat-row"><span>Gross P/L</span><strong>{fmtINR(run.gross_pnl)}</strong></div>
+            <div className="wb-stat-row"><span>Total charges</span><strong>{fmtINR(run.total_charges)}</strong></div>
+            <div className="wb-stat-row"><span>Net P/L</span><strong>{fmtINR(run.realized_net_pnl)}</strong></div>
+          </div>
+        </div>
+        <div className="wb-card p-4">
+          <div className="wb-kicker">Legs</div>
+          <div className="mt-3 space-y-2">
+            {legs.map((leg, i) => (
+              <div key={i} className="rounded-xl p-3" style={{ background: 'rgba(8,13,23,0.45)', border: '1px solid rgba(148,163,184,0.12)' }}>
+                <div className="flex items-center justify-between text-sm">
+                  <span className="font-medium text-[var(--text-primary)]">{leg.side} {leg.option_type} {leg.strike}</span>
+                  <span className="wb-muted">{leg.expiry_date}</span>
+                </div>
+                <div className="mt-1 text-sm wb-muted">
+                  Entry {fmtINR(leg.entry_price)} · Exit {fmtINR(leg.exit_price)} · P/L {fmtINR(leg.gross_leg_pnl)}
+                </div>
+              </div>
+            ))}
+            {legs.length === 0 && <div className="text-sm wb-muted">No trade entered.</div>}
+          </div>
+        </div>
+      </section>
+
+      <section className="wb-grid wb-grid-2 mt-6">
+        <AnalyzerChart title="NIFTY spot (1-min)" data={chartSpot} lineKey="spot" color="#38bdf8" valueFormatter={v => fmtNumber(v, 0)} />
+        <AnalyzerChart title="Net MTM progression" data={chartMtm} lineKey="net_mtm" color="#36b37e" valueFormatter={v => fmtINR(v)} />
+      </section>
+
+      <section className="wb-card p-5 mt-6">
+        <div className="flex items-center justify-between gap-4 mb-4">
+          <div>
+            <div className="wb-kicker">Event log</div>
+            <h2 className="text-lg font-semibold text-[var(--text-primary)] mt-1">{events.length} strategy events</h2>
+          </div>
+          <button className="wb-secondary-button" onClick={() => setEventsOnly(prev => !prev)}>
+            {eventsOnly ? 'Show all events' : 'Events only'}
+          </button>
+        </div>
+        <div className="overflow-auto">
+          <table className="w-full text-sm">
+            <thead>
+              <tr style={{ borderBottom: '1px solid var(--border)' }}>
+                {['Time', 'Type', 'Reason', 'Detail'].map(h => (
+                  <th key={h} className="text-left py-2 pr-4 wb-muted text-[11px] uppercase tracking-[0.18em]">{h}</th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {visibleEvents.map((ev, i) => (
+                <tr key={i} style={{ borderBottom: '1px solid rgba(39,54,75,0.45)' }}>
+                  <td className="py-2 pr-4 text-[var(--text-primary)]">{timeLabel(ev.timestamp)}</td>
+                  <td className="py-2 pr-4 font-semibold" style={{ color: ev.event_type === 'ENTRY' ? 'var(--green)' : ev.event_type?.includes('EXIT') ? 'var(--red)' : 'var(--text-secondary)' }}>{ev.event_type}</td>
+                  <td className="py-2 pr-4 wb-muted">{ev.reason_code || '—'}</td>
+                  <td className="py-2 pr-4 wb-muted">{ev.reason_text || '—'}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      </section>
+    </div>
+  )
+}
+
 export default function ReplayAnalyzer() {
   const navigate = useNavigate()
   const { kind, id } = useParams()
@@ -114,7 +248,14 @@ export default function ReplayAnalyzer() {
     )
   }
 
-  if (!payload || !session) return null
+  if (!payload) return null
+
+  // Generic strategy run — different payload shape
+  if (kind === 'strategy_run') {
+    return <StrategyRunAnalyzer payload={payload} kind={kind} id={id} navigate={navigate} />
+  }
+
+  if (!session) return null
 
   const tone = runStatusTone(session.status)
   const legacyRoute = kind === 'paper_session' ? `/paper/session/${id}` : `/backtests/sessions/${id}`
