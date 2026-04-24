@@ -321,7 +321,7 @@ async def execute_run(
 
     if not spot_candles:
         await _persist_no_trade(db, run_id, strategy, config, validation, user_id, "NO_SPOT_DATA")
-        return ExecutionResult(run_id=str(run_id), status="no_trade", exit_reason="NO_SPOT_DATA")
+        return ExecutionResult(run_id=str(run_id), status="no_trade", exit_reason="NO_SPOT_DATA", realized_net_pnl=None)
 
     session_start_dt = datetime.combine(trade_date, _SESSION_START)
 
