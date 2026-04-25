@@ -134,6 +134,9 @@ class StrategyRunMtm(Base):
     est_exit_charges = Column(Numeric(10, 2), nullable=True)
     net_mtm = Column(Numeric(12, 2), nullable=True)
 
+    # Trailing stop overlay — null until trail activates
+    trail_stop_level = Column(Numeric(12, 2), nullable=True)
+
     # If an exit fires at this minute, record it here
     event_code = Column(String(30), nullable=True)
 

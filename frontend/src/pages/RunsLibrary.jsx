@@ -22,6 +22,8 @@ const KIND_FILTERS = [
   { value: 'historical_batch', label: 'Historical Batch' },
 ]
 
+const PAGE_SIZE = 20
+
 function StatusBadge({ status }) {
   const tone = runStatusTone(status)
   return (
@@ -105,6 +107,8 @@ export default function RunsLibrary() {
   const [runs, setRuns] = useState([])
   const [kind, setKind] = useState(searchParams.get('kind') || 'all')
   const [query, setQuery] = useState('')
+  const [page, setPage] = useState(0)
+  const [hasMore, setHasMore] = useState(false)
   const [selectedRefs, setSelectedRefs] = useState([])
   const [compareItems, setCompareItems] = useState([])
   const [loading, setLoading] = useState(true)
@@ -114,15 +118,27 @@ export default function RunsLibrary() {
   useEffect(() => {
     setLoading(true)
     setError(null)
-    getWorkbenchRuns(kind === 'all' ? undefined : { kind })
+    const params = {
+      limit: PAGE_SIZE + 1,
+      offset: page * PAGE_SIZE,
+      ...(kind !== 'all' ? { kind } : {}),
+    }
+    getWorkbenchRuns(params)
       .then(res => {
-        const nextRuns = res.data.runs || []
+        const allRows = res.data.runs || []
+        const nextRuns = allRows.slice(0, PAGE_SIZE)
+        setHasMore(allRows.length > PAGE_SIZE)
         setRuns(nextRuns)
         setSelectedRefs(prev => prev.filter(ref => nextRuns.some(item => `${item.kind}:${item.id}` === ref)))
       })
       .catch(err => setError(err.response?.data?.detail || err.message))
       .finally(() => setLoading(false))
-  }, [kind])
+  }, [kind, page])
+
+  const handleKindChange = (nextKind) => {
+    setKind(nextKind)
+    setPage(0)
+  }
 
   useEffect(() => {
     if (selectedRefs.length < 2) {
@@ -176,7 +192,7 @@ export default function RunsLibrary() {
               Runs Library
             </div>
             <div style={{ fontSize: 10, color: PALETTE.muted }}>
-              {filtered.length} runs · select 2 or more for compare
+              {filtered.length} runs on page {page + 1}{hasMore ? '+' : ''} · select 2 or more for compare
             </div>
           </div>
 
@@ -186,7 +202,7 @@ export default function RunsLibrary() {
               <button
                 key={filter.value}
                 type="button"
-                onClick={() => setKind(filter.value)}
+                onClick={() => handleKindChange(filter.value)}
                 className="rounded-md px-3 py-1.5"
                 style={{
                   background: kind === filter.value ? PALETTE.blueSoft : PALETTE.card,
@@ -395,16 +411,57 @@ export default function RunsLibrary() {
 
             <div
               style={{
-                padding: '5px 12px',
+                padding: '6px 12px',
                 fontSize: 9,
                 color: '#64748b',
                 borderTop: `0.5px solid ${PALETTE.border}`,
                 display: 'flex',
+                alignItems: 'center',
                 justifyContent: 'space-between',
+                gap: 8,
               }}
             >
               <span>Click a row action to open replay or detail view. Compare supports up to 4 runs.</span>
-              <span>{filtered.length} rows</span>
+              <div className="flex items-center gap-2">
+                <span>{filtered.length} rows</span>
+                <button
+                  type="button"
+                  disabled={page === 0}
+                  onClick={() => setPage(p => p - 1)}
+                  style={{
+                    padding: '3px 10px',
+                    borderRadius: 5,
+                    background: page === 0 ? '#1e293b' : PALETTE.card,
+                    border: `1px solid ${PALETTE.border}`,
+                    color: page === 0 ? '#475569' : PALETTE.blue,
+                    fontSize: 9,
+                    fontWeight: 600,
+                    cursor: page === 0 ? 'default' : 'pointer',
+                  }}
+                >
+                  ← Prev
+                </button>
+                <span style={{ minWidth: 52, textAlign: 'center' }}>
+                  Page {page + 1}
+                </span>
+                <button
+                  type="button"
+                  disabled={!hasMore}
+                  onClick={() => setPage(p => p + 1)}
+                  style={{
+                    padding: '3px 10px',
+                    borderRadius: 5,
+                    background: !hasMore ? '#1e293b' : PALETTE.card,
+                    border: `1px solid ${PALETTE.border}`,
+                    color: !hasMore ? '#475569' : PALETTE.blue,
+                    fontSize: 9,
+                    fontWeight: 600,
+                    cursor: !hasMore ? 'default' : 'pointer',
+                  }}
+                >
+                  Next →
+                </button>
+              </div>
             </div>
           </section>
         )}

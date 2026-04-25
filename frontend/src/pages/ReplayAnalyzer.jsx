@@ -14,7 +14,7 @@ import { fmtDateTime, fmtINR, fmtNumber, runKindLabel, runStatusTone } from '../
 
 const timeLabel = value => value ? value.slice(11, 16) : '—'
 
-function AnalyzerChart({ title, data, lineKey, color, valueFormatter }) {
+function AnalyzerChart({ title, data, lineKey, color, valueFormatter, tightDomain = false, roundTo = 200 }) {
   if (!data?.length) {
     return (
       <div className="wb-card p-5">
@@ -22,6 +22,14 @@ function AnalyzerChart({ title, data, lineKey, color, valueFormatter }) {
         <div className="mt-4 text-sm wb-muted">No data available for this chart.</div>
       </div>
     )
+  }
+
+  let yDomain
+  if (tightDomain) {
+    const vals = data.map(r => Number(r[lineKey])).filter(v => isFinite(v))
+    const lo = Math.floor(Math.min(...vals) / roundTo) * roundTo
+    const hi = Math.ceil(Math.max(...vals) / roundTo) * roundTo
+    yDomain = [lo, hi]
   }
 
   return (
@@ -38,6 +46,7 @@ function AnalyzerChart({ title, data, lineKey, color, valueFormatter }) {
               axisLine={false}
               width={82}
               tickFormatter={valueFormatter}
+              domain={yDomain}
             />
             <Tooltip
               formatter={value => [valueFormatter(value), title]}
@@ -45,6 +54,62 @@ function AnalyzerChart({ title, data, lineKey, color, valueFormatter }) {
               labelStyle={{ color: '#b8c7de' }}
             />
             <Line type="monotone" dataKey={lineKey} stroke={color} strokeWidth={2} dot={false} />
+          </LineChart>
+        </ResponsiveContainer>
+      </div>
+    </div>
+  )
+}
+
+function MtmChart({ data, showTrail }) {
+  if (!data?.length) {
+    return (
+      <div className="wb-card p-5">
+        <div className="wb-kicker">Net MTM progression</div>
+        <div className="mt-4 text-sm wb-muted">No data available for this chart.</div>
+      </div>
+    )
+  }
+
+  const vals = data.map(r => r.net_mtm).filter(v => v != null)
+  const trailVals = showTrail ? data.map(r => r.trail_stop).filter(v => v != null) : []
+  const allVals = [...vals, ...trailVals]
+  const lo = Math.floor(Math.min(...allVals) / 1000) * 1000
+  const hi = Math.ceil(Math.max(...allVals) / 1000) * 1000
+
+  return (
+    <div className="wb-card p-5">
+      <div className="flex items-center justify-between mb-1">
+        <div className="wb-kicker">Net MTM progression</div>
+        {showTrail && (
+          <div className="flex items-center gap-3 text-[10px]" style={{ color: 'var(--text-secondary)' }}>
+            <span className="flex items-center gap-1"><span style={{ display: 'inline-block', width: 18, height: 2, background: '#36b37e', borderRadius: 1 }} />MTM</span>
+            <span className="flex items-center gap-1"><span style={{ display: 'inline-block', width: 18, height: 2, background: '#f59e0b', borderRadius: 1, borderTop: '2px dashed #f59e0b' }} />Trail stop</span>
+          </div>
+        )}
+      </div>
+      <div className="mt-3 h-64">
+        <ResponsiveContainer width="100%" height="100%">
+          <LineChart data={data} margin={{ top: 8, right: 8, left: 8, bottom: 0 }}>
+            <CartesianGrid strokeDasharray="3 3" stroke="#213047" vertical={false} />
+            <XAxis dataKey="label" tick={{ fill: '#8090aa', fontSize: 11 }} tickLine={false} axisLine={{ stroke: '#27364b' }} />
+            <YAxis
+              tick={{ fill: '#8090aa', fontSize: 11 }}
+              tickLine={false}
+              axisLine={false}
+              width={88}
+              tickFormatter={v => fmtINR(v)}
+              domain={[lo, hi]}
+            />
+            <Tooltip
+              formatter={(value, name) => [fmtINR(value), name === 'net_mtm' ? 'Net MTM' : 'Trail stop']}
+              contentStyle={{ background: '#0f1726', border: '1px solid #27364b', borderRadius: 12, fontSize: 11 }}
+              labelStyle={{ color: '#b8c7de' }}
+            />
+            <Line type="monotone" dataKey="net_mtm" stroke="#36b37e" strokeWidth={2} dot={false} connectNulls />
+            {showTrail && (
+              <Line type="monotone" dataKey="trail_stop" stroke="#f59e0b" strokeWidth={1.5} strokeDasharray="5 3" dot={false} connectNulls={false} />
+            )}
           </LineChart>
         </ResponsiveContainer>
       </div>
@@ -71,15 +136,21 @@ function StrategyRunAnalyzer({ payload, kind, id, navigate }) {
     [spotSeries]
   )
   const chartMtm = useMemo(
-    () => mtmSeries.map(r => ({ label: timeLabel(r.timestamp), net_mtm: Number(r.net_mtm ?? 0) })),
+    () => mtmSeries.map(r => ({
+      label: timeLabel(r.timestamp),
+      net_mtm: Number(r.net_mtm ?? 0),
+      trail_stop: r.trail_stop_level != null ? Number(r.trail_stop_level) : null,
+    })),
     [mtmSeries]
   )
+
+  const hasTrail = chartMtm.some(r => r.trail_stop != null)
 
   const tone = runStatusTone(run.status)
   const pnl = run.realized_net_pnl
 
   return (
-    <div className="wb-page">
+    <div className="mx-auto max-w-[1360px]" style={{ padding: '18px 20px 24px', fontSize: 12 }}>
       <section className="wb-card p-6">
         <div className="flex items-start justify-between gap-5 flex-wrap">
           <div>
@@ -146,8 +217,8 @@ function StrategyRunAnalyzer({ payload, kind, id, navigate }) {
       </section>
 
       <section className="wb-grid wb-grid-2 mt-6">
-        <AnalyzerChart title="NIFTY spot (1-min)" data={chartSpot} lineKey="spot" color="#38bdf8" valueFormatter={v => fmtNumber(v, 0)} />
-        <AnalyzerChart title="Net MTM progression" data={chartMtm} lineKey="net_mtm" color="#36b37e" valueFormatter={v => fmtINR(v)} />
+        <AnalyzerChart title={`${run.instrument || 'Spot'} (1-min)`} data={chartSpot} lineKey="spot" color="#38bdf8" valueFormatter={v => fmtNumber(v, 0)} tightDomain />
+        <MtmChart data={chartMtm} showTrail={hasTrail} />
       </section>
 
       <section className="wb-card p-5 mt-6">
@@ -262,7 +333,7 @@ export default function ReplayAnalyzer() {
   const backRoute = kind === 'paper_session' ? '/workbench/replay' : session.batch_id ? `/workbench/history/historical_batch/${session.batch_id}` : '/workbench/history'
 
   return (
-    <div className="wb-page">
+    <div className="mx-auto max-w-[1360px]" style={{ padding: '18px 20px 24px', fontSize: 12 }}>
       <section className="wb-card p-6">
         <div className="flex items-start justify-between gap-5 flex-wrap">
           <div>
@@ -324,7 +395,7 @@ export default function ReplayAnalyzer() {
       </section>
 
       <section className="wb-grid wb-grid-2 mt-6">
-        <AnalyzerChart title="Spot progression" data={spotSeries} lineKey="spot" color="#38bdf8" valueFormatter={value => fmtNumber(value, 0)} />
+        <AnalyzerChart title="Spot progression" data={spotSeries} lineKey="spot" color="#38bdf8" valueFormatter={value => fmtNumber(value, 0)} tightDomain />
         <AnalyzerChart title="Net MTM progression" data={pnlSeries} lineKey="pnl" color="#36b37e" valueFormatter={value => fmtINR(value)} />
       </section>
 

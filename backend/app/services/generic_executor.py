@@ -351,9 +351,12 @@ async def execute_run(
     warnings: List[str] = list(validation.warnings)
 
     exit_rule = strategy.get("exit_rule", {})
-    target_pct   = float(exit_rule.get("target_pct", 0.30))
+    target_pct    = float(exit_rule.get("target_pct", 0.30))
     stop_multiple = float(exit_rule.get("stop_multiple", 1.5))
-    sq_time      = _exit_time(config)
+    sq_time       = _exit_time(config)
+    # Trailing stop — activated once net_mtm crosses trail_trigger
+    trail_trigger = float(config.get("trail_trigger") or exit_rule.get("trail_trigger") or 0)
+    trail_pct     = float(config.get("trail_pct")     or exit_rule.get("trail_pct")     or 0)
 
     entry_rule = get_entry_rule(strategy.get("entry_rule_id", "timed_entry"))
 
@@ -388,6 +391,9 @@ async def execute_run(
     entry_charges         = 0.0
     exit_reason: Optional[str] = None
     exit_ts: Optional[datetime] = None
+    # Trailing stop state
+    trail_active = False
+    trail_peak   = 0.0
 
     mtm_rows: List[Dict]      = []
     leg_mtm_rows: List[Dict]  = []
@@ -499,11 +505,24 @@ async def execute_run(
         target_threshold = entry_credit_total * target_pct
         stop_threshold   = -(entry_credit_total * stop_multiple)
 
+        # Trailing stop: activate once net_mtm crosses trail_trigger, then track peak
+        trail_stop_level: Optional[float] = None
+        if trail_trigger > 0 and trail_pct > 0:
+            if not trail_active and net_mtm >= trail_trigger:
+                trail_active = True
+                trail_peak   = net_mtm
+            if trail_active:
+                if net_mtm > trail_peak:
+                    trail_peak = net_mtm
+                trail_stop_level = round(trail_peak * trail_pct, 2)
+
         fired_event: Optional[str] = None
         if net_mtm >= target_threshold:
             fired_event = "TARGET_EXIT"
         elif net_mtm <= stop_threshold:
             fired_event = "STOP_EXIT"
+        elif trail_active and trail_stop_level is not None and net_mtm <= trail_stop_level:
+            fired_event = "TRAIL_EXIT"
         elif t >= sq_time:
             fired_event = "TIME_EXIT"
 
@@ -514,6 +533,7 @@ async def execute_run(
             "gross_mtm": round(gross_mtm_total, 2),
             "est_exit_charges": round(est_exit_charges, 2),
             "net_mtm": round(net_mtm, 2),
+            "trail_stop_level": trail_stop_level,
             "event_code": fired_event,
         })
 
