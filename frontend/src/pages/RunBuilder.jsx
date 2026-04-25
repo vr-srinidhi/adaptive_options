@@ -1,6 +1,6 @@
-import { useEffect, useId, useMemo, useState } from 'react'
+import { useEffect, useId, useMemo, useRef, useState } from 'react'
 import { useNavigate, useSearchParams } from 'react-router-dom'
-import { createWorkbenchRun, getTradingDays, getWorkbenchStrategies } from '../api'
+import { createWorkbenchRun, getTradingDays, getWorkbenchStrategies, validateWorkbenchRun } from '../api'
 import { fmtINR, fmtNumber, strategyStatusTone } from '../utils/workbench'
 
 const RUN_STEPS = ['Strategies', 'Run Builder', 'Replay']
@@ -198,7 +198,9 @@ function buildPreview(strategy, runType, config, readyDays) {
 function orderFields(fields, runType) {
   const order = runType === 'paper_replay'
     ? ['instrument', 'date', 'capital', 'request_token']
-    : ['instrument', 'start_date', 'end_date', 'name', 'capital', 'execution_order', 'autorun']
+    : runType === 'single_session_backtest'
+      ? ['instrument', 'trade_date', 'entry_time', 'capital', 'vix_guardrail_enabled', 'vix_min', 'vix_max']
+      : ['instrument', 'start_date', 'end_date', 'name', 'capital', 'execution_order', 'autorun']
 
   return [...fields].sort((a, b) => {
     const aIndex = order.indexOf(a.key)
@@ -501,7 +503,11 @@ function ReadinessRail({ preview, strategy }) {
 }
 
 function SummaryCard({ canSubmit, submitting, runType, preview, onSubmit }) {
-  const accessibleLabel = runType === 'paper_replay' ? 'Launch replay' : 'Create batch'
+  const accessibleLabel = runType === 'paper_replay'
+    ? 'Launch replay'
+    : runType === 'single_session_backtest'
+      ? 'Run session backtest'
+      : 'Create batch'
   return (
     <div
       className="rounded-[10px] p-4 flex flex-col gap-5"
@@ -577,6 +583,17 @@ function buildPrimaryLayout(runType, fieldMap, preview) {
     ]
   }
 
+  if (runType === 'single_session_backtest') {
+    return [
+      { key: 'instrument', label: 'Instrument', field: fieldMap.instrument },
+      { key: 'trade_date', label: 'Trade Date', field: fieldMap.trade_date },
+      { key: 'entry_time', label: 'Entry Time', field: fieldMap.entry_time },
+      { key: 'capital', label: 'Capital (₹)', field: fieldMap.capital },
+      { key: 'expiry', label: 'Expiry', displayValue: preview.visual.expiryLabel },
+      { key: 'exit_rule', label: 'Exit Rule', displayValue: preview.visual.exitRule },
+    ]
+  }
+
   return [
     { key: 'instrument', label: 'Instrument', field: fieldMap.instrument },
     { key: 'date', label: 'Date', field: fieldMap.date },
@@ -585,6 +602,12 @@ function buildPrimaryLayout(runType, fieldMap, preview) {
     { key: 'capital', label: 'Capital (₹)', field: fieldMap.capital },
     { key: 'exit_rule', label: 'Exit Rule', displayValue: preview.visual.exitRule },
   ]
+}
+
+const MODE_LABELS = {
+  paper_replay: 'Replay',
+  historical_backtest: 'Historical',
+  single_session_backtest: 'Session',
 }
 
 export default function RunBuilder() {
@@ -599,6 +622,9 @@ export default function RunBuilder() {
   const [submitting, setSubmitting] = useState(false)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState(null)
+  const [validation, setValidation] = useState(null)
+  const [validating, setValidating] = useState(false)
+  const validateTimer = useRef(null)
 
   useEffect(() => {
     Promise.all([
@@ -627,6 +653,35 @@ export default function RunBuilder() {
     () => strategies.find(item => item.id === strategyId) || null,
     [strategies, strategyId]
   )
+
+  // Debounced validate call for single_session_backtest runs
+  useEffect(() => {
+    if (runType !== 'single_session_backtest') {
+      setValidation(null)
+      return
+    }
+    if (!config.trade_date || !config.capital) {
+      setValidation(null)
+      return
+    }
+    clearTimeout(validateTimer.current)
+    validateTimer.current = setTimeout(async () => {
+      setValidating(true)
+      try {
+        const res = await validateWorkbenchRun({
+          run_type: 'single_session_backtest',
+          strategy_id: strategyId,
+          config,
+        })
+        setValidation(res.data)
+      } catch (err) {
+        setValidation({ valid: false, error: err.response?.data?.detail || err.message })
+      } finally {
+        setValidating(false)
+      }
+    }, 600)
+    return () => clearTimeout(validateTimer.current)
+  }, [runType, strategyId, config.trade_date, config.entry_time, config.capital, config.instrument, config.vix_guardrail_enabled, config.vix_min, config.vix_max])
 
   const scopedFields = useMemo(() => {
     const schema = (strategy?.params_schema || []).filter(field => !field.modes || field.modes.includes(runType))
@@ -738,18 +793,20 @@ export default function RunBuilder() {
                   onChange={handleRunTypeChange}
                   options={modeOptions.map(mode => ({
                     value: mode,
-                    label: mode === 'paper_replay' ? 'Replay' : 'Historical',
+                    label: MODE_LABELS[mode] || mode,
                   }))}
                 />
               ) : null}
-              <ToggleGroup
-                value={guidedMode ? 'guided' : 'advanced'}
-                onChange={value => setGuidedMode(value === 'guided')}
-                options={[
-                  { value: 'guided', label: 'Guided' },
-                  { value: 'advanced', label: 'Advanced' },
-                ]}
-              />
+              {runType !== 'single_session_backtest' ? (
+                <ToggleGroup
+                  value={guidedMode ? 'guided' : 'advanced'}
+                  onChange={value => setGuidedMode(value === 'guided')}
+                  options={[
+                    { value: 'guided', label: 'Guided' },
+                    { value: 'advanced', label: 'Advanced' },
+                  ]}
+                />
+              ) : null}
             </div>
           </div>
 
@@ -844,6 +901,67 @@ export default function RunBuilder() {
                 </div>
               </div>
             </div>
+
+            {runType === 'single_session_backtest' && (validation || validating) ? (
+              <div
+                className="rounded-[10px] p-4 space-y-3"
+                style={{ background: SURFACE.card, border: `1px solid ${SURFACE.border}` }}
+              >
+                <div className="text-[10px] font-medium uppercase tracking-[0.08em]" style={{ color: SURFACE.muted }}>
+                  Contract Resolution {validating ? '…' : ''}
+                </div>
+                {validating ? (
+                  <div className="text-[10px]" style={{ color: SURFACE.muted }}>Resolving contract…</div>
+                ) : validation?.valid ? (
+                  <div className="space-y-2">
+                    <div className="grid grid-cols-2 gap-x-4 gap-y-1 text-[10px]" style={{ color: SURFACE.text }}>
+                      <span style={{ color: SURFACE.muted }}>ATM Strike</span>
+                      <span className="font-semibold">{validation.atm_strike}</span>
+                      <span style={{ color: SURFACE.muted }}>Expiry</span>
+                      <span className="font-semibold">{validation.expiry}</span>
+                      <span style={{ color: SURFACE.muted }}>Spot at Entry</span>
+                      <span className="font-semibold">{validation.spot_at_entry}</span>
+                      <span style={{ color: SURFACE.muted }}>Lot Size</span>
+                      <span className="font-semibold">{validation.lot_size}</span>
+                      <span style={{ color: SURFACE.muted }}>Approved Lots</span>
+                      <span className="font-semibold">{validation.approved_lots}</span>
+                      <span style={{ color: SURFACE.muted }}>Est. Margin</span>
+                      <span className="font-semibold">{fmtINR(validation.estimated_margin)}</span>
+                    </div>
+                    {validation.contracts?.length ? (
+                      <div className="flex flex-wrap gap-2 pt-1">
+                        {validation.contracts.map((c, i) => {
+                          const side = sideTone(c.side)
+                          const opt = optionTone(c.option_type)
+                          return (
+                            <span
+                              key={i}
+                              className="inline-flex items-center gap-1 rounded px-2 py-1 text-[10px]"
+                              style={{ border: `1px solid ${SURFACE.border}`, background: SURFACE.bg }}
+                            >
+                              <span style={{ color: side.color, fontWeight: 600 }}>{c.side}</span>
+                              <span style={{ color: opt.color }}>{c.option_type}</span>
+                              <span style={{ color: SURFACE.text }}>{c.strike}</span>
+                            </span>
+                          )
+                        })}
+                      </div>
+                    ) : null}
+                    {validation.warnings?.length ? (
+                      <div className="pt-1 space-y-1">
+                        {validation.warnings.map((w, i) => (
+                          <div key={i} className="text-[9px]" style={{ color: SURFACE.amber }}>{w}</div>
+                        ))}
+                      </div>
+                    ) : null}
+                  </div>
+                ) : (
+                  <div className="text-[10px]" style={{ color: SURFACE.red }}>
+                    {validation?.error || 'Validation failed.'}
+                  </div>
+                )}
+              </div>
+            ) : null}
 
             {error ? <div className="wb-alert-error">{error}</div> : null}
             {!canSubmit ? (

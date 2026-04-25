@@ -6,12 +6,13 @@ This file gives Claude Code full context about the project so it can assist effe
 
 ## Project Summary
 
-**Adaptive Options** is a full-stack options backtesting + paper-trading platform for NSE index options (Nifty 50, Bank Nifty). It has four modules:
+**Adaptive Options** is a full-stack options backtesting + paper-trading platform for NSE index options (Nifty 50, Bank Nifty). It has five modules:
 
 1. **Synthetic Backtest** — simulates Iron Condor, Bull Put Spread, and Bear Call Spread strategies using deterministic synthetic candle data with auto-regime detection (EMA/RSI/IV Rank).
 2. **Paper Trading ORB Replay** — replays a real historical trading day using **live Zerodha market data**. Evaluates the Opening Range Breakout (ORB) strategy through a G1–G7 gate stack, records every minute decision, and produces full audit logs + candle data.
 3. **Historical Backtest** — runs the ORB engine against a DB-backed warehouse of real 1-min candle data (spot + options). Batches span multiple trading days; results persist alongside paper trading sessions.
-4. **V2 Workbench** — strategy-agnostic shell (Strategy Catalog → Run Builder → Replay Analyzer → Runs Library) aligned to the product PRD. The ORB executor is the only live strategy; 12 further strategies are catalogued as `planned`/`research`.
+4. **V2 Workbench** — strategy-agnostic shell (Strategy Catalog → Run Builder → Replay Analyzer → Runs Library) aligned to the product PRD. Two executors are live: `orb_v1` (ORB paper/historical) and `generic_v1` (single-session backtest). 11 further strategies are catalogued as `planned`/`research`.
+5. **Generic Strategy Engine** — declarative executor that powers any strategy defined in the catalog via `leg_template` + `entry_rule_id` + `exit_rule`. No new Python files needed to add a strategy. Short Straddle is the first live strategy on this engine.
 
 Scope: **backtesting and paper trading only** — no live order placement.
 
@@ -112,25 +113,30 @@ Adaptive_options/
 │       │   ├── auth.py          ← Zerodha OAuth flow
 │       │   └── users.py         ← user register/login/refresh/logout
 │       └── services/
-│           ├── simulator.py          ← candle gen, EMA, RSI, option pricing, day runner
-│           ├── strategy.py           ← regime detection, leg builder
-│           ├── strategy_config.py    ← central ORB config, build_strategy_snapshot(), latest_weekday()
-│           ├── position_sizer.py     ← 2% capital risk sizing
-│           ├── paper_engine.py       ← ORB replay orchestrator (run_paper_engine / run_paper_engine_core)
-│           ├── entry_gates.py        ← G1–G7 gate stack
-│           ├── exit_engine.py        ← MTM exit conditions
-│           ├── opening_range.py      ← OR computation + candidate spread generators
-│           ├── spread_selector.py    ← ranked candidate selection (Phase 2)
-│           ├── option_resolver.py    ← Zerodha instrument token lookup
-│           ├── zerodha_client.py     ← Zerodha API wrappers
-│           ├── calendar.py           ← NSE trading calendar helpers
-│           ├── batch_runner.py       ← historical batch executor (background task)
-│           ├── historical_ingestion.py  ← CSV → DB ingestion
-│           ├── historical_market_data.py ← load warehouse data for engine
-│           ├── workbench_catalog.py  ← strategy catalog (13 strategies with visual_hints)
-│           ├── workbench_views.py    ← serializers: replay_payload, paper_session_library_item, etc.
-│           ├── token_store.py        ← broker token encrypt/decrypt
-│           └── audit.py              ← audit log helpers
+│           ├── simulator.py              ← candle gen, EMA, RSI, option pricing, day runner
+│           ├── strategy.py               ← regime detection, leg builder
+│           ├── strategy_config.py        ← central ORB config, build_strategy_snapshot(), latest_weekday()
+│           ├── position_sizer.py         ← 2% capital risk sizing
+│           ├── paper_engine.py           ← ORB replay orchestrator (run_paper_engine / run_paper_engine_core)
+│           ├── entry_gates.py            ← G1–G7 gate stack
+│           ├── exit_engine.py            ← MTM exit conditions
+│           ├── opening_range.py          ← OR computation + candidate spread generators
+│           ├── spread_selector.py        ← ranked candidate selection (Phase 2)
+│           ├── option_resolver.py        ← Zerodha instrument token lookup
+│           ├── zerodha_client.py         ← Zerodha API wrappers
+│           ├── calendar.py               ← NSE trading calendar helpers
+│           ├── batch_runner.py           ← historical batch executor (background task)
+│           ├── historical_ingestion.py   ← CSV → DB ingestion
+│           ├── historical_market_data.py ← load warehouse data for engine (incl. load_vix_candles)
+│           ├── workbench_catalog.py      ← strategy catalog (13 strategies with visual_hints)
+│           ├── workbench_views.py        ← serializers: replay_payload, paper_session_library_item, etc.
+│           ├── charges_service.py        ← single source of truth for NSE F&O brokerage charges
+│           ├── contract_spec_service.py  ← lot size, strike step, expiry, ATM strike resolution
+│           ├── entry_rule_registry.py    ← pluggable entry rules (TimedEntryRule; add more here)
+│           ├── generic_executor.py       ← validate_run + execute_run for generic_v1 strategies
+│           ├── strategy_replay_serializer.py ← PRD §13 replay payload for strategy_run kind
+│           ├── token_store.py            ← broker token encrypt/decrypt
+│           └── audit.py                  ← audit log helpers
 └── frontend/
     ├── Dockerfile
     ├── nginx.conf               ← SPA fallback + /api proxy
@@ -236,13 +242,91 @@ The minimum is always 1 lot. Never remove this floor.
 
 `workbench_catalog.py` is the single source of truth for strategy metadata. Each entry contains:
 - `id`, `name`, `bias`, `status` (`available` | `planned` | `research`)
-- `executor` — which backend engine handles it (only `"orb_v1"` is live)
-- `modes` — `paper_replay` and/or `historical_backtest`
+- `executor` — which backend engine handles it (`"orb_v1"` or `"generic_v1"`)
+- `modes` — `paper_replay`, `historical_backtest`, and/or `single_session_backtest`
+- `leg_template` — declarative list of `{side, option_type, strike_offset_steps}` (generic_v1 only)
+- `entry_rule_id` — key into `entry_rule_registry.py` (`"timed_entry"` covers ~38/40 strategies)
+- `exit_rule` — `{target_pct, stop_multiple, time_exit, data_gap_exit}` (generic_v1 only)
 - `params_schema` — field definitions consumed by the Run Builder form
 - `defaults` — live-computed via `_current_replay_defaults()` using `latest_weekday()`
 - `visual_hints` — payoff shape, constraint fields, leg descriptions, metric ratios consumed by `RunBuilder.jsx` via `normalizeVisual()`
 
 `supported_strategy_ids()` returns only `status == "available"` entries. The `create_run` endpoint rejects execution of non-available strategies.
+
+### Generic Strategy Engine (generic_v1)
+
+**Adding a new strategy requires only a catalog entry** — no new Python files:
+
+```python
+{
+    "id": "buy_call",
+    "executor": "generic_v1",
+    "entry_rule_id": "timed_entry",
+    "modes": ["single_session_backtest"],
+    "leg_template": [{"side": "BUY", "option_type": "CE", "strike_offset_steps": 1}],
+    "exit_rule": {"target_pct": 0.50, "stop_multiple": 1.0, "time_exit": "15:25", "data_gap_exit": True},
+    ...
+}
+```
+
+For a conditional entry (e.g., momentum check before entering):
+1. Subclass `BaseEntryRule` in `entry_rule_registry.py`
+2. Register it in `ENTRY_RULES` dict
+3. Set `entry_rule_id` in the catalog entry
+
+### Generic Executor Flow
+
+```
+validate_run(db, strategy, config)
+  ├── trading_day exists + backtest_ready
+  ├── contract spec (lot_size, strike_step) from instrument_contract_specs
+  ├── spot at entry_time → ATM strike
+  ├── resolve nearest expiry with CE + PE data
+  ├── VIX guardrail check (if enabled)
+  └── approved_lots = floor(capital / est_margin_per_lot)
+
+execute_run(db, run_id, strategy, config, validation, user_id)
+  ├── load spot_candles, vix_candles, option_candles from warehouse
+  ├── minute loop:
+  │     entry rule → ENTER or HOLD
+  │     on ENTER: record leg prices, entry_credit, entry_charges
+  │     on HOLD with trade open: compute MTM, check exits
+  │       TARGET_EXIT  net_mtm >= entry_credit_total × target_pct
+  │       STOP_EXIT    net_mtm <= -(entry_credit_total × stop_multiple)
+  │       TIME_EXIT    minute_ts.time() >= time_exit
+  │       DATA_GAP_EXIT  stale_minutes > 1
+  └── persist all 6 tables in a single commit
+```
+
+MTM formula (short strategies):
+```
+gross_mtm_per_unit = Σ (entry_price_i − current_price_i) for SELL legs
+gross_mtm_total    = gross_mtm_per_unit × lot_size × approved_lots
+net_mtm            = gross_mtm_total − entry_charges − est_exit_charges
+```
+
+### Short Straddle — First generic_v1 Strategy
+
+SELL ATM CE + SELL ATM PE at `entry_time`. Profits from premium decay when spot stays range-bound.
+
+| Parameter | Value |
+|-----------|-------|
+| Entry rule | `timed_entry` — enter exactly at `entry_time` |
+| Target exit | 30% of entry credit net |
+| Stop exit | 1.5× entry credit loss |
+| Time exit | 15:25 |
+| Lot sizes | 75 (NIFTY post-Nov 2024), 50 (NIFTY pre-Nov 2024) |
+
+### instrument_contract_specs
+
+Seeded at startup in `init_db()`. Stores lot size history with date ranges so historical backtests use the correct lot size:
+
+| Instrument | From | To | Lot Size | Strike Step |
+|------------|------|----|----------|-------------|
+| NIFTY | 2020-01-01 | 2024-11-20 | 50 | 50 |
+| NIFTY | 2024-11-21 | — | 75 | 50 |
+| BANKNIFTY | 2020-01-01 | 2024-11-20 | 25 | 100 |
+| BANKNIFTY | 2024-11-21 | — | 35 | 100 |
 
 ### build_strategy_snapshot
 
@@ -309,10 +393,11 @@ All under `/api/v2`. Strategy catalog endpoints are intentionally public (no aut
 | GET | `/v2/workspace/summary` | Home metrics, recent runs, data readiness, featured strategies |
 | GET | `/v2/strategies` | Strategy catalog (public) |
 | GET | `/v2/strategies/{id}` | Strategy detail with visual_hints and defaults (public) |
-| GET | `/v2/runs` | Unified run list: paper_session + historical_batch (`kind`, `limit`, `offset`) |
-| POST | `/v2/runs` | Create and execute a run (`run_type`, `strategy_id`, `config`) |
-| GET | `/v2/runs/{kind}/{id}` | Run detail; `kind` ∈ `paper_session`, `historical_batch`, `historical_session` |
-| GET | `/v2/runs/{kind}/{id}/replay` | Full replay payload: session, trade, decisions, marks, candle_series, explainability |
+| GET | `/v2/runs` | Unified run list: `paper_session`, `historical_batch`, `strategy_run` (`kind`, `limit`, `offset`) |
+| POST | `/v2/runs` | Create and execute a run (`run_type` ∈ `paper_replay`, `historical_backtest`, `single_session_backtest`) |
+| POST | `/v2/runs/validate` | Dry-run validation — resolves contract, expiry, lots; no DB writes |
+| GET | `/v2/runs/{kind}/{id}` | Run detail; `kind` ∈ `paper_session`, `historical_batch`, `historical_session`, `strategy_run` |
+| GET | `/v2/runs/{kind}/{id}/replay` | Full replay payload; `strategy_run` kind returns PRD §13 shape |
 | GET | `/v2/runs/compare` | Compare up to 4 runs by comma-separated `refs` (`kind:uuid,...`) |
 
 ### Zerodha Auth
@@ -365,6 +450,17 @@ JSONB columns: `legs` (option leg objects), `min_data` (`{time, spot, pnl}` per 
 | `futures_candles` | 1-min OHLCV+OI for NIFTY futures |
 | `options_candles` | 1-min OHLCV+ltp+OI for NIFTY options (~67 M rows); lookup index on `(trade_date, expiry_date, option_type, strike, timestamp)` |
 | `session_batches` | Groups multiple historical backtest sessions into one batch run |
+
+### Generic Strategy Engine (7 tables)
+
+| Table | Description |
+|-------|-------------|
+| `instrument_contract_specs` | Lot size + strike step history per instrument (date-range aware; seeded at startup) |
+| `strategy_runs` | One row per `single_session_backtest` run — header, capital, P&L, status |
+| `strategy_run_legs` | One row per option leg — entry/exit prices, gross P&L |
+| `strategy_run_mtm` | One row per minute while trade is open — spot, VIX, gross/net MTM |
+| `strategy_leg_mtm` | One row per leg per minute — individual leg price + stale_minutes |
+| `strategy_run_events` | ENTRY, EXIT, HOLD, NO_TRADE events with payload JSON |
 
 ---
 
@@ -471,6 +567,9 @@ The runtime `create_all` + idempotent `ALTER TABLE IF NOT EXISTS` in `init_db()`
 - `build_strategy_snapshot()` signature in `strategy_config.py` — both `backtests.py` and `workbench.py` depend on it; the snapshot schema is stored in DB
 - `_STRATEGIES` list in `workbench_catalog.py` — strategy IDs are stored in `strategy_config_snapshot` JSONB in the DB; renaming an `id` will break `resolve_strategy_identity()` lookups on old rows
 - `visual_hints` keys in `workbench_catalog.py` — `RunBuilder.jsx::normalizeVisual()` maps snake_case keys directly; renaming requires updating both files
+- `leg_template` / `exit_rule` keys in `workbench_catalog.py` — `generic_executor.py` reads these directly by name
+- `instrument_contract_specs` seed in `database.py` — date ranges must be accurate; the Nov-2024 lot size change (50→75 NIFTY, 25→35 BANKNIFTY) is baked in
+- `_MAX_STALE_MINUTES = 1` in `generic_executor.py` — controls DATA_GAP_EXIT sensitivity; changing affects all generic_v1 strategies
 
 ---
 
@@ -527,6 +626,24 @@ curl -s -X POST http://localhost:8000/api/v2/runs \
   -H "Authorization: Bearer <token>" \
   -H "Content-Type: application/json" \
   -d '{"run_type":"paper_replay","strategy_id":"orb_intraday_spread","config":{"instrument":"NIFTY","date":"2026-04-07","capital":2500000}}' \
+  | python3 -m json.tool
+```
+
+### Validate a Short Straddle session (dry-run, no DB writes)
+```bash
+curl -s -X POST http://localhost:8000/api/v2/runs/validate \
+  -H "Authorization: Bearer <token>" \
+  -H "Content-Type: application/json" \
+  -d '{"run_type":"single_session_backtest","strategy_id":"short_straddle","config":{"instrument":"NIFTY","trade_date":"2026-04-07","entry_time":"09:50","capital":500000}}' \
+  | python3 -m json.tool
+```
+
+### Run a Short Straddle single-session backtest
+```bash
+curl -s -X POST http://localhost:8000/api/v2/runs \
+  -H "Authorization: Bearer <token>" \
+  -H "Content-Type: application/json" \
+  -d '{"run_type":"single_session_backtest","strategy_id":"short_straddle","config":{"instrument":"NIFTY","trade_date":"2026-04-07","entry_time":"09:50","capital":500000,"vix_guardrail_enabled":true,"vix_min":14,"vix_max":22}}' \
   | python3 -m json.tool
 ```
 

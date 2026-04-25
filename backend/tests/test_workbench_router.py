@@ -78,6 +78,9 @@ class FakeDB:
                 rows = rows[:limit]
             return _ExecuteResult(rows=rows)
 
+        if "FROM strategy_runs" in sql:
+            return _ExecuteResult(rows=[])
+
         raise AssertionError(f"Unexpected query in fake DB: {sql}")
 
 

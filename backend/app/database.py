@@ -34,6 +34,7 @@ async def init_db():
     from app.models import broker_token as _bt  # noqa
     from app.models import audit_log as _al  # noqa
     from app.models import historical as _hist  # noqa
+    from app.models import strategy_run as _sr  # noqa
 
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
@@ -141,4 +142,31 @@ async def init_db():
                     f"ALTER TABLE {table} ADD CONSTRAINT {constraint} "
                     f"UNIQUE ({cols})"
                 ))
+
+        # ── Seed instrument_contract_specs ────────────────────────────────────
+        # Idempotent: INSERT ... ON CONFLICT DO NOTHING so re-runs are safe.
+        # NSE changed NIFTY lot size 50→75 in Nov 2024; both rows are seeded.
+        from datetime import date as _date
+        for row in [
+            # (instrument, effective_from, effective_to, lot_size, strike_step, weekly_expiry_weekday, est_margin)
+            ("NIFTY",    _date(2020, 1, 1),  _date(2024, 11, 20), 50,  50,  3, 90000.00),
+            ("NIFTY",    _date(2024, 11, 21), None,               75,  50,  3, 180000.00),
+            ("BANKNIFTY",_date(2020, 1, 1),  _date(2024, 11, 20), 25, 100,  2, 75000.00),
+            ("BANKNIFTY",_date(2024, 11, 21), None,               35, 100,  2, 105000.00),
+        ]:
+            await conn.execute(_sa_text(
+                "INSERT INTO instrument_contract_specs "
+                "(instrument, effective_from, effective_to, lot_size, strike_step, "
+                " weekly_expiry_weekday, estimated_margin_per_lot) "
+                "VALUES (:inst, :from_, :to_, :ls, :ss, :wed, :margin) "
+                "ON CONFLICT DO NOTHING"
+            ), {
+                "inst":   row[0],
+                "from_":  row[1],
+                "to_":    row[2],
+                "ls":     row[3],
+                "ss":     row[4],
+                "wed":    row[5],
+                "margin": row[6],
+            })
 

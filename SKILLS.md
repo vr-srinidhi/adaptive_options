@@ -8,9 +8,10 @@ Technical reference for all strategies implemented or catalogued in Adaptive Opt
 
 ### Live Strategies (V2 Workbench)
 
-| ID | Name | Module | Bias | Status |
-|----|------|--------|------|--------|
-| `orb_intraday_spread` | Opening Range Spread | Paper Replay / Historical Batch | Directional | **available** |
+| ID | Name | Executor | Run Type | Bias | Status |
+|----|------|----------|----------|------|--------|
+| `orb_intraday_spread` | Opening Range Spread | `orb_v1` | paper_replay / historical_backtest | Directional | **available** |
+| `short_straddle` | Short Straddle | `generic_v1` | single_session_backtest | Neutral | **available** |
 
 ### Synthetic Backtest Strategies
 
@@ -22,21 +23,22 @@ Technical reference for all strategies implemented or catalogued in Adaptive Opt
 
 ### Catalogued Strategies (Planned / Research)
 
-The workbench catalog (`workbench_catalog.py`) lists 13 strategies total. Only `orb_intraday_spread` is currently `available`; the rest are `planned` or `research`.
+The workbench catalog (`workbench_catalog.py`) lists 13 strategies total. Two are `available`; the rest are `planned` or `research`. Adding any of the planned strategies requires only a catalog entry — `generic_executor.py` handles execution.
 
-| Name | Bias | Status |
-|------|------|--------|
-| Opening Range Spread | Directional | available |
-| Iron Condor | Neutral | planned |
-| Bull Put Spread | Bullish | planned |
-| Bear Call Spread | Bearish | planned |
-| Long Straddle | Neutral (high vol) | planned |
-| Short Strangle | Neutral (low vol) | planned |
-| Calendar Spread | Time decay | research |
-| Ratio Back Spread | Directional | research |
-| Butterfly | Neutral (tight range) | research |
-| Jade Lizard | Bullish slight | research |
-| … | … | planned/research |
+| Name | Bias | Executor | Status |
+|------|------|----------|--------|
+| Opening Range Spread | Directional | orb_v1 | available |
+| Short Straddle | Neutral | generic_v1 | **available** |
+| Iron Condor | Neutral | generic_v1 | planned |
+| Bull Put Spread | Bullish | generic_v1 | planned |
+| Bear Call Spread | Bearish | generic_v1 | planned |
+| Long Straddle | Neutral (high vol) | generic_v1 | planned |
+| Short Strangle | Neutral (low vol) | generic_v1 | planned |
+| Calendar Spread | Time decay | generic_v1 | research |
+| Ratio Back Spread | Directional | generic_v1 | research |
+| Butterfly | Neutral (tight range) | generic_v1 | research |
+| Jade Lizard | Bullish slight | generic_v1 | research |
+| … | … | generic_v1 | planned/research |
 
 ---
 
@@ -98,6 +100,126 @@ exchange   = 0.053% × total premium turnover × qty
 GST        = 18%    × (brokerage + exchange)
 net_pnl    = gross_pnl − total_charges
 ```
+
+---
+
+## Generic Strategy Engine
+
+### Architecture
+
+Any strategy expressed as `leg_template + entry_rule_id + exit_rule` in the catalog runs on `generic_executor.py` with zero custom code. Adding a strategy = adding a catalog entry.
+
+```python
+# Example: Iron Condor on generic_v1
+{
+    "leg_template": [
+        {"side": "SELL", "option_type": "PE", "strike_offset_steps": -2},
+        {"side": "BUY",  "option_type": "PE", "strike_offset_steps": -4},
+        {"side": "SELL", "option_type": "CE", "strike_offset_steps":  2},
+        {"side": "BUY",  "option_type": "CE", "strike_offset_steps":  4},
+    ],
+    "entry_rule_id": "timed_entry",
+    "exit_rule": {"target_pct": 0.45, "stop_multiple": 2.0, "time_exit": "15:25", "data_gap_exit": True},
+}
+```
+
+### Entry Rules (`entry_rule_registry.py`)
+
+| Rule ID | Class | Behaviour |
+|---------|-------|-----------|
+| `timed_entry` | `TimedEntryRule` | Enter exactly at `config["entry_time"]`; HOLD before, NO_TRADE after |
+
+To add a conditional entry rule: subclass `BaseEntryRule`, implement `evaluate(minute_ts, config, *, trade_open) → EntrySignal`, register in `ENTRY_RULES` dict.
+
+### Exit Conditions
+
+| Code | Trigger | Formula |
+|------|---------|---------|
+| `TARGET_EXIT` | Profit target hit | `net_mtm >= entry_credit_total × target_pct` |
+| `STOP_EXIT` | Loss limit hit | `net_mtm <= -(entry_credit_total × stop_multiple)` |
+| `TIME_EXIT` | Square-off time reached | `minute_ts.time() >= exit_rule["time_exit"]` |
+| `DATA_GAP_EXIT` | Stale option prices | any leg stale > 1 minute (configurable via `_MAX_STALE_MINUTES`) |
+
+### MTM Formula (short positions)
+
+```
+gross_mtm_per_unit = Σ (entry_price_i − current_price_i)   for each SELL leg
+gross_mtm_total    = gross_mtm_per_unit × lot_size × approved_lots
+est_exit_charges   = compute_exit_charges_estimate(lots, lot_size, current_prices)
+net_mtm            = gross_mtm_total − entry_charges − est_exit_charges
+```
+
+### Charges Service (`charges_service.py`)
+
+Single source of truth for NSE F&O brokerage. Used by both generic executor and ORB engine.
+
+```
+brokerage  = N_orders × ₹20           (₹20 flat per order, Zerodha)
+STT        = 0.05%  × sell premium × qty   (sell-side only)
+exchange   = 0.053% × total premium × qty
+GST        = 18%    × (brokerage + exchange)
+total      = brokerage + STT + exchange + GST
+```
+
+### Lot Size History (`instrument_contract_specs`)
+
+NSE changed NIFTY lot size in Nov 2024. The engine reads from the DB for historical accuracy:
+
+| Instrument | Period | Lot Size | Strike Step |
+|------------|--------|----------|-------------|
+| NIFTY | up to 2024-11-20 | 50 | 50 |
+| NIFTY | 2024-11-21 onwards | 75 | 50 |
+| BANKNIFTY | up to 2024-11-20 | 25 | 100 |
+| BANKNIFTY | 2024-11-21 onwards | 35 | 100 |
+
+---
+
+## Short Straddle Strategy
+
+### Concept
+
+Sell both ATM Call and ATM Put simultaneously. Collect premium from both sides; profit if spot stays range-bound until exit. Unlimited theoretical risk if spot moves sharply.
+
+```
+Payoff at expiry
+        ▲ Profit
+        │    /\
+        │   /  \
+────────┼──/────\──────── Spot
+        │ /      \
+        │/        \
+       Loss (unlimited)
+ATM-x  ATM     ATM+x
+```
+
+### Legs
+
+| Action | Type | Strike | Rationale |
+|--------|------|--------|-----------|
+| SELL | CE | ATM | Collect call premium; profit if spot ≤ ATM at exit |
+| SELL | PE | ATM | Collect put premium; profit if spot ≥ ATM at exit |
+
+ATM = `round(spot_at_entry / strike_step) * strike_step`
+
+### Parameters
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `trade_date` | latest weekday | Date to run the session on |
+| `entry_time` | `09:50` | Minute to enter — must have spot + both option prices |
+| `capital` | — | Required; approved_lots = floor(capital / est_margin_per_lot) |
+| `vix_guardrail_enabled` | `true` | Skip trade if VIX outside [vix_min, vix_max] |
+| `vix_min` | 14 | Minimum VIX to allow entry |
+| `vix_max` | 22 | Maximum VIX to allow entry |
+
+### Exit Conditions
+
+| Condition | Trigger |
+|-----------|---------|
+| `TARGET_EXIT` | net_mtm ≥ 30% of entry credit |
+| `STOP_EXIT` | net_mtm ≤ −150% of entry credit |
+| `TIME_EXIT` | 15:25 |
+| `DATA_GAP_EXIT` | option price stale > 1 minute |
 
 ---
 
@@ -327,6 +449,9 @@ This is why IV Rank drives strategy selection — you want to sell premium when 
 | Backend | pytest | `test_router_helpers.py` | `_trading_days`, `_to_dict` helpers |
 | Backend | pytest | `test_workbench_services.py` | Catalog list/get, `visual_hints`, `resolve_strategy_identity`, `replay_payload` |
 | Backend | pytest | `test_workbench_router.py` | HTTP-level `/api/v2/*` endpoints via ASGI transport |
+| Backend | pytest | `test_contract_spec_service.py` | ATM strike rounding (incl. banker's rounding edge cases), leg template expansion |
+| Backend | pytest | `test_charges_service.py` | Brokerage math: entry/exit/total charges, STT, GST, monotonicity |
+| Backend | pytest | `test_generic_executor.py` | `validate_run` (7 tests) + `execute_run` (6 tests) via async fake DB and service patches |
 | Frontend | Vitest | `TopNav.test.jsx` | Primary + legacy nav links, workbench visibility rules, active state |
 | Frontend | Vitest | `Backtest.test.jsx` | Form, API call, loading state |
 | Frontend | Vitest | `Dashboard.test.jsx` | Data render, navigation, empty/error states |
@@ -354,12 +479,17 @@ CI/CD is handled by GitHub Actions (`.github/workflows/ci.yml`): tests gate ever
 
 ## Lot Sizes & Tick Sizes (NSE)
 
-| Index | Lot Size | Tick Size | ATM strike spacing |
-|-------|----------|-----------|-------------------|
-| Nifty 50 | 50 | ₹50 | ₹50 per tick |
-| Bank Nifty | 25 | ₹100 | ₹100 per tick |
+NSE revised lot sizes in November 2024. The engine reads from `instrument_contract_specs` for historical accuracy.
 
-Strike selection always snaps to the nearest valid tick:
+| Index | Period | Lot Size | Strike Step |
+|-------|--------|----------|-------------|
+| Nifty 50 | up to 2024-11-20 | 50 | 50 |
+| Nifty 50 | 2024-11-21 onwards | **75** | 50 |
+| Bank Nifty | up to 2024-11-20 | 25 | 100 |
+| Bank Nifty | 2024-11-21 onwards | **35** | 100 |
+
+Strike selection always snaps to the nearest valid step:
 ```python
-atm = round(spot / tick_size) * tick_size
+atm = round(spot / strike_step) * strike_step
 ```
+Python's `round()` uses banker's rounding (round-half-to-even). Test cases must avoid exact midpoints to prevent ambiguous assertions.

@@ -22,14 +22,26 @@ from app.models.paper_trade import (
     PaperTradeLeg,
     PaperTradeMinuteMark,
 )
+from app.models.strategy_run import (
+    StrategyLegMtm,
+    StrategyRun,
+    StrategyRunEvent,
+    StrategyRunLeg,
+    StrategyRunMtm,
+)
 from app.models.user import User
 from app.services import zerodha_client
 from app.services.audit import log_event
+from app.services.generic_executor import execute_run, validate_run
 from app.services.paper_engine import run_paper_engine
 from app.services.strategy_config import (
     WORKBENCH_STRATEGY_ID,
     WORKBENCH_STRATEGY_NAME,
     build_strategy_snapshot,
+)
+from app.services.strategy_replay_serializer import (
+    strategy_run_library_item,
+    strategy_run_replay_payload,
 )
 from app.services.token_store import get_broker_token, store_broker_token
 from app.services.workbench_catalog import get_strategy, list_strategies, supported_strategy_ids
@@ -47,7 +59,7 @@ router = APIRouter(prefix="/api/v2", tags=["workbench-v2"])
 
 
 class CreateRunRequest(BaseModel):
-    run_type: str = Field(..., pattern="^(paper_replay|historical_backtest)$")
+    run_type: str = Field(..., pattern="^(paper_replay|historical_backtest|single_session_backtest)$")
     strategy_id: str
     config: dict[str, Any]
 
@@ -180,7 +192,7 @@ async def get_strategy_detail(strategy_id: str):
 
 @router.get("/runs")
 async def list_runs(
-    kind: Optional[str] = Query(None, pattern="^(paper_session|historical_batch)$"),
+    kind: Optional[str] = Query(None, pattern="^(paper_session|historical_batch|strategy_run)$"),
     limit: int = Query(40, ge=1, le=200),
     offset: int = Query(0, ge=0),
     db: AsyncSession = Depends(get_db),
@@ -202,9 +214,7 @@ async def list_runs(
             paper_query = paper_query.offset(offset).limit(limit)
         else:
             paper_query = paper_query.limit(fetch_limit)
-        paper_rows = (await db.execute(
-            paper_query
-        )).scalars().all()
+        paper_rows = (await db.execute(paper_query)).scalars().all()
         trade_by_session = {}
         if paper_rows:
             trade_rows = (await db.execute(
@@ -223,10 +233,21 @@ async def list_runs(
             batch_query = batch_query.offset(offset).limit(limit)
         else:
             batch_query = batch_query.limit(fetch_limit)
-        batch_rows = (await db.execute(
-            batch_query
-        )).scalars().all()
+        batch_rows = (await db.execute(batch_query)).scalars().all()
         items.extend(historical_batch_library_item(row) for row in batch_rows)
+
+    if kind in (None, "strategy_run"):
+        sr_query = (
+            select(StrategyRun)
+            .where(StrategyRun.user_id == current_user.id)
+            .order_by(StrategyRun.created_at.desc())
+        )
+        if kind == "strategy_run":
+            sr_query = sr_query.offset(offset).limit(limit)
+        else:
+            sr_query = sr_query.limit(fetch_limit)
+        sr_rows = (await db.execute(sr_query)).scalars().all()
+        items.extend(strategy_run_library_item(row) for row in sr_rows)
 
     items.sort(key=lambda item: item.get("created_at") or "", reverse=True)
     if kind is None:
@@ -374,6 +395,28 @@ async def create_run(
             "navigate_to": f"/workbench/replay/paper_session/{session_id}",
         }
 
+    if body.run_type == "single_session_backtest":
+        validation = await validate_run(db, strategy, config)
+        if validation.error:
+            raise HTTPException(status_code=422, detail=validation.error)
+
+        run_id = uuid.uuid4()
+        result = await execute_run(db, run_id, strategy, config, validation, current_user.id)
+
+        if result.status == "ERROR":
+            raise HTTPException(status_code=500, detail=result.exit_reason or "Execution failed.")
+
+        run_row = (await db.execute(
+            select(StrategyRun).where(StrategyRun.id == run_id)
+        )).scalar_one_or_none()
+        if run_row is None:
+            raise HTTPException(status_code=500, detail="Run record not found after execution.")
+
+        return {
+            "run": strategy_run_library_item(run_row),
+            "navigate_to": f"/workbench/replay/strategy_run/{run_id}",
+        }
+
     instrument = str(config.get("instrument", "NIFTY")).strip().upper()
     if instrument not in ("NIFTY", "BANKNIFTY"):
         raise HTTPException(status_code=400, detail="instrument must be NIFTY or BANKNIFTY.")
@@ -426,6 +469,42 @@ async def create_run(
     return {
         "run": historical_batch_library_item(batch),
         "navigate_to": f"/workbench/history/historical_batch/{batch.id}",
+    }
+
+
+@router.post("/runs/validate")
+async def validate_run_endpoint(
+    body: CreateRunRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_active_user),
+):
+    """Dry-run validation: resolves contract, expiry, spot, lots — no DB writes."""
+    if body.run_type != "single_session_backtest":
+        raise HTTPException(status_code=422, detail="Validation is only supported for single_session_backtest runs.")
+
+    strategy = get_strategy(body.strategy_id)
+    if strategy is None:
+        raise HTTPException(status_code=404, detail="Strategy not found.")
+    if body.strategy_id not in supported_strategy_ids():
+        raise HTTPException(status_code=422, detail="Strategy is catalogued but not executable yet.")
+
+    validation = await validate_run(db, strategy, body.config or {})
+    if validation.error:
+        raise HTTPException(status_code=422, detail=validation.error)
+
+    return {
+        "valid": True,
+        "instrument": validation.instrument,
+        "trade_date": validation.trade_date,
+        "entry_time": validation.entry_time,
+        "expiry": validation.resolved_expiry,
+        "atm_strike": validation.atm_strike,
+        "spot_at_entry": validation.spot_at_entry,
+        "lot_size": validation.lot_size,
+        "approved_lots": validation.approved_lots,
+        "estimated_margin": validation.estimated_margin,
+        "contracts": validation.contracts or [],
+        "warnings": validation.warnings or [],
     }
 
 
@@ -500,6 +579,18 @@ async def get_run_detail(
             }
         }
 
+    if kind == "strategy_run":
+        run_id = _parse_uuid(item_id)
+        run_row = (await db.execute(
+            select(StrategyRun).where(
+                StrategyRun.id == run_id,
+                StrategyRun.user_id == current_user.id,
+            )
+        )).scalar_one_or_none()
+        if run_row is None:
+            raise HTTPException(status_code=404, detail="Run not found.")
+        return {"run": strategy_run_library_item(run_row)}
+
     raise HTTPException(status_code=404, detail="Unsupported run kind.")
 
 
@@ -510,6 +601,40 @@ async def get_run_replay(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_active_user),
 ):
+    if kind == "strategy_run":
+        run_id = _parse_uuid(item_id)
+        run_row = (await db.execute(
+            select(StrategyRun).where(
+                StrategyRun.id == run_id,
+                StrategyRun.user_id == current_user.id,
+            )
+        )).scalar_one_or_none()
+        if run_row is None:
+            raise HTTPException(status_code=404, detail="Run not found.")
+
+        legs = (await db.execute(
+            select(StrategyRunLeg)
+            .where(StrategyRunLeg.run_id == run_id)
+            .order_by(StrategyRunLeg.leg_index)
+        )).scalars().all()
+        mtm_rows = (await db.execute(
+            select(StrategyRunMtm)
+            .where(StrategyRunMtm.run_id == run_id)
+            .order_by(StrategyRunMtm.timestamp)
+        )).scalars().all()
+        leg_mtm_rows = (await db.execute(
+            select(StrategyLegMtm)
+            .where(StrategyLegMtm.run_id == run_id)
+            .order_by(StrategyLegMtm.timestamp)
+        )).scalars().all()
+        events = (await db.execute(
+            select(StrategyRunEvent)
+            .where(StrategyRunEvent.run_id == run_id)
+            .order_by(StrategyRunEvent.timestamp)
+        )).scalars().all()
+
+        return strategy_run_replay_payload(run_row, legs, mtm_rows, leg_mtm_rows, events)
+
     if kind not in {"paper_session", "historical_session"}:
         raise HTTPException(status_code=404, detail="Replay is only available for session-level runs.")
 
