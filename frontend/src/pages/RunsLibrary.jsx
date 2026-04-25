@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useNavigate, useSearchParams } from 'react-router-dom'
 import { compareWorkbenchRuns, getWorkbenchRuns } from '../api'
 import { fmtDateTime, fmtINR, fmtShortDate, runKindLabel, runStatusTone } from '../utils/workbench'
@@ -112,11 +112,38 @@ export default function RunsLibrary() {
   const [selectedRefs, setSelectedRefs] = useState([])
   const [compareItems, setCompareItems] = useState([])
   const [loading, setLoading] = useState(true)
+  const [loadingMore, setLoadingMore] = useState(false)
   const [comparing, setComparing] = useState(false)
   const [error, setError] = useState(null)
+  const sentinelRef = useRef(null)
 
+  // Initial load + kind filter change: reset list
   useEffect(() => {
     setLoading(true)
+    setError(null)
+    setRuns([])
+    setPage(0)
+    setHasMore(false)
+    const params = {
+      limit: PAGE_SIZE + 1,
+      offset: 0,
+      ...(kind !== 'all' ? { kind } : {}),
+    }
+    getWorkbenchRuns(params)
+      .then(res => {
+        const allRows = res.data.runs || []
+        const nextRuns = allRows.slice(0, PAGE_SIZE)
+        setHasMore(allRows.length > PAGE_SIZE)
+        setRuns(nextRuns)
+      })
+      .catch(err => setError(err.response?.data?.detail || err.message))
+      .finally(() => setLoading(false))
+  }, [kind])
+
+  // Subsequent pages: append to list
+  useEffect(() => {
+    if (page === 0) return
+    setLoadingMore(true)
     setError(null)
     const params = {
       limit: PAGE_SIZE + 1,
@@ -128,17 +155,30 @@ export default function RunsLibrary() {
         const allRows = res.data.runs || []
         const nextRuns = allRows.slice(0, PAGE_SIZE)
         setHasMore(allRows.length > PAGE_SIZE)
-        setRuns(nextRuns)
-        setSelectedRefs(prev => prev.filter(ref => nextRuns.some(item => `${item.kind}:${item.id}` === ref)))
+        setRuns(prev => [...prev, ...nextRuns])
       })
       .catch(err => setError(err.response?.data?.detail || err.message))
-      .finally(() => setLoading(false))
-  }, [kind, page])
+      .finally(() => setLoadingMore(false))
+  }, [page]) // eslint-disable-line react-hooks/exhaustive-deps
 
-  const handleKindChange = (nextKind) => {
+  // IntersectionObserver: increment page when sentinel comes into view
+  useEffect(() => {
+    if (!sentinelRef.current) return
+    const observer = new IntersectionObserver(
+      entries => {
+        if (entries[0].isIntersecting && hasMore && !loadingMore && !loading) {
+          setPage(p => p + 1)
+        }
+      },
+      { threshold: 0.1 }
+    )
+    observer.observe(sentinelRef.current)
+    return () => observer.disconnect()
+  }, [hasMore, loadingMore, loading])
+
+  const handleKindChange = useCallback((nextKind) => {
     setKind(nextKind)
-    setPage(0)
-  }
+  }, [])
 
   useEffect(() => {
     if (selectedRefs.length < 2) {
@@ -192,7 +232,7 @@ export default function RunsLibrary() {
               Runs Library
             </div>
             <div style={{ fontSize: 10, color: PALETTE.muted }}>
-              {filtered.length} runs on page {page + 1}{hasMore ? '+' : ''} · select 2 or more for compare
+              {runs.length} loaded{hasMore ? ' · scroll for more' : ' · all loaded'} · select 2 or more for compare
             </div>
           </div>
 
@@ -411,58 +451,38 @@ export default function RunsLibrary() {
 
             <div
               style={{
-                padding: '6px 12px',
+                padding: '5px 12px',
                 fontSize: 9,
                 color: '#64748b',
                 borderTop: `0.5px solid ${PALETTE.border}`,
                 display: 'flex',
-                alignItems: 'center',
                 justifyContent: 'space-between',
-                gap: 8,
               }}
             >
               <span>Click a row action to open replay or detail view. Compare supports up to 4 runs.</span>
-              <div className="flex items-center gap-2">
-                <span>{filtered.length} rows</span>
-                <button
-                  type="button"
-                  disabled={page === 0}
-                  onClick={() => setPage(p => p - 1)}
-                  style={{
-                    padding: '3px 10px',
-                    borderRadius: 5,
-                    background: page === 0 ? '#1e293b' : PALETTE.card,
-                    border: `1px solid ${PALETTE.border}`,
-                    color: page === 0 ? '#475569' : PALETTE.blue,
-                    fontSize: 9,
-                    fontWeight: 600,
-                    cursor: page === 0 ? 'default' : 'pointer',
-                  }}
-                >
-                  ← Prev
-                </button>
-                <span style={{ minWidth: 52, textAlign: 'center' }}>
-                  Page {page + 1}
-                </span>
-                <button
-                  type="button"
-                  disabled={!hasMore}
-                  onClick={() => setPage(p => p + 1)}
-                  style={{
-                    padding: '3px 10px',
-                    borderRadius: 5,
-                    background: !hasMore ? '#1e293b' : PALETTE.card,
-                    border: `1px solid ${PALETTE.border}`,
-                    color: !hasMore ? '#475569' : PALETTE.blue,
-                    fontSize: 9,
-                    fontWeight: 600,
-                    cursor: !hasMore ? 'default' : 'pointer',
-                  }}
-                >
-                  Next →
-                </button>
-              </div>
+              <span>{filtered.length} rows shown</span>
             </div>
+
+            {/* Infinite scroll sentinel */}
+            <div ref={sentinelRef} style={{ height: 1 }} />
+
+            {loadingMore && (
+              <div
+                className="flex items-center justify-center gap-2"
+                style={{ padding: '10px 0', fontSize: 10, color: PALETTE.muted }}
+              >
+                <span className="spinner" /> Loading more…
+              </div>
+            )}
+
+            {!hasMore && !loading && runs.length > 0 && (
+              <div
+                className="text-center"
+                style={{ padding: '8px 0', fontSize: 9, color: '#334155' }}
+              >
+                All {runs.length} runs loaded
+              </div>
+            )}
           </section>
         )}
       </div>
