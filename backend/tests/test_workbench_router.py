@@ -235,5 +235,6 @@ def test_list_runs_supports_offset_pagination_over_http():
 
     assert status_code == 200
     runs = payload["runs"]
-    assert [item["id"] for item in runs] == [str(batch_a.id), str(session_b.id)]
+    # sort is date_label desc; session_b "2026-04-06" sorts above batch_a "2026-04-01 – 2026-04-07"
+    assert [item["id"] for item in runs] == [str(session_b.id), str(batch_a.id)]
     assert runs[0]["strategy_name"] == "Opening Range Spread"

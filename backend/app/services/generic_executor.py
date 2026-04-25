@@ -393,6 +393,7 @@ async def execute_run(
     entry_charges         = 0.0
     exit_reason: Optional[str] = None
     exit_ts: Optional[datetime] = None
+    actual_entry_ts: Optional[datetime] = None   # actual minute trade opened (may differ from configured entry_time in grace window)
     # Trailing stop state
     trail_active       = False
     trail_peak         = 0.0
@@ -439,6 +440,7 @@ async def execute_run(
                     continue
 
                 trade_open = True
+                actual_entry_ts = ts
                 entry_prices = list(cur_prices)
 
                 # Only SELL legs contribute to entry credit for short strategies
@@ -523,12 +525,14 @@ async def execute_run(
                 trail_stop_level = round(trail_peak * trail_pct, 2)
 
         fired_event: Optional[str] = None
-        if net_mtm >= target_threshold:
-            fired_event = "TARGET_EXIT"
-        elif net_mtm <= stop_threshold:
+        if net_mtm <= stop_threshold:
             fired_event = "STOP_EXIT"
         elif trail_active and trail_stop_level is not None and net_mtm <= trail_stop_level:
             fired_event = "TRAIL_EXIT"
+        elif trail_trigger == 0 and net_mtm >= target_threshold:
+            # TARGET_EXIT is suppressed when a trailing stop is configured —
+            # the trail manages the profit exit so the position can run past target.
+            fired_event = "TARGET_EXIT"
         elif t >= sq_time:
             fired_event = "TIME_EXIT"
 
@@ -624,7 +628,7 @@ async def execute_run(
         executor=strategy.get("executor", "generic_v1"),
         instrument=instrument,
         trade_date=trade_date,
-        entry_time=validation.entry_time if trade_open else None,
+        entry_time=actual_entry_ts.strftime("%H:%M") if actual_entry_ts else None,
         exit_time=exit_ts.strftime("%H:%M") if exit_ts else None,
         status=status,
         exit_reason=exit_reason,

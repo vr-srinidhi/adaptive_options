@@ -661,8 +661,10 @@ async def _compute_shadow_mtm(db: AsyncSession, run_row, legs) -> list:
         for row in rows:
             option_prices[(strike, opt_type, row.timestamp)] = float(row.close)
 
+    _SHADOW_MAX_STALE = 1  # same bound as executor _MAX_STALE_MINUTES
     shadow: list = []
-    last_prices: dict = {}  # carry-forward for stale candles (max 1 min)
+    last_prices: dict = {}
+    stale_counts_shadow: dict = {}
     for spot_row in spot_rows:
         ts = spot_row.timestamp
         cur: dict = {}
@@ -672,11 +674,14 @@ async def _compute_shadow_mtm(db: AsyncSession, run_row, legs) -> list:
             if p is not None:
                 cur[key] = p
                 last_prices[key] = p
-            elif key in last_prices:
-                cur[key] = last_prices[key]  # 1-min carry-forward
+                stale_counts_shadow[key] = 0
+            elif key in last_prices and stale_counts_shadow.get(key, 0) < _SHADOW_MAX_STALE:
+                cur[key] = last_prices[key]
+                stale_counts_shadow[key] = stale_counts_shadow.get(key, 0) + 1
+            # else: no carry-forward — cur[key] absent, triggers skip below
 
         if len(cur) < len(leg_info):
-            continue  # skip minutes with missing data
+            continue  # skip minutes with missing/stale data
 
         gross_mtm_per_unit = sum(
             (ep - cur[(strike, opt_type)]) if side == "SELL" else (cur[(strike, opt_type)] - ep)
@@ -813,6 +818,16 @@ async def compare_runs(
             )).scalars().all()
             wins = sum(1 for row in sessions if (row.summary_pnl or 0) > 0)
             comparisons.append(historical_batch_library_item(batch, sessions_total=len(sessions), winning_sessions=wins))
+        elif kind == "strategy_run":
+            run_row = (await db.execute(
+                select(StrategyRun).where(
+                    StrategyRun.id == _parse_uuid(raw_id),
+                    StrategyRun.user_id == current_user.id,
+                )
+            )).scalar_one_or_none()
+            if run_row is None:
+                raise HTTPException(status_code=404, detail=f"strategy_run {raw_id} not found.")
+            comparisons.append(strategy_run_library_item(run_row))
         else:
             raise HTTPException(status_code=400, detail=f"Unsupported compare kind: {kind}")
 
