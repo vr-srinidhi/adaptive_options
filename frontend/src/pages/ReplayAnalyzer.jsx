@@ -113,7 +113,7 @@ function SpotChart({ data, entryLabel, exitLabel, exitReason }) {
   )
 }
 
-function MtmChart({ data, showTrail, entryLabel, exitLabel }) {
+function MtmChart({ data, showTrail, showShadow, entryLabel, exitLabel }) {
   if (!data?.length) {
     return (
       <div className="wb-card p-5">
@@ -123,9 +123,10 @@ function MtmChart({ data, showTrail, entryLabel, exitLabel }) {
     )
   }
 
-  const vals = data.map(r => r.net_mtm).filter(v => v != null)
-  const trailVals = showTrail ? data.map(r => r.trail_stop).filter(v => v != null) : []
-  const allVals = [...vals, ...trailVals, 0]
+  const vals       = data.map(r => r.net_mtm).filter(v => v != null)
+  const trailVals  = showTrail  ? data.map(r => r.trail_stop).filter(v => v != null) : []
+  const shadowVals = showShadow ? data.map(r => r.shadow_mtm).filter(v => v != null) : []
+  const allVals = [...vals, ...trailVals, ...shadowVals, 0]
   const lo = Math.floor(Math.min(...allVals) / 1000) * 1000
   const hi = Math.ceil(Math.max(...allVals) / 1000) * 1000
 
@@ -135,7 +136,8 @@ function MtmChart({ data, showTrail, entryLabel, exitLabel }) {
         <div className="wb-kicker">Net MTM — trade window</div>
         <div className="flex items-center gap-4 text-[10px]" style={{ color: 'var(--text-secondary)' }}>
           <span className="flex items-center gap-1"><span style={{ display: 'inline-block', width: 18, height: 2, background: '#36b37e', borderRadius: 1 }} />MTM</span>
-          {showTrail && <span className="flex items-center gap-1"><span style={{ display: 'inline-block', width: 18, height: 2, background: '#f59e0b', borderRadius: 1, borderTop: '2px dashed #f59e0b' }} />Trail stop</span>}
+          {showTrail  && <span className="flex items-center gap-1"><span style={{ display: 'inline-block', width: 18, height: 2, background: '#f59e0b', borderRadius: 1, borderTop: '2px dashed #f59e0b' }} />Trail stop</span>}
+          {showShadow && <span className="flex items-center gap-1"><span style={{ display: 'inline-block', width: 18, height: 2, background: '#a78bfa', borderRadius: 1, borderTop: '2px dashed #a78bfa' }} />If held</span>}
         </div>
       </div>
       <div className="mt-3" style={{ height: 280 }}>
@@ -145,7 +147,7 @@ function MtmChart({ data, showTrail, entryLabel, exitLabel }) {
             <XAxis dataKey="label" tick={{ fill: '#8090aa', fontSize: 10 }} tickLine={false} axisLine={{ stroke: '#27364b' }} interval={29} />
             <YAxis tick={{ fill: '#8090aa', fontSize: 10 }} tickLine={false} axisLine={false} width={88} tickFormatter={v => fmtINR(v)} domain={[lo, hi]} />
             <Tooltip
-              formatter={(value, name) => value != null ? [fmtINR(value), name === 'net_mtm' ? 'Net MTM' : 'Trail stop'] : null}
+              formatter={(value, name) => value != null ? [fmtINR(value), name === 'net_mtm' ? 'Net MTM' : name === 'trail_stop' ? 'Trail stop' : 'If held (shadow)'] : null}
               contentStyle={{ background: '#0f1726', border: '1px solid #27364b', borderRadius: 12, fontSize: 11 }}
               labelStyle={{ color: '#b8c7de' }}
             />
@@ -164,6 +166,9 @@ function MtmChart({ data, showTrail, entryLabel, exitLabel }) {
             {showTrail && (
               <Line type="monotone" dataKey="trail_stop" stroke="#f59e0b" strokeWidth={1.5} strokeDasharray="5 3" dot={false} connectNulls={false} />
             )}
+            {showShadow && (
+              <Line type="monotone" dataKey="shadow_mtm" stroke="#a78bfa" strokeWidth={1.5} strokeDasharray="6 3" dot={false} connectNulls={false} strokeOpacity={0.8} />
+            )}
           </LineChart>
         </ResponsiveContainer>
       </div>
@@ -176,6 +181,7 @@ function StrategyRunAnalyzer({ payload, kind, id, navigate }) {
   const legs = payload?.legs || []
   const spotSeriesFull = payload?.spot_series_full || payload?.spot_series || []
   const mtmSeries = payload?.mtm_series || []
+  const shadowMtmSeries = payload?.shadow_mtm_series || []
   const events = payload?.events || []
 
   const [eventsOnly, setEventsOnly] = useState(false)
@@ -200,28 +206,36 @@ function StrategyRunAnalyzer({ payload, kind, id, navigate }) {
     const m = {}
     mtmSeries.forEach(r => {
       m[timeLabel(r.timestamp)] = {
-        net_mtm: r.net_mtm != null ? Number(r.net_mtm) : null,
+        net_mtm:   r.net_mtm != null ? Number(r.net_mtm) : null,
         trail_stop: r.trail_stop_level != null ? Number(r.trail_stop_level) : null,
       }
     })
     return m
   }, [mtmSeries])
 
-  // Full-day MTM: use spot backbone, fill in trade-window values, null elsewhere
+  const shadowByLabel = useMemo(() => {
+    const m = {}
+    shadowMtmSeries.forEach(r => { m[timeLabel(r.timestamp)] = r.net_mtm != null ? Number(r.net_mtm) : null })
+    return m
+  }, [shadowMtmSeries])
+
+  // Full-day MTM: spot backbone + actual trade window + shadow after exit
   const chartMtm = useMemo(
     () => spotSeriesFull.map(r => {
       const lbl = timeLabel(r.timestamp)
       const mtm = mtmByLabel[lbl]
       return {
-        label: lbl,
-        net_mtm:   mtm ? mtm.net_mtm   : null,
-        trail_stop: mtm ? mtm.trail_stop : null,
+        label:       lbl,
+        net_mtm:     mtm ? mtm.net_mtm    : null,
+        trail_stop:  mtm ? mtm.trail_stop  : null,
+        shadow_mtm:  shadowByLabel[lbl] ?? null,
       }
     }),
-    [spotSeriesFull, mtmByLabel]
+    [spotSeriesFull, mtmByLabel, shadowByLabel]
   )
 
-  const hasTrail = chartMtm.some(r => r.trail_stop != null)
+  const hasTrail  = chartMtm.some(r => r.trail_stop != null)
+  const hasShadow = chartMtm.some(r => r.shadow_mtm != null)
 
   const tone = runStatusTone(run.status)
   const pnl = run.realized_net_pnl
@@ -303,6 +317,7 @@ function StrategyRunAnalyzer({ payload, kind, id, navigate }) {
         <MtmChart
           data={chartMtm}
           showTrail={hasTrail}
+          showShadow={hasShadow}
           entryLabel={entryLabel}
           exitLabel={exitLabel}
         />

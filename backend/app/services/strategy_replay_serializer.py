@@ -53,6 +53,7 @@ def strategy_run_replay_payload(
     leg_mtm_rows: List[StrategyLegMtm],
     events: List[StrategyRunEvent],
     spot_candles_full: Optional[List] = None,
+    shadow_mtm_rows: Optional[List[Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     """Full replay payload per PRD §13."""
 
@@ -174,10 +175,11 @@ def strategy_run_replay_payload(
             "realized_net_pnl":    float(run.realized_net_pnl) if run.realized_net_pnl is not None else None,
             "warnings":            (run.result_json or {}).get("warnings", []),
         },
-        "legs":             serialized_legs,
-        "spot_series":      spot_series,
-        "spot_series_full": spot_series_full,
-        "mtm_series":       mtm_series,
-        "events":           serialized_events,
-        "minute_table":     minute_table,
+        "legs":              serialized_legs,
+        "spot_series":       spot_series,
+        "spot_series_full":  spot_series_full,
+        "mtm_series":        mtm_series,
+        "shadow_mtm_series": shadow_mtm_rows or [],
+        "events":            serialized_events,
+        "minute_table":      minute_table,
     }
