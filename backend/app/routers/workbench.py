@@ -240,7 +240,7 @@ async def list_runs(
         sr_query = (
             select(StrategyRun)
             .where(StrategyRun.user_id == current_user.id)
-            .order_by(StrategyRun.created_at.desc())
+            .order_by(StrategyRun.trade_date.desc(), StrategyRun.created_at.desc())
         )
         if kind == "strategy_run":
             sr_query = sr_query.offset(offset).limit(limit)
@@ -249,7 +249,7 @@ async def list_runs(
         sr_rows = (await db.execute(sr_query)).scalars().all()
         items.extend(strategy_run_library_item(row) for row in sr_rows)
 
-    items.sort(key=lambda item: item.get("created_at") or "", reverse=True)
+    items.sort(key=lambda item: item.get("date_label") or item.get("created_at") or "", reverse=True)
     if kind is None:
         items = items[offset:offset + limit]
     return {"runs": items[:limit]}
