@@ -351,12 +351,14 @@ async def execute_run(
     warnings: List[str] = list(validation.warnings)
 
     exit_rule = strategy.get("exit_rule", {})
-    target_pct    = float(exit_rule.get("target_pct", 0.30))
-    stop_multiple = float(exit_rule.get("stop_multiple", 1.5))
-    sq_time       = _exit_time(config)
+    target_pct        = float(exit_rule.get("target_pct", 0.30))
+    stop_multiple     = float(exit_rule.get("stop_multiple", 1.5))
+    stop_capital_pct  = float(config.get("stop_capital_pct") or exit_rule.get("stop_capital_pct") or 0)
+    sq_time           = _exit_time(config)
     # Trailing stop — activated once net_mtm crosses trail_trigger
     trail_trigger = float(config.get("trail_trigger") or exit_rule.get("trail_trigger") or 0)
     trail_pct     = float(config.get("trail_pct")     or exit_rule.get("trail_pct")     or 0)
+    capital_amount = float(config.get("capital", 0))
 
     entry_rule = get_entry_rule(strategy.get("entry_rule_id", "timed_entry"))
 
@@ -504,7 +506,10 @@ async def execute_run(
 
         # Exit conditions
         target_threshold = entry_credit_total * target_pct
-        stop_threshold   = -(entry_credit_total * stop_multiple)
+        if stop_capital_pct > 0 and capital_amount > 0:
+            stop_threshold = -(capital_amount * stop_capital_pct)
+        else:
+            stop_threshold = -(entry_credit_total * stop_multiple)
 
         # Trailing stop: activate once net_mtm crosses trail_trigger, then track peak
         trail_stop_level: Optional[float] = None
