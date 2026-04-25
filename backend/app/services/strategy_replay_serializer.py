@@ -25,19 +25,24 @@ from app.models.strategy_run import (
 def strategy_run_library_item(run: StrategyRun) -> Dict[str, Any]:
     """Compact row for the Runs Library list."""
     pnl = float(run.realized_net_pnl) if run.realized_net_pnl is not None else None
+    trade_date = run.trade_date.isoformat() if run.trade_date else None
     return {
-        "id":          str(run.id),
-        "kind":        "strategy_run",
-        "strategy_id": run.strategy_id,
-        "instrument":  run.instrument,
-        "trade_date":  run.trade_date.isoformat() if run.trade_date else None,
-        "entry_time":  run.entry_time,
-        "status":      run.status,
-        "exit_reason": run.exit_reason,
-        "lots":        run.approved_lots,
-        "lot_size":    run.lot_size,
+        "id":               str(run.id),
+        "kind":             "strategy_run",
+        "strategy_id":      run.strategy_id,
+        "strategy_name":    run.strategy_id,
+        "instrument":       run.instrument,
+        "trade_date":       trade_date,
+        "date_label":       trade_date,
+        "entry_time":       run.entry_time,
+        "status":           run.status,
+        "exit_reason":      run.exit_reason,
+        "lots":             run.approved_lots,
+        "lot_size":         run.lot_size,
         "realized_net_pnl": pnl,
-        "created_at":  run.created_at.isoformat() if run.created_at else None,
+        "pnl":              pnl,
+        "created_at":       run.created_at.isoformat() if run.created_at else None,
+        "route":            f"/workbench/replay/strategy_run/{run.id}",
     }
 
 
@@ -47,6 +52,8 @@ def strategy_run_replay_payload(
     mtm_rows: List[StrategyRunMtm],
     leg_mtm_rows: List[StrategyLegMtm],
     events: List[StrategyRunEvent],
+    spot_candles_full: Optional[List] = None,
+    shadow_mtm_rows: Optional[List[Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     """Full replay payload per PRD §13."""
 
@@ -78,9 +85,10 @@ def strategy_run_replay_payload(
     mtm_series = [
         {
             "timestamp":        row.timestamp.isoformat(),
-            "gross_mtm":        float(row.gross_mtm)        if row.gross_mtm        is not None else None,
-            "est_exit_charges": float(row.est_exit_charges) if row.est_exit_charges is not None else None,
-            "net_mtm":          float(row.net_mtm)          if row.net_mtm          is not None else None,
+            "gross_mtm":        float(row.gross_mtm)          if row.gross_mtm          is not None else None,
+            "est_exit_charges": float(row.est_exit_charges)   if row.est_exit_charges   is not None else None,
+            "net_mtm":          float(row.net_mtm)            if row.net_mtm            is not None else None,
+            "trail_stop_level": float(row.trail_stop_level)   if row.trail_stop_level   is not None else None,
             "event_code":       row.event_code,
         }
         for row in mtm_rows
@@ -131,6 +139,17 @@ def strategy_run_replay_payload(
         for ev in sorted(events, key=lambda e: e.timestamp)
     ]
 
+    # Full-day spot series (09:15–15:30 for context charts)
+    spot_series_full = []
+    if spot_candles_full:
+        spot_series_full = [
+            {
+                "timestamp": candle.timestamp.isoformat(),
+                "close": float(candle.close) if candle.close is not None else None,
+            }
+            for candle in spot_candles_full
+        ]
+
     # Entry credit total
     entry_credit_total = (
         float(run.entry_credit_total) if run.entry_credit_total is not None else None
@@ -156,9 +175,11 @@ def strategy_run_replay_payload(
             "realized_net_pnl":    float(run.realized_net_pnl) if run.realized_net_pnl is not None else None,
             "warnings":            (run.result_json or {}).get("warnings", []),
         },
-        "legs":         serialized_legs,
-        "spot_series":  spot_series,
-        "mtm_series":   mtm_series,
-        "events":       serialized_events,
-        "minute_table": minute_table,
+        "legs":              serialized_legs,
+        "spot_series":       spot_series,
+        "spot_series_full":  spot_series_full,
+        "mtm_series":        mtm_series,
+        "shadow_mtm_series": shadow_mtm_rows or [],
+        "events":            serialized_events,
+        "minute_table":      minute_table,
     }

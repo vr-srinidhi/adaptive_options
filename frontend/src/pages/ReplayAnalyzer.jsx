@@ -2,8 +2,10 @@ import { useEffect, useMemo, useState } from 'react'
 import { Link, useNavigate, useParams } from 'react-router-dom'
 import {
   CartesianGrid,
+  Label,
   Line,
   LineChart,
+  ReferenceLine,
   ResponsiveContainer,
   Tooltip,
   XAxis,
@@ -14,7 +16,7 @@ import { fmtDateTime, fmtINR, fmtNumber, runKindLabel, runStatusTone } from '../
 
 const timeLabel = value => value ? value.slice(11, 16) : '—'
 
-function AnalyzerChart({ title, data, lineKey, color, valueFormatter }) {
+function AnalyzerChart({ title, data, lineKey, color, valueFormatter, tightDomain = false, roundTo = 200 }) {
   if (!data?.length) {
     return (
       <div className="wb-card p-5">
@@ -22,6 +24,14 @@ function AnalyzerChart({ title, data, lineKey, color, valueFormatter }) {
         <div className="mt-4 text-sm wb-muted">No data available for this chart.</div>
       </div>
     )
+  }
+
+  let yDomain
+  if (tightDomain) {
+    const vals = data.map(r => Number(r[lineKey])).filter(v => isFinite(v))
+    const lo = Math.floor(Math.min(...vals) / roundTo) * roundTo
+    const hi = Math.ceil(Math.max(...vals) / roundTo) * roundTo
+    yDomain = [lo, hi]
   }
 
   return (
@@ -38,6 +48,7 @@ function AnalyzerChart({ title, data, lineKey, color, valueFormatter }) {
               axisLine={false}
               width={82}
               tickFormatter={valueFormatter}
+              domain={yDomain}
             />
             <Tooltip
               formatter={value => [valueFormatter(value), title]}
@@ -52,11 +63,125 @@ function AnalyzerChart({ title, data, lineKey, color, valueFormatter }) {
   )
 }
 
+function SpotChart({ data, entryLabel, exitLabel, exitReason }) {
+  if (!data?.length) {
+    return (
+      <div className="wb-card p-5">
+        <div className="wb-kicker">Full Day Spot</div>
+        <div className="mt-4 text-sm wb-muted">No spot data available.</div>
+      </div>
+    )
+  }
+  const vals = data.map(r => r.spot).filter(v => isFinite(v))
+  const lo = Math.floor(Math.min(...vals) / 200) * 200
+  const hi = Math.ceil(Math.max(...vals) / 200) * 200
+  return (
+    <div className="wb-card p-5">
+      <div className="flex items-center justify-between mb-1">
+        <div className="wb-kicker">Full Day NIFTY Spot</div>
+        <div className="flex items-center gap-4 text-[10px]" style={{ color: 'var(--text-secondary)' }}>
+          <span className="flex items-center gap-1"><span style={{ display: 'inline-block', width: 2, height: 12, background: '#22c55e', borderRadius: 1 }} />Entry {entryLabel}</span>
+          <span className="flex items-center gap-1"><span style={{ display: 'inline-block', width: 2, height: 12, background: '#ef4444', borderRadius: 1 }} />Exit {exitLabel} ({exitReason})</span>
+        </div>
+      </div>
+      <div className="mt-3" style={{ height: 280 }}>
+        <ResponsiveContainer width="100%" height="100%">
+          <LineChart data={data} margin={{ top: 8, right: 16, left: 8, bottom: 0 }}>
+            <CartesianGrid strokeDasharray="3 3" stroke="#213047" vertical={false} />
+            <XAxis dataKey="label" tick={{ fill: '#8090aa', fontSize: 10 }} tickLine={false} axisLine={{ stroke: '#27364b' }} interval={29} />
+            <YAxis tick={{ fill: '#8090aa', fontSize: 10 }} tickLine={false} axisLine={false} width={82} tickFormatter={v => fmtNumber(v, 0)} domain={[lo, hi]} />
+            <Tooltip
+              formatter={v => [fmtNumber(v, 1), 'Spot']}
+              contentStyle={{ background: '#0f1726', border: '1px solid #27364b', borderRadius: 12, fontSize: 11 }}
+              labelStyle={{ color: '#b8c7de' }}
+            />
+            {entryLabel && (
+              <ReferenceLine x={entryLabel} stroke="#22c55e" strokeWidth={1.5} strokeDasharray="4 3">
+                <Label value="IN" position="insideTopRight" fill="#22c55e" fontSize={10} fontWeight={700} />
+              </ReferenceLine>
+            )}
+            {exitLabel && (
+              <ReferenceLine x={exitLabel} stroke="#ef4444" strokeWidth={1.5} strokeDasharray="4 3">
+                <Label value="OUT" position="insideTopLeft" fill="#ef4444" fontSize={10} fontWeight={700} />
+              </ReferenceLine>
+            )}
+            <Line type="monotone" dataKey="spot" stroke="#38bdf8" strokeWidth={1.5} dot={false} />
+          </LineChart>
+        </ResponsiveContainer>
+      </div>
+    </div>
+  )
+}
+
+function MtmChart({ data, showTrail, showShadow, entryLabel, exitLabel }) {
+  if (!data?.length) {
+    return (
+      <div className="wb-card p-5">
+        <div className="wb-kicker">Net MTM progression</div>
+        <div className="mt-4 text-sm wb-muted">No data available for this chart.</div>
+      </div>
+    )
+  }
+
+  const vals       = data.map(r => r.net_mtm).filter(v => v != null)
+  const trailVals  = showTrail  ? data.map(r => r.trail_stop).filter(v => v != null) : []
+  const shadowVals = showShadow ? data.map(r => r.shadow_mtm).filter(v => v != null) : []
+  const allVals = [...vals, ...trailVals, ...shadowVals, 0]
+  const lo = Math.floor(Math.min(...allVals) / 1000) * 1000
+  const hi = Math.ceil(Math.max(...allVals) / 1000) * 1000
+
+  return (
+    <div className="wb-card p-5">
+      <div className="flex items-center justify-between mb-1">
+        <div className="wb-kicker">Net MTM — trade window</div>
+        <div className="flex items-center gap-4 text-[10px]" style={{ color: 'var(--text-secondary)' }}>
+          <span className="flex items-center gap-1"><span style={{ display: 'inline-block', width: 18, height: 2, background: '#36b37e', borderRadius: 1 }} />MTM</span>
+          {showTrail  && <span className="flex items-center gap-1"><span style={{ display: 'inline-block', width: 18, height: 2, background: '#f59e0b', borderRadius: 1, borderTop: '2px dashed #f59e0b' }} />Trail stop</span>}
+          {showShadow && <span className="flex items-center gap-1"><span style={{ display: 'inline-block', width: 18, height: 2, background: '#a78bfa', borderRadius: 1, borderTop: '2px dashed #a78bfa' }} />If held</span>}
+        </div>
+      </div>
+      <div className="mt-3" style={{ height: 280 }}>
+        <ResponsiveContainer width="100%" height="100%">
+          <LineChart data={data} margin={{ top: 8, right: 16, left: 8, bottom: 0 }}>
+            <CartesianGrid strokeDasharray="3 3" stroke="#213047" vertical={false} />
+            <XAxis dataKey="label" tick={{ fill: '#8090aa', fontSize: 10 }} tickLine={false} axisLine={{ stroke: '#27364b' }} interval={29} />
+            <YAxis tick={{ fill: '#8090aa', fontSize: 10 }} tickLine={false} axisLine={false} width={88} tickFormatter={v => fmtINR(v)} domain={[lo, hi]} />
+            <Tooltip
+              formatter={(value, name) => value != null ? [fmtINR(value), name === 'net_mtm' ? 'Net MTM' : name === 'trail_stop' ? 'Trail stop' : 'If held (shadow)'] : null}
+              contentStyle={{ background: '#0f1726', border: '1px solid #27364b', borderRadius: 12, fontSize: 11 }}
+              labelStyle={{ color: '#b8c7de' }}
+            />
+            <ReferenceLine y={0} stroke="#334155" strokeWidth={1} />
+            {entryLabel && (
+              <ReferenceLine x={entryLabel} stroke="#22c55e" strokeWidth={1.5} strokeDasharray="4 3">
+                <Label value="IN" position="insideTopRight" fill="#22c55e" fontSize={10} fontWeight={700} />
+              </ReferenceLine>
+            )}
+            {exitLabel && (
+              <ReferenceLine x={exitLabel} stroke="#ef4444" strokeWidth={1.5} strokeDasharray="4 3">
+                <Label value="OUT" position="insideTopLeft" fill="#ef4444" fontSize={10} fontWeight={700} />
+              </ReferenceLine>
+            )}
+            <Line type="monotone" dataKey="net_mtm" stroke="#36b37e" strokeWidth={2} dot={false} connectNulls={false} />
+            {showTrail && (
+              <Line type="monotone" dataKey="trail_stop" stroke="#f59e0b" strokeWidth={1.5} strokeDasharray="5 3" dot={false} connectNulls={false} />
+            )}
+            {showShadow && (
+              <Line type="monotone" dataKey="shadow_mtm" stroke="#a78bfa" strokeWidth={1.5} strokeDasharray="6 3" dot={false} connectNulls={false} strokeOpacity={0.8} />
+            )}
+          </LineChart>
+        </ResponsiveContainer>
+      </div>
+    </div>
+  )
+}
+
 function StrategyRunAnalyzer({ payload, kind, id, navigate }) {
   const run = payload?.run || {}
   const legs = payload?.legs || []
-  const spotSeries = payload?.spot_series || []
+  const spotSeriesFull = payload?.spot_series_full || payload?.spot_series || []
   const mtmSeries = payload?.mtm_series || []
+  const shadowMtmSeries = payload?.shadow_mtm_series || []
   const events = payload?.events || []
 
   const [eventsOnly, setEventsOnly] = useState(false)
@@ -66,20 +191,57 @@ function StrategyRunAnalyzer({ payload, kind, id, navigate }) {
     return events.filter(e => e.event_type !== 'HOLD')
   }, [events, eventsOnly])
 
+  // Entry/exit time labels for ReferenceLine (HH:MM)
+  const entryLabel = run.entry_time || null   // already HH:MM
+  const exitLabel  = run.exit_time  || null
+
+  // Full-day spot chart data
   const chartSpot = useMemo(
-    () => spotSeries.map(r => ({ label: timeLabel(r.timestamp), spot: Number(r.close) })),
-    [spotSeries]
+    () => spotSeriesFull.map(r => ({ label: timeLabel(r.timestamp), spot: Number(r.close) })),
+    [spotSeriesFull]
   )
+
+  // MTM chart — indexed by HH:MM label
+  const mtmByLabel = useMemo(() => {
+    const m = {}
+    mtmSeries.forEach(r => {
+      m[timeLabel(r.timestamp)] = {
+        net_mtm:   r.net_mtm != null ? Number(r.net_mtm) : null,
+        trail_stop: r.trail_stop_level != null ? Number(r.trail_stop_level) : null,
+      }
+    })
+    return m
+  }, [mtmSeries])
+
+  const shadowByLabel = useMemo(() => {
+    const m = {}
+    shadowMtmSeries.forEach(r => { m[timeLabel(r.timestamp)] = r.net_mtm != null ? Number(r.net_mtm) : null })
+    return m
+  }, [shadowMtmSeries])
+
+  // Full-day MTM: spot backbone + actual trade window + shadow after exit
   const chartMtm = useMemo(
-    () => mtmSeries.map(r => ({ label: timeLabel(r.timestamp), net_mtm: Number(r.net_mtm ?? 0) })),
-    [mtmSeries]
+    () => spotSeriesFull.map(r => {
+      const lbl = timeLabel(r.timestamp)
+      const mtm = mtmByLabel[lbl]
+      return {
+        label:       lbl,
+        net_mtm:     mtm ? mtm.net_mtm    : null,
+        trail_stop:  mtm ? mtm.trail_stop  : null,
+        shadow_mtm:  shadowByLabel[lbl] ?? null,
+      }
+    }),
+    [spotSeriesFull, mtmByLabel, shadowByLabel]
   )
+
+  const hasTrail  = chartMtm.some(r => r.trail_stop != null)
+  const hasShadow = chartMtm.some(r => r.shadow_mtm != null)
 
   const tone = runStatusTone(run.status)
   const pnl = run.realized_net_pnl
 
   return (
-    <div className="wb-page">
+    <div className="mx-auto max-w-[1360px]" style={{ padding: '18px 20px 24px', fontSize: 12 }}>
       <section className="wb-card p-6">
         <div className="flex items-start justify-between gap-5 flex-wrap">
           <div>
@@ -146,8 +308,19 @@ function StrategyRunAnalyzer({ payload, kind, id, navigate }) {
       </section>
 
       <section className="wb-grid wb-grid-2 mt-6">
-        <AnalyzerChart title="NIFTY spot (1-min)" data={chartSpot} lineKey="spot" color="#38bdf8" valueFormatter={v => fmtNumber(v, 0)} />
-        <AnalyzerChart title="Net MTM progression" data={chartMtm} lineKey="net_mtm" color="#36b37e" valueFormatter={v => fmtINR(v)} />
+        <SpotChart
+          data={chartSpot}
+          entryLabel={entryLabel}
+          exitLabel={exitLabel}
+          exitReason={run.exit_reason}
+        />
+        <MtmChart
+          data={chartMtm}
+          showTrail={hasTrail}
+          showShadow={hasShadow}
+          entryLabel={entryLabel}
+          exitLabel={exitLabel}
+        />
       </section>
 
       <section className="wb-card p-5 mt-6">
@@ -262,7 +435,7 @@ export default function ReplayAnalyzer() {
   const backRoute = kind === 'paper_session' ? '/workbench/replay' : session.batch_id ? `/workbench/history/historical_batch/${session.batch_id}` : '/workbench/history'
 
   return (
-    <div className="wb-page">
+    <div className="mx-auto max-w-[1360px]" style={{ padding: '18px 20px 24px', fontSize: 12 }}>
       <section className="wb-card p-6">
         <div className="flex items-start justify-between gap-5 flex-wrap">
           <div>
@@ -324,7 +497,7 @@ export default function ReplayAnalyzer() {
       </section>
 
       <section className="wb-grid wb-grid-2 mt-6">
-        <AnalyzerChart title="Spot progression" data={spotSeries} lineKey="spot" color="#38bdf8" valueFormatter={value => fmtNumber(value, 0)} />
+        <AnalyzerChart title="Spot progression" data={spotSeries} lineKey="spot" color="#38bdf8" valueFormatter={value => fmtNumber(value, 0)} tightDomain />
         <AnalyzerChart title="Net MTM progression" data={pnlSeries} lineKey="pnl" color="#36b37e" valueFormatter={value => fmtINR(value)} />
       </section>
 

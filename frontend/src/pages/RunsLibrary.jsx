@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useNavigate, useSearchParams } from 'react-router-dom'
 import { compareWorkbenchRuns, getWorkbenchRuns } from '../api'
 import { fmtDateTime, fmtINR, fmtShortDate, runKindLabel, runStatusTone } from '../utils/workbench'
@@ -21,6 +21,8 @@ const KIND_FILTERS = [
   { value: 'paper_session', label: 'Paper Replay' },
   { value: 'historical_batch', label: 'Historical Batch' },
 ]
+
+const PAGE_SIZE = 20
 
 function StatusBadge({ status }) {
   const tone = runStatusTone(status)
@@ -105,24 +107,78 @@ export default function RunsLibrary() {
   const [runs, setRuns] = useState([])
   const [kind, setKind] = useState(searchParams.get('kind') || 'all')
   const [query, setQuery] = useState('')
+  const [page, setPage] = useState(0)
+  const [hasMore, setHasMore] = useState(false)
   const [selectedRefs, setSelectedRefs] = useState([])
   const [compareItems, setCompareItems] = useState([])
   const [loading, setLoading] = useState(true)
+  const [loadingMore, setLoadingMore] = useState(false)
   const [comparing, setComparing] = useState(false)
   const [error, setError] = useState(null)
+  const sentinelRef = useRef(null)
 
+  // Initial load + kind filter change: reset list
   useEffect(() => {
     setLoading(true)
     setError(null)
-    getWorkbenchRuns(kind === 'all' ? undefined : { kind })
+    setRuns([])
+    setPage(0)
+    setHasMore(false)
+    const params = {
+      limit: PAGE_SIZE + 1,
+      offset: 0,
+      ...(kind !== 'all' ? { kind } : {}),
+    }
+    getWorkbenchRuns(params)
       .then(res => {
-        const nextRuns = res.data.runs || []
+        const allRows = res.data.runs || []
+        const nextRuns = allRows.slice(0, PAGE_SIZE)
+        setHasMore(allRows.length > PAGE_SIZE)
         setRuns(nextRuns)
-        setSelectedRefs(prev => prev.filter(ref => nextRuns.some(item => `${item.kind}:${item.id}` === ref)))
       })
       .catch(err => setError(err.response?.data?.detail || err.message))
       .finally(() => setLoading(false))
   }, [kind])
+
+  // Subsequent pages: append to list
+  useEffect(() => {
+    if (page === 0) return
+    setLoadingMore(true)
+    setError(null)
+    const params = {
+      limit: PAGE_SIZE + 1,
+      offset: page * PAGE_SIZE,
+      ...(kind !== 'all' ? { kind } : {}),
+    }
+    getWorkbenchRuns(params)
+      .then(res => {
+        const allRows = res.data.runs || []
+        const nextRuns = allRows.slice(0, PAGE_SIZE)
+        setHasMore(allRows.length > PAGE_SIZE)
+        setRuns(prev => [...prev, ...nextRuns])
+      })
+      .catch(err => setError(err.response?.data?.detail || err.message))
+      .finally(() => setLoadingMore(false))
+  }, [page]) // eslint-disable-line react-hooks/exhaustive-deps
+
+  // IntersectionObserver: increment page when sentinel comes into view
+  useEffect(() => {
+    if (!sentinelRef.current) return
+    const observer = new IntersectionObserver(
+      entries => {
+        if (entries[0].isIntersecting && hasMore && !loadingMore && !loading) {
+          setPage(p => p + 1)
+        }
+      },
+      { threshold: 0.1 }
+    )
+    observer.observe(sentinelRef.current)
+    return () => observer.disconnect()
+  }, [hasMore, loadingMore, loading])
+
+  const handleKindChange = useCallback((nextKind) => {
+    setKind(nextKind)
+  }, [])
 
   useEffect(() => {
     if (selectedRefs.length < 2) {
@@ -176,7 +232,7 @@ export default function RunsLibrary() {
               Runs Library
             </div>
             <div style={{ fontSize: 10, color: PALETTE.muted }}>
-              {filtered.length} runs · select 2 or more for compare
+              {runs.length} loaded{hasMore ? ' · scroll for more' : ' · all loaded'} · select 2 or more for compare
             </div>
           </div>
 
@@ -186,7 +242,7 @@ export default function RunsLibrary() {
               <button
                 key={filter.value}
                 type="button"
-                onClick={() => setKind(filter.value)}
+                onClick={() => handleKindChange(filter.value)}
                 className="rounded-md px-3 py-1.5"
                 style={{
                   background: kind === filter.value ? PALETTE.blueSoft : PALETTE.card,
@@ -404,8 +460,29 @@ export default function RunsLibrary() {
               }}
             >
               <span>Click a row action to open replay or detail view. Compare supports up to 4 runs.</span>
-              <span>{filtered.length} rows</span>
+              <span>{filtered.length} rows shown</span>
             </div>
+
+            {/* Infinite scroll sentinel */}
+            <div ref={sentinelRef} style={{ height: 1 }} />
+
+            {loadingMore && (
+              <div
+                className="flex items-center justify-center gap-2"
+                style={{ padding: '10px 0', fontSize: 10, color: PALETTE.muted }}
+              >
+                <span className="spinner" /> Loading more…
+              </div>
+            )}
+
+            {!hasMore && !loading && runs.length > 0 && (
+              <div
+                className="text-center"
+                style={{ padding: '8px 0', fontSize: 9, color: '#334155' }}
+              >
+                All {runs.length} runs loaded
+              </div>
+            )}
           </section>
         )}
       </div>

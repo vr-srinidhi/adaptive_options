@@ -13,7 +13,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db
 from app.dependencies.auth import get_current_active_user
-from app.models.historical import SessionBatch, TradingDay
+from app.models.historical import OptionsCandle, SessionBatch, SpotCandle, TradingDay
+from app.services.charges_service import compute_entry_charges, compute_exit_charges_estimate
 from app.models.paper_trade import (
     MinuteDecision,
     PaperCandleSeries,
@@ -240,7 +241,7 @@ async def list_runs(
         sr_query = (
             select(StrategyRun)
             .where(StrategyRun.user_id == current_user.id)
-            .order_by(StrategyRun.created_at.desc())
+            .order_by(StrategyRun.trade_date.desc(), StrategyRun.created_at.desc())
         )
         if kind == "strategy_run":
             sr_query = sr_query.offset(offset).limit(limit)
@@ -249,7 +250,7 @@ async def list_runs(
         sr_rows = (await db.execute(sr_query)).scalars().all()
         items.extend(strategy_run_library_item(row) for row in sr_rows)
 
-    items.sort(key=lambda item: item.get("created_at") or "", reverse=True)
+    items.sort(key=lambda item: item.get("date_label") or item.get("created_at") or "", reverse=True)
     if kind is None:
         items = items[offset:offset + limit]
     return {"runs": items[:limit]}
@@ -594,6 +595,107 @@ async def get_run_detail(
     raise HTTPException(status_code=404, detail="Unsupported run kind.")
 
 
+async def _compute_shadow_mtm(db: AsyncSession, run_row, legs) -> list:
+    """
+    Hypothetical MTM from exit_time → 15:25 using actual entry prices.
+    Same gross-MTM formula as the executor, no stop/target applied.
+    """
+    from datetime import datetime, time as dt_time
+
+    if not run_row.exit_time or not legs or run_row.status == "no_trade":
+        return []
+
+    try:
+        h, m = map(int, run_row.exit_time.split(":"))
+        exit_dt = datetime.combine(run_row.trade_date, dt_time(h, m))
+    except Exception:
+        return []
+
+    sq_dt = datetime.combine(run_row.trade_date, dt_time(15, 25))
+    if exit_dt >= sq_dt:
+        return []
+
+    lot_size      = run_row.lot_size or 0
+    approved_lots = run_row.approved_lots or 0
+    if lot_size == 0 or approved_lots == 0:
+        return []
+
+    leg_info = [
+        (l.side, l.option_type, l.strike, l.expiry_date, float(l.entry_price))
+        for l in legs if l.entry_price is not None
+    ]
+    sell_entry_prices = [ep for side, _, _, _, ep in leg_info if side == "SELL"]
+    entry_charges = compute_entry_charges(approved_lots, lot_size, sell_entry_prices)
+
+    # Spot candles after exit
+    spot_rows = (await db.execute(
+        select(SpotCandle)
+        .where(
+            SpotCandle.symbol == run_row.instrument,
+            SpotCandle.trade_date == run_row.trade_date,
+            SpotCandle.timestamp > exit_dt,
+            SpotCandle.timestamp <= sq_dt,
+        )
+        .order_by(SpotCandle.timestamp)
+    )).scalars().all()
+
+    if not spot_rows:
+        return []
+
+    # Option candles after exit, keyed (strike, opt_type, ts) -> price
+    option_prices: dict = {}
+    for side, opt_type, strike, expiry, _ in leg_info:
+        rows = (await db.execute(
+            select(OptionsCandle)
+            .where(
+                OptionsCandle.symbol == run_row.instrument,
+                OptionsCandle.trade_date == run_row.trade_date,
+                OptionsCandle.expiry_date == expiry,
+                OptionsCandle.strike == strike,
+                OptionsCandle.option_type == opt_type,
+                OptionsCandle.timestamp > exit_dt,
+                OptionsCandle.timestamp <= sq_dt,
+            )
+            .order_by(OptionsCandle.timestamp)
+        )).scalars().all()
+        for row in rows:
+            option_prices[(strike, opt_type, row.timestamp)] = float(row.close)
+
+    _SHADOW_MAX_STALE = 1  # same bound as executor _MAX_STALE_MINUTES
+    shadow: list = []
+    last_prices: dict = {}
+    stale_counts_shadow: dict = {}
+    for spot_row in spot_rows:
+        ts = spot_row.timestamp
+        cur: dict = {}
+        for side, opt_type, strike, _, _ in leg_info:
+            key = (strike, opt_type)
+            p = option_prices.get((strike, opt_type, ts))
+            if p is not None:
+                cur[key] = p
+                last_prices[key] = p
+                stale_counts_shadow[key] = 0
+            elif key in last_prices and stale_counts_shadow.get(key, 0) < _SHADOW_MAX_STALE:
+                cur[key] = last_prices[key]
+                stale_counts_shadow[key] = stale_counts_shadow.get(key, 0) + 1
+            # else: no carry-forward — cur[key] absent, triggers skip below
+
+        if len(cur) < len(leg_info):
+            continue  # skip minutes with missing/stale data
+
+        gross_mtm_per_unit = sum(
+            (ep - cur[(strike, opt_type)]) if side == "SELL" else (cur[(strike, opt_type)] - ep)
+            for side, opt_type, strike, _, ep in leg_info
+        )
+        gross_mtm_total = gross_mtm_per_unit * lot_size * approved_lots
+        sell_cur = [cur[(strike, opt_type)] for side, opt_type, strike, _, _ in leg_info if side == "SELL"]
+        est_exit = compute_exit_charges_estimate(approved_lots, lot_size, sell_cur or [0.0])
+        net_mtm  = gross_mtm_total - entry_charges - est_exit
+        shadow.append({"timestamp": ts.isoformat(), "net_mtm": round(net_mtm, 2)})
+
+    return shadow
+
+
 @router.get("/runs/{kind}/{item_id}/replay")
 async def get_run_replay(
     kind: str,
@@ -633,7 +735,18 @@ async def get_run_replay(
             .order_by(StrategyRunEvent.timestamp)
         )).scalars().all()
 
-        return strategy_run_replay_payload(run_row, legs, mtm_rows, leg_mtm_rows, events)
+        spot_candles_full = (await db.execute(
+            select(SpotCandle)
+            .where(
+                SpotCandle.symbol == run_row.instrument,
+                SpotCandle.trade_date == run_row.trade_date,
+            )
+            .order_by(SpotCandle.timestamp)
+        )).scalars().all()
+
+        shadow_mtm = await _compute_shadow_mtm(db, run_row, legs)
+
+        return strategy_run_replay_payload(run_row, legs, mtm_rows, leg_mtm_rows, events, spot_candles_full, shadow_mtm)
 
     if kind not in {"paper_session", "historical_session"}:
         raise HTTPException(status_code=404, detail="Replay is only available for session-level runs.")
@@ -705,6 +818,16 @@ async def compare_runs(
             )).scalars().all()
             wins = sum(1 for row in sessions if (row.summary_pnl or 0) > 0)
             comparisons.append(historical_batch_library_item(batch, sessions_total=len(sessions), winning_sessions=wins))
+        elif kind == "strategy_run":
+            run_row = (await db.execute(
+                select(StrategyRun).where(
+                    StrategyRun.id == _parse_uuid(raw_id),
+                    StrategyRun.user_id == current_user.id,
+                )
+            )).scalar_one_or_none()
+            if run_row is None:
+                raise HTTPException(status_code=404, detail=f"strategy_run {raw_id} not found.")
+            comparisons.append(strategy_run_library_item(run_row))
         else:
             raise HTTPException(status_code=400, detail=f"Unsupported compare kind: {kind}")
 

@@ -234,12 +234,17 @@ async def validate_run(
     leg_template = strategy.get("leg_template", [])
     resolved_legs = resolve_leg_strikes(leg_template, atm_strike, spec.strike_step)
 
-    # 7. Confirm each resolved leg strike has a price at the entry minute
+    # 7. Confirm each resolved leg strike has a price within the entry grace window
+    from datetime import timedelta as _td
+    _GRACE = 5   # minutes — must match _ENTRY_GRACE_MINUTES in entry_rule_registry
     entry_dt = datetime.combine(trade_date, _parse_time(entry_time_str))
+    grace_end_dt = entry_dt + _td(minutes=_GRACE)
     contracts = []
-    missing_legs: List[str] = []
+    exact_missing: List[str] = []
+    fully_missing: List[str] = []
     for side, opt_type, strike in resolved_legs:
-        row = (await db.execute(
+        # Check exact minute first
+        exact_row = (await db.execute(
             select(OptionsCandle)
             .where(
                 OptionsCandle.symbol == instrument,
@@ -251,18 +256,40 @@ async def validate_run(
             )
             .limit(1)
         )).scalar_one_or_none()
-        if row is None:
-            missing_legs.append(f"{opt_type} {strike}")
+        if exact_row is None:
+            exact_missing.append(f"{opt_type} {strike}")
+            # Check whether any minute in the grace window has data
+            grace_row = (await db.execute(
+                select(OptionsCandle)
+                .where(
+                    OptionsCandle.symbol == instrument,
+                    OptionsCandle.trade_date == trade_date,
+                    OptionsCandle.expiry_date == expiry_result.expiry,
+                    OptionsCandle.strike == strike,
+                    OptionsCandle.option_type == opt_type,
+                    OptionsCandle.timestamp > entry_dt,
+                    OptionsCandle.timestamp <= grace_end_dt,
+                )
+                .limit(1)
+            )).scalar_one_or_none()
+            if grace_row is None:
+                fully_missing.append(f"{opt_type} {strike}")
         contracts.append({"side": side, "option_type": opt_type, "strike": strike})
 
-    if missing_legs:
+    if fully_missing:
         return ValidationResult(
             validated=False, instrument=instrument,
             trade_date=trade_date_str, entry_time=entry_time_str,
             error=(
-                f"No price data at {entry_time_str} for: {', '.join(missing_legs)}. "
-                "These strikes are not tradable on this date at the requested entry time."
+                f"No price data within {_GRACE} minutes of {entry_time_str} "
+                f"for: {', '.join(fully_missing)}. "
+                "These strikes are not tradable on this date."
             ),
+        )
+    if exact_missing:
+        warnings.append(
+            f"No price at exactly {entry_time_str} for {', '.join(exact_missing)}. "
+            f"Entry will be attempted within the next {_GRACE} minutes."
         )
 
     # 8. Position sizing
@@ -324,9 +351,14 @@ async def execute_run(
     warnings: List[str] = list(validation.warnings)
 
     exit_rule = strategy.get("exit_rule", {})
-    target_pct   = float(exit_rule.get("target_pct", 0.30))
-    stop_multiple = float(exit_rule.get("stop_multiple", 1.5))
-    sq_time      = _exit_time(config)
+    target_pct        = float(exit_rule.get("target_pct", 0.30))
+    stop_multiple     = float(exit_rule.get("stop_multiple", 1.5))
+    stop_capital_pct  = float(config.get("stop_capital_pct") or exit_rule.get("stop_capital_pct") or 0)
+    sq_time           = _exit_time(config)
+    # Trailing stop — activated once net_mtm crosses trail_trigger
+    trail_trigger = float(config.get("trail_trigger") or exit_rule.get("trail_trigger") or 0)
+    trail_pct     = float(config.get("trail_pct")     or exit_rule.get("trail_pct")     or 0)
+    capital_amount = float(config.get("capital", 0))
 
     entry_rule = get_entry_rule(strategy.get("entry_rule_id", "timed_entry"))
 
@@ -361,6 +393,11 @@ async def execute_run(
     entry_charges         = 0.0
     exit_reason: Optional[str] = None
     exit_ts: Optional[datetime] = None
+    actual_entry_ts: Optional[datetime] = None   # actual minute trade opened (may differ from configured entry_time in grace window)
+    # Trailing stop state
+    trail_active       = False
+    trail_peak         = 0.0
+    trail_stop_at_exit: Optional[float] = None
 
     mtm_rows: List[Dict]      = []
     leg_mtm_rows: List[Dict]  = []
@@ -394,14 +431,16 @@ async def execute_run(
             if signal.action == "ENTER":
                 # Validate all leg prices are available at entry
                 if any(p is None for p in cur_prices):
+                    # Log as HOLD so the grace-window retry can fire next minute
                     event_rows.append({
                         "run_id": run_id, "timestamp": ts,
-                        "event_type": "NO_TRADE", "reason_code": "MISSING_LEG_PRICE",
-                        "reason_text": "One or more leg prices unavailable at entry",
+                        "event_type": "HOLD", "reason_code": "MISSING_LEG_PRICE",
+                        "reason_text": "Leg prices unavailable at entry — retrying next minute",
                     })
                     continue
 
                 trade_open = True
+                actual_entry_ts = ts
                 entry_prices = list(cur_prices)
 
                 # Only SELL legs contribute to entry credit for short strategies
@@ -469,13 +508,31 @@ async def execute_run(
 
         # Exit conditions
         target_threshold = entry_credit_total * target_pct
-        stop_threshold   = -(entry_credit_total * stop_multiple)
+        if stop_capital_pct > 0 and capital_amount > 0:
+            stop_threshold = -(capital_amount * stop_capital_pct)
+        else:
+            stop_threshold = -(entry_credit_total * stop_multiple)
+
+        # Trailing stop: activate once net_mtm crosses trail_trigger, then track peak
+        trail_stop_level: Optional[float] = None
+        if trail_trigger > 0 and trail_pct > 0:
+            if not trail_active and net_mtm >= trail_trigger:
+                trail_active = True
+                trail_peak   = net_mtm
+            if trail_active:
+                if net_mtm > trail_peak:
+                    trail_peak = net_mtm
+                trail_stop_level = round(trail_peak * trail_pct, 2)
 
         fired_event: Optional[str] = None
-        if net_mtm >= target_threshold:
-            fired_event = "TARGET_EXIT"
-        elif net_mtm <= stop_threshold:
+        if net_mtm <= stop_threshold:
             fired_event = "STOP_EXIT"
+        elif trail_active and trail_stop_level is not None and net_mtm <= trail_stop_level:
+            fired_event = "TRAIL_EXIT"
+        elif trail_trigger == 0 and net_mtm >= target_threshold:
+            # TARGET_EXIT is suppressed when a trailing stop is configured —
+            # the trail manages the profit exit so the position can run past target.
+            fired_event = "TARGET_EXIT"
         elif t >= sq_time:
             fired_event = "TIME_EXIT"
 
@@ -486,6 +543,7 @@ async def execute_run(
             "gross_mtm": round(gross_mtm_total, 2),
             "est_exit_charges": round(est_exit_charges, 2),
             "net_mtm": round(net_mtm, 2),
+            "trail_stop_level": trail_stop_level,
             "event_code": fired_event,
         })
 
@@ -503,6 +561,8 @@ async def execute_run(
         if fired_event:
             exit_reason = fired_event
             exit_ts = ts
+            if fired_event == "TRAIL_EXIT" and trail_stop_level is not None:
+                trail_stop_at_exit = trail_stop_level
             event_rows.append({
                 "run_id": run_id, "timestamp": ts,
                 "event_type": fired_event, "reason_code": fired_event,
@@ -535,6 +595,13 @@ async def execute_run(
         )
         realized_net_pnl = round(gross_pnl - total_charges, 2)
 
+        # For TRAIL_EXIT the stop is a guaranteed floor — lock in at trail_stop_level.
+        # The actual 1-min close may gap through the stop; we assume the stop order
+        # filled at the trail level, not the candle close.
+        if exit_reason == "TRAIL_EXIT" and trail_stop_at_exit is not None:
+            realized_net_pnl = round(trail_stop_at_exit, 2)
+            gross_pnl        = round(trail_stop_at_exit + total_charges, 2)
+
     if not trade_open:
         # Session ended without an entry
         if not exit_reason:
@@ -561,7 +628,7 @@ async def execute_run(
         executor=strategy.get("executor", "generic_v1"),
         instrument=instrument,
         trade_date=trade_date,
-        entry_time=validation.entry_time if trade_open else None,
+        entry_time=actual_entry_ts.strftime("%H:%M") if actual_entry_ts else None,
         exit_time=exit_ts.strftime("%H:%M") if exit_ts else None,
         status=status,
         exit_reason=exit_reason,
