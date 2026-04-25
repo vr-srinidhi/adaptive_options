@@ -13,7 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db
 from app.dependencies.auth import get_current_active_user
-from app.models.historical import SessionBatch, TradingDay
+from app.models.historical import SessionBatch, SpotCandle, TradingDay
 from app.models.paper_trade import (
     MinuteDecision,
     PaperCandleSeries,
@@ -633,7 +633,16 @@ async def get_run_replay(
             .order_by(StrategyRunEvent.timestamp)
         )).scalars().all()
 
-        return strategy_run_replay_payload(run_row, legs, mtm_rows, leg_mtm_rows, events)
+        spot_candles_full = (await db.execute(
+            select(SpotCandle)
+            .where(
+                SpotCandle.symbol == run_row.instrument,
+                SpotCandle.trade_date == run_row.trade_date,
+            )
+            .order_by(SpotCandle.timestamp)
+        )).scalars().all()
+
+        return strategy_run_replay_payload(run_row, legs, mtm_rows, leg_mtm_rows, events, spot_candles_full)
 
     if kind not in {"paper_session", "historical_session"}:
         raise HTTPException(status_code=404, detail="Replay is only available for session-level runs.")

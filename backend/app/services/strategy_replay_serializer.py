@@ -52,6 +52,7 @@ def strategy_run_replay_payload(
     mtm_rows: List[StrategyRunMtm],
     leg_mtm_rows: List[StrategyLegMtm],
     events: List[StrategyRunEvent],
+    spot_candles_full: Optional[List] = None,
 ) -> Dict[str, Any]:
     """Full replay payload per PRD §13."""
 
@@ -137,6 +138,17 @@ def strategy_run_replay_payload(
         for ev in sorted(events, key=lambda e: e.timestamp)
     ]
 
+    # Full-day spot series (09:15–15:30 for context charts)
+    spot_series_full = []
+    if spot_candles_full:
+        spot_series_full = [
+            {
+                "timestamp": candle.timestamp.isoformat(),
+                "close": float(candle.close) if candle.close is not None else None,
+            }
+            for candle in spot_candles_full
+        ]
+
     # Entry credit total
     entry_credit_total = (
         float(run.entry_credit_total) if run.entry_credit_total is not None else None
@@ -162,9 +174,10 @@ def strategy_run_replay_payload(
             "realized_net_pnl":    float(run.realized_net_pnl) if run.realized_net_pnl is not None else None,
             "warnings":            (run.result_json or {}).get("warnings", []),
         },
-        "legs":         serialized_legs,
-        "spot_series":  spot_series,
-        "mtm_series":   mtm_series,
-        "events":       serialized_events,
-        "minute_table": minute_table,
+        "legs":             serialized_legs,
+        "spot_series":      spot_series,
+        "spot_series_full": spot_series_full,
+        "mtm_series":       mtm_series,
+        "events":           serialized_events,
+        "minute_table":     minute_table,
     }
