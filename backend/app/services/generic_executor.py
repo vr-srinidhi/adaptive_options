@@ -392,8 +392,9 @@ async def execute_run(
     exit_reason: Optional[str] = None
     exit_ts: Optional[datetime] = None
     # Trailing stop state
-    trail_active = False
-    trail_peak   = 0.0
+    trail_active       = False
+    trail_peak         = 0.0
+    trail_stop_at_exit: Optional[float] = None
 
     mtm_rows: List[Dict]      = []
     leg_mtm_rows: List[Dict]  = []
@@ -551,6 +552,8 @@ async def execute_run(
         if fired_event:
             exit_reason = fired_event
             exit_ts = ts
+            if fired_event == "TRAIL_EXIT" and trail_stop_level is not None:
+                trail_stop_at_exit = trail_stop_level
             event_rows.append({
                 "run_id": run_id, "timestamp": ts,
                 "event_type": fired_event, "reason_code": fired_event,
@@ -582,6 +585,13 @@ async def execute_run(
             sell_entry, sell_exit if sell_exit else [0.0],
         )
         realized_net_pnl = round(gross_pnl - total_charges, 2)
+
+        # For TRAIL_EXIT the stop is a guaranteed floor — lock in at trail_stop_level.
+        # The actual 1-min close may gap through the stop; we assume the stop order
+        # filled at the trail level, not the candle close.
+        if exit_reason == "TRAIL_EXIT" and trail_stop_at_exit is not None:
+            realized_net_pnl = round(trail_stop_at_exit, 2)
+            gross_pnl        = round(trail_stop_at_exit + total_charges, 2)
 
     if not trade_open:
         # Session ended without an entry
