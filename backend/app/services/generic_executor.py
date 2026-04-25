@@ -47,7 +47,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models.historical import TradingDay
+from app.models.historical import OptionsCandle, TradingDay
 from app.models.strategy_run import (
     StrategyLegMtm,
     StrategyRun,
@@ -234,10 +234,36 @@ async def validate_run(
     leg_template = strategy.get("leg_template", [])
     resolved_legs = resolve_leg_strikes(leg_template, atm_strike, spec.strike_step)
 
-    # 7. Confirm each leg has data at entry minute
+    # 7. Confirm each resolved leg strike has a price at the entry minute
+    entry_dt = datetime.combine(trade_date, _parse_time(entry_time_str))
     contracts = []
+    missing_legs: List[str] = []
     for side, opt_type, strike in resolved_legs:
+        row = (await db.execute(
+            select(OptionsCandle)
+            .where(
+                OptionsCandle.symbol == instrument,
+                OptionsCandle.trade_date == trade_date,
+                OptionsCandle.expiry_date == expiry_result.expiry,
+                OptionsCandle.strike == strike,
+                OptionsCandle.option_type == opt_type,
+                OptionsCandle.timestamp == entry_dt,
+            )
+            .limit(1)
+        )).scalar_one_or_none()
+        if row is None:
+            missing_legs.append(f"{opt_type} {strike}")
         contracts.append({"side": side, "option_type": opt_type, "strike": strike})
+
+    if missing_legs:
+        return ValidationResult(
+            validated=False, instrument=instrument,
+            trade_date=trade_date_str, entry_time=entry_time_str,
+            error=(
+                f"No price data at {entry_time_str} for: {', '.join(missing_legs)}. "
+                "These strikes are not tradable on this date at the requested entry time."
+            ),
+        )
 
     # 8. Position sizing
     capital = float(config.get("capital", 0))
@@ -334,6 +360,7 @@ async def execute_run(
     entry_credit_total    = 0.0
     entry_charges         = 0.0
     exit_reason: Optional[str] = None
+    exit_ts: Optional[datetime] = None
 
     mtm_rows: List[Dict]      = []
     leg_mtm_rows: List[Dict]  = []
@@ -417,6 +444,7 @@ async def execute_run(
 
         if data_gap and config.get("exit_rule", {}).get("data_gap_exit", True):
             exit_reason = "DATA_GAP_EXIT"
+            exit_ts = ts
             event_rows.append({
                 "run_id": run_id, "timestamp": ts,
                 "event_type": "DATA_GAP_EXIT", "reason_code": "DATA_GAP_EXIT",
@@ -474,6 +502,7 @@ async def execute_run(
 
         if fired_event:
             exit_reason = fired_event
+            exit_ts = ts
             event_rows.append({
                 "run_id": run_id, "timestamp": ts,
                 "event_type": fired_event, "reason_code": fired_event,
@@ -533,7 +562,7 @@ async def execute_run(
         instrument=instrument,
         trade_date=trade_date,
         entry_time=validation.entry_time if trade_open else None,
-        exit_time=exit_reason and mtm_rows[-1]["timestamp"].strftime("%H:%M") if mtm_rows else None,
+        exit_time=exit_ts.strftime("%H:%M") if exit_ts else None,
         status=status,
         exit_reason=exit_reason,
         capital=validation.capital if hasattr(validation, "capital") else float(config.get("capital", 0)),
@@ -551,6 +580,13 @@ async def execute_run(
 
     if trade_open:
         for i, ((side, opt_type, strike), leg_id) in enumerate(zip(resolved, leg_ids)):
+            ep = entry_prices[i]
+            xp = last_prices[i]
+            if ep is not None and xp is not None:
+                raw_pnl = (ep - xp) if side == "SELL" else (xp - ep)
+                leg_gross_pnl = round(raw_pnl * lot_size * approved_lots, 2)
+            else:
+                leg_gross_pnl = None
             db.add(StrategyRunLeg(
                 id=leg_id,
                 run_id=run_id,
@@ -560,9 +596,9 @@ async def execute_run(
                 strike=strike,
                 expiry_date=expiry,
                 quantity=lot_size * approved_lots,
-                entry_price=entry_prices[i],
-                exit_price=last_prices[i],
-                gross_leg_pnl=None,
+                entry_price=ep,
+                exit_price=xp,
+                gross_leg_pnl=leg_gross_pnl,
             ))
 
     for row in mtm_rows:
