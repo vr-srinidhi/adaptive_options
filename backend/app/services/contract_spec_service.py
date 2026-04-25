@@ -133,21 +133,35 @@ async def resolve_expiry(
             "Ensure data has been ingested into the warehouse."
         )
 
-    # Try each expiry until we find one with CE + PE at the entry minute
+    # Try each expiry until we find one with CE + PE at the entry minute.
+    # Query CE and PE separately — a single .limit(4) query can return all rows
+    # of one type when the index is scanned in option_type order.
     for (expiry,) in rows:
-        count_result = (await db.execute(
+        has_ce = (await db.execute(
             select(OptionsCandle)
             .where(
                 OptionsCandle.symbol == instrument,
                 OptionsCandle.trade_date == trade_date,
                 OptionsCandle.expiry_date == expiry,
+                OptionsCandle.option_type == "CE",
                 OptionsCandle.timestamp == entry_dt,
             )
-            .limit(4)
-        )).scalars().all()
+            .limit(1)
+        )).scalar_one_or_none()
 
-        option_types_available = {r.option_type for r in count_result}
-        if "CE" in option_types_available and "PE" in option_types_available:
+        has_pe = (await db.execute(
+            select(OptionsCandle)
+            .where(
+                OptionsCandle.symbol == instrument,
+                OptionsCandle.trade_date == trade_date,
+                OptionsCandle.expiry_date == expiry,
+                OptionsCandle.option_type == "PE",
+                OptionsCandle.timestamp == entry_dt,
+            )
+            .limit(1)
+        )).scalar_one_or_none()
+
+        if has_ce and has_pe:
             if expiry != rows[0][0]:
                 warnings.append(
                     f"Nearest expiry {rows[0][0]} had no CE/PE data at entry; "

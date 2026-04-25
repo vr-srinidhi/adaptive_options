@@ -130,9 +130,12 @@ class FakeDB:
             return _ExecResult(rows=self.expiry_rows)
 
         if "OptionsCandle" in sql or "options_candles" in sql:
-            # resolve_expiry uses .scalars().all() — served from option_rows
-            # per-leg price check uses .scalar_one_or_none() — served from _leg_price_rows
-            return _ExecResult(rows=self.option_rows, leg_rows=self._leg_price_rows)
+            # Per-leg price checks (validate_run step 7) filter by strike; resolve_expiry does not.
+            # SQLAlchemy renders a strike filter as `:strike_1` in the parameterised SQL string.
+            if ":strike_" in sql:
+                return _ExecResult(rows=self.option_rows, leg_rows=self._leg_price_rows)
+            # resolve_expiry CE/PE availability check — always use option_rows
+            return _ExecResult(rows=self.option_rows)
 
         # strategy_run_events, strategy_runs, etc. — not needed for validate
         return _ExecResult()
