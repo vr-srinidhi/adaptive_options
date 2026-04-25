@@ -180,7 +180,12 @@ Sells ATM CE + ATM PE simultaneously. Profit if spot stays range-bound; loss if 
 | SELL CE | ATM | Collect call premium |
 | SELL PE | ATM | Collect put premium |
 
-Default exit: 30% target, 150% stop, 15:25 time exit.
+Exit rules:
+- **Stop**: 1.5% of capital (e.g. ₹37,500 at ₹25L) — capital-based, not credit-based
+- **Trailing stop**: activates once net MTM ≥ ₹12,000; exits when net MTM falls to 50% of the peak reached. Once the trail is configured, the target exit is suppressed — the trail manages the profit exit instead.
+- **Time exit**: 15:25
+
+When a TRAIL_EXIT fires, realized P&L is locked at the trail stop level (not the candle close, which may gap through the stop).
 
 ---
 
@@ -447,7 +452,8 @@ backend/
 |------|---------|
 | `src/api/index.js` | All API calls — axios wrappers for every endpoint group |
 | `src/pages/RunBuilder.jsx` | Run config form with `normalizeVisual()`, `countWeekdaysInRange()` |
-| `src/pages/ReplayAnalyzer.jsx` | Gate-by-gate audit, MTM chart, explainability block |
+| `src/pages/ReplayAnalyzer.jsx` | Full-day Spot + MTM charts (09:15–15:29) with green IN / red OUT markers; purple dashed "If held" shadow MTM line after exit; gate-by-gate audit, legs table |
+| `src/pages/RunsLibrary.jsx` | All saved runs sorted by date desc; infinite scroll (loads 20 rows on sentinel intersection) |
 | `src/components/TopNav.jsx` | Primary workbench nav + legacy links (hidden on workbench) |
 | `src/index.css` | `wb-*` CSS token classes (wb-card, wb-kicker, wb-grid, wb-chip, etc.) |
 

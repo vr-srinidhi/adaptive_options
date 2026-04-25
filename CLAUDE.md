@@ -246,7 +246,7 @@ The minimum is always 1 lot. Never remove this floor.
 - `modes` — `paper_replay`, `historical_backtest`, and/or `single_session_backtest`
 - `leg_template` — declarative list of `{side, option_type, strike_offset_steps}` (generic_v1 only)
 - `entry_rule_id` — key into `entry_rule_registry.py` (`"timed_entry"` covers ~38/40 strategies)
-- `exit_rule` — `{target_pct, stop_multiple, time_exit, data_gap_exit}` (generic_v1 only)
+- `exit_rule` — `{target_pct, stop_capital_pct, stop_multiple, trail_trigger, trail_pct, time_exit, data_gap_exit}` (generic_v1 only)
 - `params_schema` — field definitions consumed by the Run Builder form
 - `defaults` — live-computed via `_current_replay_defaults()` using `latest_weekday()`
 - `visual_hints` — payoff shape, constraint fields, leg descriptions, metric ratios consumed by `RunBuilder.jsx` via `normalizeVisual()`
@@ -264,7 +264,7 @@ The minimum is always 1 lot. Never remove this floor.
     "entry_rule_id": "timed_entry",
     "modes": ["single_session_backtest"],
     "leg_template": [{"side": "BUY", "option_type": "CE", "strike_offset_steps": 1}],
-    "exit_rule": {"target_pct": 0.50, "stop_multiple": 1.0, "time_exit": "15:25", "data_gap_exit": True},
+    "exit_rule": {"target_pct": 0.50, "stop_capital_pct": 0.01, "time_exit": "15:25", "data_gap_exit": True},
     ...
 }
 ```
@@ -289,13 +289,23 @@ execute_run(db, run_id, strategy, config, validation, user_id)
   ├── load spot_candles, vix_candles, option_candles from warehouse
   ├── minute loop:
   │     entry rule → ENTER or HOLD
+  │       if prices missing at entry_time, retry for up to 5 min (grace window)
+  │       actual entry timestamp persisted (may differ from configured entry_time)
   │     on ENTER: record leg prices, entry_credit, entry_charges
-  │     on HOLD with trade open: compute MTM, check exits
-  │       TARGET_EXIT  net_mtm >= entry_credit_total × target_pct
-  │       STOP_EXIT    net_mtm <= -(entry_credit_total × stop_multiple)
-  │       TIME_EXIT    minute_ts.time() >= time_exit
+  │     on HOLD with trade open: compute MTM, check exits (in priority order):
+  │       STOP_EXIT      net_mtm <= -(capital × stop_capital_pct)  [preferred]
+  │                   or net_mtm <= -(entry_credit_total × stop_multiple)  [fallback]
+  │       TRAIL_EXIT     trail active AND net_mtm <= trail_peak × trail_pct
+  │       TARGET_EXIT    net_mtm >= entry_credit_total × target_pct
+  │                      (suppressed when trail_trigger > 0 — trail manages profit exit)
+  │       TIME_EXIT      minute_ts.time() >= time_exit
   │       DATA_GAP_EXIT  stale_minutes > 1
   └── persist all 6 tables in a single commit
+
+Trailing stop: activates once net_mtm >= trail_trigger; thereafter tracks peak
+and exits when net_mtm falls to trail_peak × trail_pct. When TRAIL_EXIT fires,
+realized_net_pnl is locked at trail_stop_level (not the candle close, which may
+gap through the stop).
 ```
 
 MTM formula (short strategies):
@@ -311,11 +321,30 @@ SELL ATM CE + SELL ATM PE at `entry_time`. Profits from premium decay when spot 
 
 | Parameter | Value |
 |-----------|-------|
-| Entry rule | `timed_entry` — enter exactly at `entry_time` |
-| Target exit | 30% of entry credit net |
-| Stop exit | 1.5× entry credit loss |
+| Entry rule | `timed_entry` — enter at `entry_time`; retries up to 5 min if prices missing |
+| Target exit | Suppressed when trail is configured — trail manages profit exit |
+| Stop exit | 1.5% of capital (e.g. ₹37,500 at ₹25L) |
+| Trailing stop | Activates at ₹12,000 net MTM; exits if net_mtm drops to 50% of peak |
 | Time exit | 15:25 |
 | Lot sizes | 75 (NIFTY post-Nov 2024), 50 (NIFTY pre-Nov 2024) |
+
+### ReplayAnalyzer — strategy_run chart payload
+
+`GET /api/v2/runs/strategy_run/{id}/replay` returns:
+
+```
+{
+  run:              { id, trade_date, entry_time, exit_time, status, exit_reason, ... }
+  legs:             [{ leg_index, side, option_type, strike, expiry_date, entry_price, exit_price }]
+  spot_series_full: [{ timestamp, close }]   ← full day 09:15–15:29 (375 rows)
+  mtm_series:       [{ timestamp, gross_mtm, net_mtm, trail_stop_level, event_code }]  ← trade window only
+  shadow_mtm_series:[{ timestamp, net_mtm }] ← exit_time+1 → 15:25, hypothetical "if held"
+  minute_table:     flat join spot + leg prices per minute
+  events:           ENTRY / HOLD / EXIT events with payload_json
+}
+```
+
+`ReplayAnalyzer.jsx` uses `spot_series_full` as the x-axis backbone for both the Spot and MTM charts so the full trading day (09:15–15:29) is always visible. The MTM line renders only for the trade window (null before entry, null after exit, `connectNulls={false}`). The shadow MTM line (`#a78bfa` dashed) continues from exit to 15:25. `ReferenceLine` marks entry (green IN) and exit (red OUT) on both charts.
 
 ### instrument_contract_specs
 
@@ -398,7 +427,7 @@ All under `/api/v2`. Strategy catalog endpoints are intentionally public (no aut
 | POST | `/v2/runs/validate` | Dry-run validation — resolves contract, expiry, lots; no DB writes |
 | GET | `/v2/runs/{kind}/{id}` | Run detail; `kind` ∈ `paper_session`, `historical_batch`, `historical_session`, `strategy_run` |
 | GET | `/v2/runs/{kind}/{id}/replay` | Full replay payload; `strategy_run` kind returns PRD §13 shape |
-| GET | `/v2/runs/compare` | Compare up to 4 runs by comma-separated `refs` (`kind:uuid,...`) |
+| GET | `/v2/runs/compare` | Compare up to 4 runs by comma-separated `refs` (`kind:uuid,...`); supports `paper_session`, `historical_batch`, `strategy_run` |
 
 ### Zerodha Auth
 
@@ -475,8 +504,8 @@ JSONB columns: `legs` (option leg objects), `min_data` (`{time, spot, pnl}` per 
 | `/workbench/strategies` | `StrategyCatalog.jsx` | Browse strategy cards by bucket |
 | `/workbench/run` | `RunBuilder.jsx` | Configure + launch a run |
 | `/workbench/replay` | `ReplayDesk.jsx` | Paper session list + replay entry |
-| `/workbench/replay/:kind/:id` | `ReplayAnalyzer.jsx` | Per-session: charts, decisions, legs |
-| `/workbench/history` | `RunsLibrary.jsx` | All saved runs with filters |
+| `/workbench/replay/:kind/:id` | `ReplayAnalyzer.jsx` | Per-session: full-day spot + MTM charts with IN/OUT markers, shadow MTM, decisions, legs |
+| `/workbench/history` | `RunsLibrary.jsx` | All saved runs, sorted date desc, infinite scroll (20 rows at a time) |
 | `/workbench/history/:kind/:id` | `WorkbenchHistoryDetail.jsx` | Batch or session detail |
 
 ### Historical Backtest
@@ -569,7 +598,10 @@ The runtime `create_all` + idempotent `ALTER TABLE IF NOT EXISTS` in `init_db()`
 - `visual_hints` keys in `workbench_catalog.py` — `RunBuilder.jsx::normalizeVisual()` maps snake_case keys directly; renaming requires updating both files
 - `leg_template` / `exit_rule` keys in `workbench_catalog.py` — `generic_executor.py` reads these directly by name
 - `instrument_contract_specs` seed in `database.py` — date ranges must be accurate; the Nov-2024 lot size change (50→75 NIFTY, 25→35 BANKNIFTY) is baked in
-- `_MAX_STALE_MINUTES = 1` in `generic_executor.py` — controls DATA_GAP_EXIT sensitivity; changing affects all generic_v1 strategies
+- `_MAX_STALE_MINUTES = 1` in `generic_executor.py` — controls DATA_GAP_EXIT sensitivity; changing affects all generic_v1 strategies and the shadow MTM stale cap in `workbench.py::_compute_shadow_mtm`
+- `stop_capital_pct` vs `stop_multiple` in exit_rule — `stop_capital_pct` takes precedence when present; `stop_multiple` is the fallback for backward-compat with old catalog entries. Do not remove the fallback.
+- Exit check order in `generic_executor.py` — STOP → TRAIL → TARGET → TIME → DATA_GAP. TARGET is intentionally checked *after* TRAIL and is suppressed when `trail_trigger > 0`. Do not reorder.
+- `trail_stop_at_exit` lock in `generic_executor.py` — TRAIL_EXIT P&L is locked at `trail_stop_level`, not the candle close. Removing this causes gap-through slippage to inflate reported losses.
 
 ---
 
