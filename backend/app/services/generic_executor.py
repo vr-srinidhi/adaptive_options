@@ -234,12 +234,17 @@ async def validate_run(
     leg_template = strategy.get("leg_template", [])
     resolved_legs = resolve_leg_strikes(leg_template, atm_strike, spec.strike_step)
 
-    # 7. Confirm each resolved leg strike has a price at the entry minute
+    # 7. Confirm each resolved leg strike has a price within the entry grace window
+    from datetime import timedelta as _td
+    _GRACE = 5   # minutes — must match _ENTRY_GRACE_MINUTES in entry_rule_registry
     entry_dt = datetime.combine(trade_date, _parse_time(entry_time_str))
+    grace_end_dt = entry_dt + _td(minutes=_GRACE)
     contracts = []
-    missing_legs: List[str] = []
+    exact_missing: List[str] = []
+    fully_missing: List[str] = []
     for side, opt_type, strike in resolved_legs:
-        row = (await db.execute(
+        # Check exact minute first
+        exact_row = (await db.execute(
             select(OptionsCandle)
             .where(
                 OptionsCandle.symbol == instrument,
@@ -251,18 +256,40 @@ async def validate_run(
             )
             .limit(1)
         )).scalar_one_or_none()
-        if row is None:
-            missing_legs.append(f"{opt_type} {strike}")
+        if exact_row is None:
+            exact_missing.append(f"{opt_type} {strike}")
+            # Check whether any minute in the grace window has data
+            grace_row = (await db.execute(
+                select(OptionsCandle)
+                .where(
+                    OptionsCandle.symbol == instrument,
+                    OptionsCandle.trade_date == trade_date,
+                    OptionsCandle.expiry_date == expiry_result.expiry,
+                    OptionsCandle.strike == strike,
+                    OptionsCandle.option_type == opt_type,
+                    OptionsCandle.timestamp > entry_dt,
+                    OptionsCandle.timestamp <= grace_end_dt,
+                )
+                .limit(1)
+            )).scalar_one_or_none()
+            if grace_row is None:
+                fully_missing.append(f"{opt_type} {strike}")
         contracts.append({"side": side, "option_type": opt_type, "strike": strike})
 
-    if missing_legs:
+    if fully_missing:
         return ValidationResult(
             validated=False, instrument=instrument,
             trade_date=trade_date_str, entry_time=entry_time_str,
             error=(
-                f"No price data at {entry_time_str} for: {', '.join(missing_legs)}. "
-                "These strikes are not tradable on this date at the requested entry time."
+                f"No price data within {_GRACE} minutes of {entry_time_str} "
+                f"for: {', '.join(fully_missing)}. "
+                "These strikes are not tradable on this date."
             ),
+        )
+    if exact_missing:
+        warnings.append(
+            f"No price at exactly {entry_time_str} for {', '.join(exact_missing)}. "
+            f"Entry will be attempted within the next {_GRACE} minutes."
         )
 
     # 8. Position sizing
@@ -394,10 +421,11 @@ async def execute_run(
             if signal.action == "ENTER":
                 # Validate all leg prices are available at entry
                 if any(p is None for p in cur_prices):
+                    # Log as HOLD so the grace-window retry can fire next minute
                     event_rows.append({
                         "run_id": run_id, "timestamp": ts,
-                        "event_type": "NO_TRADE", "reason_code": "MISSING_LEG_PRICE",
-                        "reason_text": "One or more leg prices unavailable at entry",
+                        "event_type": "HOLD", "reason_code": "MISSING_LEG_PRICE",
+                        "reason_text": "Leg prices unavailable at entry — retrying next minute",
                     })
                     continue
 

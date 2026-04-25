@@ -49,9 +49,16 @@ class BaseEntryRule(ABC):
 
 # ── TimedEntryRule ────────────────────────────────────────────────────────────
 
+_ENTRY_GRACE_MINUTES = 5   # retry window: enter at entry_time or any of the next 5 minutes
+
+
 class TimedEntryRule(BaseEntryRule):
     """
-    Enter exactly at the configured entry_time minute.
+    Enter at the configured entry_time, with a grace window for missing prices.
+
+    Returns ENTER for any minute in [entry_time, entry_time + _ENTRY_GRACE_MINUTES].
+    This lets execute_run retry entry on the next available minute if the exact
+    entry_time candle is missing from the warehouse.
 
     config keys used:
       entry_time  str  "HH:MM"  (required)
@@ -74,11 +81,16 @@ class TimedEntryRule(BaseEntryRule):
         except Exception:
             target = time(9, 50)
 
+        from datetime import date as _date, timedelta
+        target_end = (
+            datetime.combine(_date.today(), target) + timedelta(minutes=_ENTRY_GRACE_MINUTES)
+        ).time()
+
         current = minute_ts.time().replace(second=0, microsecond=0)
 
-        if current == target:
+        if target <= current <= target_end:
             return EntrySignal("ENTER", "ENTRY_SCHEDULED", f"Entry at {entry_time_str}")
-        if current > target:
+        if current > target_end:
             return EntrySignal(
                 "HOLD",
                 "PAST_ENTRY_TIME",
