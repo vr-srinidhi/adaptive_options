@@ -142,10 +142,10 @@ function MtmChart({ data, showTrail, entryLabel, exitLabel }) {
         <ResponsiveContainer width="100%" height="100%">
           <LineChart data={data} margin={{ top: 8, right: 16, left: 8, bottom: 0 }}>
             <CartesianGrid strokeDasharray="3 3" stroke="#213047" vertical={false} />
-            <XAxis dataKey="label" tick={{ fill: '#8090aa', fontSize: 10 }} tickLine={false} axisLine={{ stroke: '#27364b' }} interval={14} />
+            <XAxis dataKey="label" tick={{ fill: '#8090aa', fontSize: 10 }} tickLine={false} axisLine={{ stroke: '#27364b' }} interval={29} />
             <YAxis tick={{ fill: '#8090aa', fontSize: 10 }} tickLine={false} axisLine={false} width={88} tickFormatter={v => fmtINR(v)} domain={[lo, hi]} />
             <Tooltip
-              formatter={(value, name) => [fmtINR(value), name === 'net_mtm' ? 'Net MTM' : 'Trail stop']}
+              formatter={(value, name) => value != null ? [fmtINR(value), name === 'net_mtm' ? 'Net MTM' : 'Trail stop'] : null}
               contentStyle={{ background: '#0f1726', border: '1px solid #27364b', borderRadius: 12, fontSize: 11 }}
               labelStyle={{ color: '#b8c7de' }}
             />
@@ -160,7 +160,7 @@ function MtmChart({ data, showTrail, entryLabel, exitLabel }) {
                 <Label value="OUT" position="insideTopLeft" fill="#ef4444" fontSize={10} fontWeight={700} />
               </ReferenceLine>
             )}
-            <Line type="monotone" dataKey="net_mtm" stroke="#36b37e" strokeWidth={2} dot={false} connectNulls />
+            <Line type="monotone" dataKey="net_mtm" stroke="#36b37e" strokeWidth={2} dot={false} connectNulls={false} />
             {showTrail && (
               <Line type="monotone" dataKey="trail_stop" stroke="#f59e0b" strokeWidth={1.5} strokeDasharray="5 3" dot={false} connectNulls={false} />
             )}
@@ -207,13 +207,18 @@ function StrategyRunAnalyzer({ payload, kind, id, navigate }) {
     return m
   }, [mtmSeries])
 
+  // Full-day MTM: use spot backbone, fill in trade-window values, null elsewhere
   const chartMtm = useMemo(
-    () => mtmSeries.map(r => ({
-      label: timeLabel(r.timestamp),
-      net_mtm: r.net_mtm != null ? Number(r.net_mtm) : null,
-      trail_stop: r.trail_stop_level != null ? Number(r.trail_stop_level) : null,
-    })),
-    [mtmSeries]
+    () => spotSeriesFull.map(r => {
+      const lbl = timeLabel(r.timestamp)
+      const mtm = mtmByLabel[lbl]
+      return {
+        label: lbl,
+        net_mtm:   mtm ? mtm.net_mtm   : null,
+        trail_stop: mtm ? mtm.trail_stop : null,
+      }
+    }),
+    [spotSeriesFull, mtmByLabel]
   )
 
   const hasTrail = chartMtm.some(r => r.trail_stop != null)
