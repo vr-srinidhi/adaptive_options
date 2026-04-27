@@ -103,9 +103,12 @@ def _vix_candle(ts_str, close):
     )
 
 
-def _spot_candle(ts_str, close):
+def _spot_candle(ts_str, close, open=None, high=None, low=None):
     return SimpleNamespace(
         timestamp=datetime.fromisoformat(ts_str),
+        open=Decimal(str(open  if open  is not None else close)),
+        high=Decimal(str(high  if high  is not None else close)),
+        low=Decimal(str(low   if low   is not None else close)),
         close=Decimal(str(close)),
     )
 
@@ -272,6 +275,22 @@ def test_data_quality_warning_for_forward_filled_vix():
         vix_candles_full=vix_candles,
     )
     assert any(w["type"] == "forward_filled_vix" for w in payload["data_quality"])
+
+
+# ── Spot series OHLC ─────────────────────────────────────────────────────────
+
+def test_spot_series_full_includes_ohlc():
+    """spot_series_full must carry open/high/low/close so CSV NIFTY columns are populated."""
+    candle = _spot_candle("2026-04-07T09:15:00", close=23000, open=22980, high=23020, low=22970)
+    payload = strategy_run_replay_payload(
+        _run(), [], [], [], [],
+        spot_candles_full=[candle],
+    )
+    row = payload["spot_series_full"][0]
+    assert row["open"]  == 22980.0
+    assert row["high"]  == 23020.0
+    assert row["low"]   == 22970.0
+    assert row["close"] == 23000.0
 
 
 # ── Legs table regression tests ───────────────────────────────────────────────

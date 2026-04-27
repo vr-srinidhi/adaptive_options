@@ -167,7 +167,10 @@ def strategy_run_replay_payload(
         spot_series_full = [
             {
                 "timestamp": candle.timestamp.isoformat(),
-                "close":     float(candle.close) if candle.close is not None else None,
+                "open":  float(candle.open)  if candle.open  is not None else None,
+                "high":  float(candle.high)  if candle.high  is not None else None,
+                "low":   float(candle.low)   if candle.low   is not None else None,
+                "close": float(candle.close) if candle.close is not None else None,
             }
             for candle in spot_candles_full
         ]
