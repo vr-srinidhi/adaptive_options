@@ -5,7 +5,7 @@ Deterministic candle generation, indicator computation, and option pricing.
 import hashlib
 import math
 from datetime import date, time
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
@@ -42,18 +42,25 @@ def _seed(trade_date: date, instrument: str) -> int:
 
 # ── Zerodha real candle fetch ─────────────────────────────────────────────────
 
-def _candles_from_zerodha(trade_date: date, instrument: str) -> Tuple[np.ndarray, float]:
+def _candles_from_zerodha(
+    trade_date: date,
+    instrument: str,
+    access_token: Optional[str] = None,
+) -> Tuple[np.ndarray, float]:
     """
     Fetch real underlying 1-min candles from Zerodha for *instrument* on *trade_date*.
     Returns (candles shape (375,4), daily_vol).
     Raises DataUnavailableError or RuntimeError if unavailable/unauthenticated.
     """
-    from app.services import zerodha_client
+    from app.services.zerodha_client import fetch_candles_with_token
     from app.services.option_resolver import UNDERLYING_TOKENS
     from datetime import time as dtime
 
+    if not access_token:
+        raise RuntimeError("No per-user Zerodha access token available.")
+
     token = UNDERLYING_TOKENS[instrument]
-    records = zerodha_client.fetch_candles(token, trade_date)
+    records = fetch_candles_with_token(token, trade_date, access_token)
 
     session_start = dtime(9, 15)
     session_end = dtime(15, 29)
@@ -89,11 +96,13 @@ def _candles_from_zerodha(trade_date: date, instrument: str) -> Tuple[np.ndarray
 
 
 def _get_candles_and_source(
-    trade_date: date, instrument: str
+    trade_date: date,
+    instrument: str,
+    access_token: Optional[str] = None,
 ) -> Tuple[np.ndarray, float, str]:
     """Try Zerodha first; fall back to synthetic. Returns (candles, daily_vol, data_source)."""
     try:
-        candles, daily_vol = _candles_from_zerodha(trade_date, instrument)
+        candles, daily_vol = _candles_from_zerodha(trade_date, instrument, access_token)
         return candles, daily_vol, "ZERODHA"
     except Exception:
         candles, daily_vol = generate_candles(trade_date, instrument)
@@ -106,10 +115,15 @@ def _iv_rank_from_vol(daily_vol: float) -> int:
     return int(max(0, min(100, round((daily_vol - lo) / (hi - lo) * 100.0))))
 
 
-def _fetch_option_price_map(token: int, trade_date: date) -> Dict[str, float]:
+def _fetch_option_price_map(
+    token: int,
+    trade_date: date,
+    access_token: str,
+) -> Dict[str, float]:
     """Return {HH:MM → close_price} for the option contract on trade_date."""
-    from app.services import zerodha_client
-    records = zerodha_client.fetch_candles(token, trade_date)
+    from app.services.zerodha_client import fetch_candles_with_token
+
+    records = fetch_candles_with_token(token, trade_date, access_token)
     return {
         f"{r['date'].hour:02d}:{r['date'].minute:02d}": float(r["close"])
         for r in records
@@ -348,7 +362,13 @@ def _idx_to_time_obj(idx: int) -> time:
 
 # ── Main day simulation ───────────────────────────────────────────────────────
 
-def run_day_simulation(trade_date: date, instrument: str, capital: float) -> Dict:
+def run_day_simulation(
+    trade_date: date,
+    instrument: str,
+    capital: float,
+    *,
+    access_token: Optional[str] = None,
+) -> Dict:
     """
     Simulate one trading day using the skill-enhanced engine:
       - 10-regime detection + signal scoring (EMA9/21, ATR14, RSI14)
@@ -368,7 +388,11 @@ def run_day_simulation(trade_date: date, instrument: str, capital: float) -> Dic
     tick_size = cfg["tick_size"]
     lot_size  = cfg["lot_size"]
 
-    candles, daily_vol, data_source = _get_candles_and_source(trade_date, instrument)
+    candles, daily_vol, data_source = _get_candles_and_source(
+        trade_date,
+        instrument,
+        access_token,
+    )
     closes = candles[:, 3]
 
     df = compute_indicators_df(candles)
@@ -458,8 +482,13 @@ def run_day_simulation(trade_date: date, instrument: str, capital: float) -> Dic
 
     if data_source == "ZERODHA":
         try:
-            from app.services import zerodha_client, option_resolver
-            master   = zerodha_client.get_instruments("NFO")
+            from app.services import option_resolver
+            from app.services.zerodha_client import get_instruments_with_token
+
+            if not access_token:
+                raise RuntimeError("No per-user Zerodha access token available.")
+
+            master   = get_instruments_with_token(access_token, "NFO")
             resolved, expiry_date = option_resolver.resolve_all_legs(
                 instrument, trade_date, legs, master
             )
@@ -467,7 +496,7 @@ def run_day_simulation(trade_date: date, instrument: str, capital: float) -> Dic
             for li, (token, _exp) in enumerate(resolved):
                 if token is not None:
                     try:
-                        pmap = _fetch_option_price_map(token, trade_date)
+                        pmap = _fetch_option_price_map(token, trade_date, access_token)
                         option_price_maps[li] = pmap
                         if entry_ts in pmap:
                             legs[li]["ep"] = pmap[entry_ts]

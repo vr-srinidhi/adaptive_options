@@ -17,6 +17,7 @@ from app.models.session import BacktestSession
 from app.models.user import User
 from app.services.calendar import HOLIDAY, TRADING_DAY, WEEKEND, get_trading_days
 from app.services.simulator import run_day_simulation
+from app.services.token_store import get_broker_token
 
 
 def _trading_days(start: date, end: date) -> list:
@@ -115,6 +116,7 @@ async def run_backtest(
         raise HTTPException(status_code=400, detail="Maximum 60 trading days per run.")
 
     sessions = []
+    broker_access_token = await get_broker_token(db, user.id)
 
     # Persist NO_TRADE audit rows for holidays and weekends
     for td, day_type in non_trading_days:
@@ -153,7 +155,12 @@ async def run_backtest(
     # Run simulation for actual trading days
     for td, _day_type in trading_days:
         try:
-            result = run_day_simulation(td, instrument, req.capital)
+            result = run_day_simulation(
+                td,
+                instrument,
+                req.capital,
+                access_token=broker_access_token,
+            )
         except Exception as exc:
             # DATA_UNAVAILABLE — persist audit row so the date isn't silently skipped
             obj = BacktestSession(
@@ -240,9 +247,7 @@ async def get_results(
     user: User = Depends(get_current_active_user),
 ):
     q = select(BacktestSession).order_by(BacktestSession.session_date.desc())
-    q = q.where(
-        (BacktestSession.user_id == user.id) | (BacktestSession.user_id.is_(None))
-    )
+    q = q.where(BacktestSession.user_id == user.id)
     if instrument:
         q = q.where(BacktestSession.instrument == instrument.strip().upper())
     q = q.limit(limit).offset(offset)
@@ -263,8 +268,7 @@ async def get_session(
     row = (await db.execute(
         select(BacktestSession).where(
             BacktestSession.id == sid,
-            # user_id IS NULL: intentional bridge for sessions created before auth was added
-            (BacktestSession.user_id == user.id) | (BacktestSession.user_id.is_(None)),
+            BacktestSession.user_id == user.id,
         )
     )).scalar_one_or_none()
     if not row:
@@ -279,7 +283,7 @@ async def get_summary(
     user: User = Depends(get_current_active_user),
 ):
     q = select(BacktestSession).where(
-        (BacktestSession.user_id == user.id) | (BacktestSession.user_id.is_(None))
+        BacktestSession.user_id == user.id
     )
     if instrument:
         q = q.where(BacktestSession.instrument == instrument.strip().upper())
@@ -312,15 +316,12 @@ async def clear_results(
     db: AsyncSession = Depends(get_db),
     user: User = Depends(get_current_active_user),
 ):
-    # Only delete this user's sessions (+ legacy sessions with no owner)
     q_count = select(func.count()).select_from(BacktestSession).where(
-        (BacktestSession.user_id == user.id) | (BacktestSession.user_id.is_(None))
+        BacktestSession.user_id == user.id
     )
     count = (await db.execute(q_count)).scalar() or 0
     await db.execute(
-        delete(BacktestSession).where(
-            (BacktestSession.user_id == user.id) | (BacktestSession.user_id.is_(None))
-        )
+        delete(BacktestSession).where(BacktestSession.user_id == user.id)
     )
     await db.commit()
     return {"deleted": count}
