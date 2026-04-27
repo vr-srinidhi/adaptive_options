@@ -126,6 +126,6 @@ export const validateWorkbenchRun = (payload) => api.post('/v2/runs/validate', p
 export const getWorkbenchRun = (kind, id) => api.get(`/v2/runs/${kind}/${id}`)
 export const getWorkbenchReplay = (kind, id) => api.get(`/v2/runs/${kind}/${id}/replay`)
 export const compareWorkbenchRuns = (refs) => api.get('/v2/runs/compare', { params: { refs } })
-export const getStrategyRunReplayCsvUrl = (id) => `${api.defaults.baseURL}/v2/runs/strategy_run/${id}/replay/csv`
+export const getStrategyRunReplayCsv = (id) => api.get(`/v2/runs/strategy_run/${id}/replay/csv`, { responseType: 'blob' })
 
 export default api

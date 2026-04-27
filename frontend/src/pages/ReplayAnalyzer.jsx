@@ -11,7 +11,7 @@ import {
   XAxis,
   YAxis,
 } from 'recharts'
-import { getStrategyRunReplayCsvUrl, getWorkbenchReplay } from '../api'
+import { getStrategyRunReplayCsv, getWorkbenchReplay } from '../api'
 import { fmtDateTime, fmtINR, fmtNumber, runKindLabel, runStatusTone } from '../utils/workbench'
 
 const timeLabel = value => value ? value.slice(11, 16) : '—'
@@ -402,11 +402,20 @@ function PremiumChart({ title, data, entryPrice, exitPrice, entryLabel, exitLabe
 
 // ── Decision Timeline ─────────────────────────────────────────────────────────
 
-const IMPORTANT_EVENTS = new Set(['ENTRY', 'EXIT', 'TRAIL_EXIT', 'STOP_EXIT', 'TARGET_EXIT',
-                                    'TIME_EXIT', 'DATA_GAP_EXIT', 'DATA_WARNING', 'NO_TRADE'])
+const IMPORTANT_EVENTS = new Set([
+  'ENTRY', 'EXIT',
+  'TRAIL_UPDATE', 'TRAIL_UPDATED',
+  'TRAIL_EXIT', 'STOP_EXIT', 'TARGET_EXIT', 'TIME_EXIT', 'DATA_GAP_EXIT',
+  'DATA_WARNING', 'NO_TRADE',
+])
 
 function isImportantEvent(ev) {
-  return IMPORTANT_EVENTS.has(ev.event_type) || ev.event_type?.includes('EXIT')
+  const type   = ev.event_type  || ''
+  const reason = ev.reason_code || ''
+  return IMPORTANT_EVENTS.has(type)
+    || type.includes('EXIT')
+    || type.includes('TRAIL')
+    || reason.includes('TRAIL')
 }
 
 function DecisionTimeline({ events }) {
@@ -474,15 +483,25 @@ function DecisionTimeline({ events }) {
 
 function ExportMenu({ runId, run }) {
   const [open, setOpen] = useState(false)
+  const [downloading, setDownloading] = useState(false)
 
-  const handleCsvDownload = () => {
-    const url = getStrategyRunReplayCsvUrl(runId)
-    const a = document.createElement('a')
-    a.href = url
-    // Pass auth header via link click isn't possible for file downloads
-    // Use window.open which will use the session cookie / storage
-    window.open(url, '_blank')
+  const handleCsvDownload = async () => {
     setOpen(false)
+    setDownloading(true)
+    try {
+      const res = await getStrategyRunReplayCsv(runId)
+      const blob = new Blob([res.data], { type: 'text/csv' })
+      const url = URL.createObjectURL(blob)
+      const a = document.createElement('a')
+      a.href = url
+      a.download = `replay_${run.instrument || ''}_${run.trade_date || ''}_${runId.slice(0, 8)}.csv`
+      document.body.appendChild(a)
+      a.click()
+      document.body.removeChild(a)
+      URL.revokeObjectURL(url)
+    } finally {
+      setDownloading(false)
+    }
   }
 
   const handlePdfPrint = () => {
@@ -495,8 +514,9 @@ function ExportMenu({ runId, run }) {
       <button
         className="wb-secondary-button flex items-center gap-1.5"
         onClick={() => setOpen(v => !v)}
+        disabled={downloading}
       >
-        Download ▾
+        {downloading ? 'Downloading…' : 'Download ▾'}
       </button>
       {open && (
         <div className="absolute right-0 top-full mt-1 z-50 rounded-xl shadow-2xl overflow-hidden"
@@ -513,7 +533,7 @@ function ExportMenu({ runId, run }) {
             style={{ color: 'var(--text-primary)' }}
             onClick={handlePdfPrint}
           >
-            PDF Report (Print)
+            Print / Save as PDF
           </button>
         </div>
       )}

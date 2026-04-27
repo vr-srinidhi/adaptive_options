@@ -714,89 +714,8 @@ async def get_run_replay(
         if run_row is None:
             raise HTTPException(status_code=404, detail="Run not found.")
 
-        legs = (await db.execute(
-            select(StrategyRunLeg)
-            .where(StrategyRunLeg.run_id == run_id)
-            .order_by(StrategyRunLeg.leg_index)
-        )).scalars().all()
-        mtm_rows = (await db.execute(
-            select(StrategyRunMtm)
-            .where(StrategyRunMtm.run_id == run_id)
-            .order_by(StrategyRunMtm.timestamp)
-        )).scalars().all()
-        leg_mtm_rows = (await db.execute(
-            select(StrategyLegMtm)
-            .where(StrategyLegMtm.run_id == run_id)
-            .order_by(StrategyLegMtm.timestamp)
-        )).scalars().all()
-        events = (await db.execute(
-            select(StrategyRunEvent)
-            .where(StrategyRunEvent.run_id == run_id)
-            .order_by(StrategyRunEvent.timestamp)
-        )).scalars().all()
-
-        spot_candles_full = (await db.execute(
-            select(SpotCandle)
-            .where(
-                SpotCandle.symbol == run_row.instrument,
-                SpotCandle.trade_date == run_row.trade_date,
-            )
-            .order_by(SpotCandle.timestamp)
-        )).scalars().all()
-
-        vix_candles_full = (await db.execute(
-            select(VixCandle)
-            .where(VixCandle.trade_date == run_row.trade_date)
-            .order_by(VixCandle.timestamp)
-        )).scalars().all()
-
-        shadow_mtm = await _compute_shadow_mtm(db, run_row, legs)
-
-        # Load option OHLC per leg for premium charts (trade window only)
-        leg_candles: dict = {}
-        if legs and run_row.entry_time and run_row.exit_time:
-            from datetime import datetime, time as dt_time
-            try:
-                eh, em = map(int, run_row.entry_time.split(":"))
-                xh, xm = map(int, run_row.exit_time.split(":"))
-                entry_dt = datetime.combine(run_row.trade_date, dt_time(eh, em))
-                exit_dt  = datetime.combine(run_row.trade_date, dt_time(xh, xm))
-            except Exception:
-                entry_dt = exit_dt = None
-
-            if entry_dt and exit_dt:
-                for leg in legs:
-                    ohlc_rows = (await db.execute(
-                        select(OptionsCandle)
-                        .where(
-                            OptionsCandle.symbol == run_row.instrument,
-                            OptionsCandle.trade_date == run_row.trade_date,
-                            OptionsCandle.expiry_date == leg.expiry_date,
-                            OptionsCandle.strike == leg.strike,
-                            OptionsCandle.option_type == leg.option_type,
-                            OptionsCandle.timestamp >= entry_dt,
-                            OptionsCandle.timestamp <= exit_dt,
-                        )
-                        .order_by(OptionsCandle.timestamp)
-                    )).scalars().all()
-                    leg_candles[str(leg.leg_index)] = [
-                        {
-                            "timestamp": r.timestamp.isoformat(),
-                            "open":  float(r.open)  if r.open  is not None else None,
-                            "high":  float(r.high)  if r.high  is not None else None,
-                            "low":   float(r.low)   if r.low   is not None else None,
-                            "close": float(r.close) if r.close is not None else None,
-                        }
-                        for r in ohlc_rows
-                    ]
-
-        return strategy_run_replay_payload(
-            run_row, legs, mtm_rows, leg_mtm_rows, events,
-            spot_candles_full=spot_candles_full,
-            shadow_mtm_rows=shadow_mtm,
-            vix_candles_full=vix_candles_full,
-            leg_candles=leg_candles,
-        )
+        payload = await _build_strategy_run_replay_payload(db, run_row)
+        return payload
 
     if kind not in {"paper_session", "historical_session"}:
         raise HTTPException(status_code=404, detail="Replay is only available for session-level runs.")
@@ -838,6 +757,81 @@ async def get_run_replay(
     )
 
 
+async def _build_strategy_run_replay_payload(db: AsyncSession, run_row: "StrategyRun") -> dict:
+    """
+    Single source of truth for all replay data.
+    Called by both the replay endpoint and the CSV endpoint so screen values
+    and export values are guaranteed to match.
+    """
+    run_id = run_row.id
+
+    legs = (await db.execute(
+        select(StrategyRunLeg)
+        .where(StrategyRunLeg.run_id == run_id)
+        .order_by(StrategyRunLeg.leg_index)
+    )).scalars().all()
+    mtm_rows = (await db.execute(
+        select(StrategyRunMtm)
+        .where(StrategyRunMtm.run_id == run_id)
+        .order_by(StrategyRunMtm.timestamp)
+    )).scalars().all()
+    leg_mtm_rows = (await db.execute(
+        select(StrategyLegMtm)
+        .where(StrategyLegMtm.run_id == run_id)
+        .order_by(StrategyLegMtm.timestamp)
+    )).scalars().all()
+    events = (await db.execute(
+        select(StrategyRunEvent)
+        .where(StrategyRunEvent.run_id == run_id)
+        .order_by(StrategyRunEvent.timestamp)
+    )).scalars().all()
+    spot_candles_full = (await db.execute(
+        select(SpotCandle)
+        .where(SpotCandle.symbol == run_row.instrument, SpotCandle.trade_date == run_row.trade_date)
+        .order_by(SpotCandle.timestamp)
+    )).scalars().all()
+    vix_candles_full = (await db.execute(
+        select(VixCandle)
+        .where(VixCandle.trade_date == run_row.trade_date)
+        .order_by(VixCandle.timestamp)
+    )).scalars().all()
+
+    shadow_mtm = await _compute_shadow_mtm(db, run_row, legs)
+
+    # Full-day option OHLC per leg (not trade-window only — PRD requires full-day premium charts)
+    leg_candles: dict = {}
+    for leg in legs:
+        ohlc_rows = (await db.execute(
+            select(OptionsCandle)
+            .where(
+                OptionsCandle.symbol     == run_row.instrument,
+                OptionsCandle.trade_date == run_row.trade_date,
+                OptionsCandle.expiry_date == leg.expiry_date,
+                OptionsCandle.strike      == leg.strike,
+                OptionsCandle.option_type == leg.option_type,
+            )
+            .order_by(OptionsCandle.timestamp)
+        )).scalars().all()
+        leg_candles[str(leg.leg_index)] = [
+            {
+                "timestamp": r.timestamp.isoformat(),
+                "open":  float(r.open)  if r.open  is not None else None,
+                "high":  float(r.high)  if r.high  is not None else None,
+                "low":   float(r.low)   if r.low   is not None else None,
+                "close": float(r.close) if r.close is not None else None,
+            }
+            for r in ohlc_rows
+        ]
+
+    return strategy_run_replay_payload(
+        run_row, legs, mtm_rows, leg_mtm_rows, events,
+        spot_candles_full=spot_candles_full,
+        shadow_mtm_rows=shadow_mtm,
+        vix_candles_full=vix_candles_full,
+        leg_candles=leg_candles,
+    )
+
+
 @router.get("/runs/strategy_run/{item_id}/replay/csv")
 async def get_strategy_run_replay_csv(
     item_id: str,
@@ -846,12 +840,11 @@ async def get_strategy_run_replay_csv(
 ):
     """
     Full replay CSV export (PRD §7.3 schema).
-    One row per minute for the full trading day (spot + VIX + CE/PE leg candles +
-    leg MTM + net MTM + trail stop + event markers).
+    Built from the same serializer output as the replay endpoint so screen
+    values and CSV values are guaranteed to match.
     """
     import csv
     import io
-    from datetime import datetime, time as dt_time
 
     from fastapi.responses import StreamingResponse
 
@@ -865,118 +858,31 @@ async def get_strategy_run_replay_csv(
     if run_row is None:
         raise HTTPException(status_code=404, detail="Run not found.")
 
-    legs = (await db.execute(
-        select(StrategyRunLeg)
-        .where(StrategyRunLeg.run_id == run_id)
-        .order_by(StrategyRunLeg.leg_index)
-    )).scalars().all()
+    payload = await _build_strategy_run_replay_payload(db, run_row)
 
-    mtm_rows = (await db.execute(
-        select(StrategyRunMtm)
-        .where(StrategyRunMtm.run_id == run_id)
-        .order_by(StrategyRunMtm.timestamp)
-    )).scalars().all()
+    # ── Build lookup maps from serializer output (single source of truth) ──
+    spot_by_ts    = {r["timestamp"]: r for r in payload["spot_series_full"]}
+    vix_by_ts     = {r["timestamp"]: r for r in payload["vix_series_full"]}
+    mtm_by_ts     = {r["timestamp"]: r for r in payload["mtm_series"]}
 
-    leg_mtm_rows = (await db.execute(
-        select(StrategyLegMtm)
-        .where(StrategyLegMtm.run_id == run_id)
-        .order_by(StrategyLegMtm.timestamp)
-    )).scalars().all()
+    # Aggregate multiple events per minute joined with "|"
+    events_by_ts: dict = {}
+    for ev in payload["events"]:
+        ts = ev["timestamp"]
+        if ts not in events_by_ts:
+            events_by_ts[ts] = {"event_type": [], "event_reason": []}
+        events_by_ts[ts]["event_type"].append(ev["event_type"]  or "")
+        events_by_ts[ts]["event_reason"].append(ev["reason_code"] or "")
 
-    events = (await db.execute(
-        select(StrategyRunEvent)
-        .where(StrategyRunEvent.run_id == run_id)
-        .order_by(StrategyRunEvent.timestamp)
-    )).scalars().all()
+    # Per-leg candles keyed by (leg_index_str, timestamp)
+    leg_candle_by_ts: dict = {}
+    for leg_idx_str, candles in payload["leg_candles"].items():
+        for c in candles:
+            leg_candle_by_ts[(leg_idx_str, c["timestamp"])] = c
 
-    spot_candles_full = (await db.execute(
-        select(SpotCandle)
-        .where(
-            SpotCandle.symbol == run_row.instrument,
-            SpotCandle.trade_date == run_row.trade_date,
-        )
-        .order_by(SpotCandle.timestamp)
-    )).scalars().all()
-
-    vix_candles_full = (await db.execute(
-        select(VixCandle)
-        .where(VixCandle.trade_date == run_row.trade_date)
-        .order_by(VixCandle.timestamp)
-    )).scalars().all()
-
-    # Load option OHLC for all legs, full day
-    leg_ohlc_by_ts: dict = {}  # {(leg_index, ts_iso): {open, high, low, close}}
-    for leg in legs:
-        ohlc_rows = (await db.execute(
-            select(OptionsCandle)
-            .where(
-                OptionsCandle.symbol == run_row.instrument,
-                OptionsCandle.trade_date == run_row.trade_date,
-                OptionsCandle.expiry_date == leg.expiry_date,
-                OptionsCandle.strike == leg.strike,
-                OptionsCandle.option_type == leg.option_type,
-            )
-            .order_by(OptionsCandle.timestamp)
-        )).scalars().all()
-        for r in ohlc_rows:
-            leg_ohlc_by_ts[(leg.leg_index, r.timestamp.isoformat())] = {
-                "open":  float(r.open)  if r.open  is not None else "",
-                "high":  float(r.high)  if r.high  is not None else "",
-                "low":   float(r.low)   if r.low   is not None else "",
-                "close": float(r.close) if r.close is not None else "",
-            }
-
-    # Build lookup maps
-    vix_by_ts = {vc.timestamp.isoformat(): float(vc.close) if vc.close is not None else None for vc in vix_candles_full}
-    spot_by_ts = {c.timestamp.isoformat(): c for c in spot_candles_full}
-
-    # leg MTM by (leg_id, ts)
-    leg_mtm_map: dict = {}
-    for lm in leg_mtm_rows:
-        leg_mtm_map[(str(lm.leg_id), lm.timestamp.isoformat())] = float(lm.gross_leg_pnl) if lm.gross_leg_pnl is not None else None
-
-    leg_id_to_leg = {str(l.id): l for l in legs}
-
-    # Aggregate MTM by ts
-    mtm_by_ts = {row.timestamp.isoformat(): row for row in mtm_rows}
-
-    # CE/PE MTM grouped
-    ce_leg_ids = {str(l.id) for l in legs if l.option_type == "CE"}
-    pe_leg_ids = {str(l.id) for l in legs if l.option_type == "PE"}
-
-    ce_mtm_by_ts: dict = {}
-    pe_mtm_by_ts: dict = {}
-    for lm in leg_mtm_rows:
-        ts_key = lm.timestamp.isoformat()
-        lid = str(lm.leg_id)
-        val = float(lm.gross_leg_pnl) if lm.gross_leg_pnl is not None else 0.0
-        if lid in ce_leg_ids:
-            ce_mtm_by_ts[ts_key] = ce_mtm_by_ts.get(ts_key, 0.0) + val
-        elif lid in pe_leg_ids:
-            pe_mtm_by_ts[ts_key] = pe_mtm_by_ts.get(ts_key, 0.0) + val
-
-    # Event lookup by ts
-    event_by_ts: dict = {}
-    for ev in events:
-        event_by_ts[ev.timestamp.isoformat()] = ev
-
-    # VIX forward-fill
-    last_vix = None
-    vix_filled: dict = {}
-    for spot_c in spot_candles_full:
-        ts_key = spot_c.timestamp.isoformat()
-        raw = vix_by_ts.get(ts_key)
-        if raw is not None:
-            last_vix = raw
-            vix_filled[ts_key] = (raw, "actual")
-        elif last_vix is not None:
-            vix_filled[ts_key] = (last_vix, "forward_filled")
-        else:
-            vix_filled[ts_key] = (None, "missing")
-
-    # CE/PE leg info
-    ce_legs = [l for l in legs if l.option_type == "CE"]
-    pe_legs = [l for l in legs if l.option_type == "PE"]
+    serialized_legs = payload["legs"]
+    ce_legs = [l for l in serialized_legs if l["option_type"] == "CE"]
+    pe_legs = [l for l in serialized_legs if l["option_type"] == "PE"]
 
     def _f(v) -> str:
         return "" if v is None else str(round(float(v), 2))
@@ -987,79 +893,73 @@ async def get_strategy_run_replay_csv(
         "nifty_open", "nifty_high", "nifty_low", "nifty_close",
         "india_vix", "vix_source",
     ]
-    # CE leg columns (first CE leg for simplicity; most strategies have 1)
+    # CE and PE OHLC columns per leg (numbered if >1 leg per side)
     for i, leg in enumerate(ce_legs):
         pfx = f"ce{i+1}" if len(ce_legs) > 1 else "ce"
         fieldnames += [f"{pfx}_symbol", f"{pfx}_expiry", f"{pfx}_strike",
-                       f"{pfx}_open", f"{pfx}_high", f"{pfx}_low", f"{pfx}_close",
-                       f"{pfx}_mtm"]
+                       f"{pfx}_open", f"{pfx}_high", f"{pfx}_low", f"{pfx}_close"]
     for i, leg in enumerate(pe_legs):
         pfx = f"pe{i+1}" if len(pe_legs) > 1 else "pe"
         fieldnames += [f"{pfx}_symbol", f"{pfx}_expiry", f"{pfx}_strike",
-                       f"{pfx}_open", f"{pfx}_high", f"{pfx}_low", f"{pfx}_close",
-                       f"{pfx}_mtm"]
-    fieldnames += ["net_mtm", "trail_stop", "event_type", "event_reason"]
+                       f"{pfx}_open", f"{pfx}_high", f"{pfx}_low", f"{pfx}_close"]
+    # Aggregate MTM columns — same formula as the screen (no per-leg confusion)
+    fieldnames += ["ce_mtm", "pe_mtm", "net_mtm", "trail_stop", "event_type", "event_reason"]
 
     writer = csv.DictWriter(output, fieldnames=fieldnames, extrasaction="ignore")
     writer.writeheader()
 
     trade_date_str = run_row.trade_date.isoformat()
-    run_id_str = str(run_row.id)
+    run_id_str     = str(run_row.id)
 
-    for spot_c in spot_candles_full:
-        ts_key = spot_c.timestamp.isoformat()
-        vix_val, vix_src = vix_filled.get(ts_key, (None, "missing"))
-        mtm_row = mtm_by_ts.get(ts_key)
-        ev = event_by_ts.get(ts_key)
+    for ts_key, spot in spot_by_ts.items():
+        vix_row = vix_by_ts.get(ts_key, {})
+        mtm_row = mtm_by_ts.get(ts_key, {})
+        ev_agg  = events_by_ts.get(ts_key)
 
         row: dict = {
             "strategy_run_id": run_id_str,
             "trading_date":    trade_date_str,
             "timestamp":       ts_key,
-            "nifty_open":      _f(spot_c.open),
-            "nifty_high":      _f(spot_c.high),
-            "nifty_low":       _f(spot_c.low),
-            "nifty_close":     _f(spot_c.close),
-            "india_vix":       _f(vix_val),
-            "vix_source":      vix_src,
-            "net_mtm":         _f(mtm_row.net_mtm if mtm_row else None),
-            "trail_stop":      _f(mtm_row.trail_stop_level if mtm_row else None),
-            "event_type":      ev.event_type if ev else "",
-            "event_reason":    ev.reason_code if ev else "",
+            "nifty_open":      _f(spot.get("open")  if "open"  in spot else None),
+            "nifty_high":      _f(spot.get("high")  if "high"  in spot else None),
+            "nifty_low":       _f(spot.get("low")   if "low"   in spot else None),
+            "nifty_close":     _f(spot.get("close") if "close" in spot else None),
+            "india_vix":       _f(vix_row.get("vix_close")),
+            "vix_source":      vix_row.get("vix_source", "missing"),
+            "ce_mtm":          _f(mtm_row.get("ce_mtm")),
+            "pe_mtm":          _f(mtm_row.get("pe_mtm")),
+            "net_mtm":         _f(mtm_row.get("net_mtm")),
+            "trail_stop":      _f(mtm_row.get("trail_stop_level")),
+            "event_type":      "|".join(ev_agg["event_type"])   if ev_agg else "",
+            "event_reason":    "|".join(ev_agg["event_reason"]) if ev_agg else "",
         }
 
         for i, leg in enumerate(ce_legs):
             pfx = f"ce{i+1}" if len(ce_legs) > 1 else "ce"
-            ohlc = leg_ohlc_by_ts.get((leg.leg_index, ts_key), {})
-            leg_pnl = ce_mtm_by_ts.get(ts_key) if i == 0 else None
-            expiry_str = leg.expiry_date.isoformat() if leg.expiry_date else ""
-            symbol = f"{run_row.instrument}{leg.strike}CE{expiry_str}"
+            ohlc = leg_candle_by_ts.get((str(leg["leg_index"]), ts_key), {})
+            expiry_str = leg.get("expiry_date", "")
             row.update({
-                f"{pfx}_symbol": symbol,
+                f"{pfx}_symbol": f"{run_row.instrument}{leg['strike']}CE{expiry_str}",
                 f"{pfx}_expiry": expiry_str,
-                f"{pfx}_strike": str(leg.strike),
-                f"{pfx}_open":   str(ohlc.get("open", "")),
-                f"{pfx}_high":   str(ohlc.get("high", "")),
-                f"{pfx}_low":    str(ohlc.get("low", "")),
-                f"{pfx}_close":  str(ohlc.get("close", "")),
-                f"{pfx}_mtm":    _f(leg_pnl),
+                f"{pfx}_strike": str(leg["strike"]),
+                f"{pfx}_open":   _f(ohlc.get("open")),
+                f"{pfx}_high":   _f(ohlc.get("high")),
+                f"{pfx}_low":    _f(ohlc.get("low")),
+                f"{pfx}_close":  _f(ohlc.get("close")),
             })
 
         for i, leg in enumerate(pe_legs):
             pfx = f"pe{i+1}" if len(pe_legs) > 1 else "pe"
-            ohlc = leg_ohlc_by_ts.get((leg.leg_index, ts_key), {})
-            leg_pnl = pe_mtm_by_ts.get(ts_key) if i == 0 else None
-            expiry_str = leg.expiry_date.isoformat() if leg.expiry_date else ""
-            symbol = f"{run_row.instrument}{leg.strike}PE{expiry_str}"
+            ohlc = leg_candle_by_ts.get((str(leg["leg_index"]), ts_key), {})
+            expiry_str = leg.get("expiry_date", "")
             row.update({
-                f"{pfx}_symbol": symbol,
+                f"{pfx}_symbol": f"{run_row.instrument}{leg['strike']}PE{expiry_str}",
                 f"{pfx}_expiry": expiry_str,
-                f"{pfx}_strike": str(leg.strike),
-                f"{pfx}_open":   str(ohlc.get("open", "")),
-                f"{pfx}_high":   str(ohlc.get("high", "")),
-                f"{pfx}_low":    str(ohlc.get("low", "")),
-                f"{pfx}_close":  str(ohlc.get("close", "")),
-                f"{pfx}_mtm":    _f(leg_pnl),
+                f"{pfx}_strike": str(leg["strike"]),
+                f"{pfx}_open":   _f(ohlc.get("open")),
+                f"{pfx}_high":   _f(ohlc.get("high")),
+                f"{pfx}_low":    _f(ohlc.get("low")),
+                f"{pfx}_close":  _f(ohlc.get("close")),
             })
 
         writer.writerow(row)
