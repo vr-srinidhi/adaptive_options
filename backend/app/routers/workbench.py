@@ -75,7 +75,7 @@ def _parse_uuid(value: str) -> uuid.UUID:
 async def _owned_paper_session(session_id: uuid.UUID, user: User, db: AsyncSession, *, session_type: Optional[str] = None) -> PaperSession:
     q = select(PaperSession).where(
         PaperSession.id == session_id,
-        (PaperSession.user_id == user.id) | (PaperSession.user_id.is_(None)),
+        PaperSession.user_id == user.id,
     )
     if session_type:
         q = q.where(PaperSession.session_type == session_type)
@@ -89,7 +89,7 @@ async def _owned_batch(batch_id: uuid.UUID, user: User, db: AsyncSession) -> Ses
     batch = (await db.execute(
         select(SessionBatch).where(
             SessionBatch.id == batch_id,
-            (SessionBatch.created_by == user.id) | (SessionBatch.created_by.is_(None)),
+            SessionBatch.created_by == user.id,
         )
     )).scalar_one_or_none()
     if batch is None:
@@ -101,18 +101,18 @@ async def _build_workspace_summary(user: User, db: AsyncSession) -> dict:
     paper_count = (await db.execute(
         select(func.count()).select_from(PaperSession).where(
             PaperSession.session_type == "paper_replay",
-            (PaperSession.user_id == user.id) | (PaperSession.user_id.is_(None)),
+            PaperSession.user_id == user.id,
         )
     )).scalar_one()
     historical_batch_count = (await db.execute(
         select(func.count()).select_from(SessionBatch).where(
-            (SessionBatch.created_by == user.id) | (SessionBatch.created_by.is_(None)),
+            SessionBatch.created_by == user.id,
         )
     )).scalar_one()
     historical_session_count = (await db.execute(
         select(func.count()).select_from(PaperSession).where(
             PaperSession.session_type == "historical_backtest",
-            (PaperSession.user_id == user.id) | (PaperSession.user_id.is_(None)),
+            PaperSession.user_id == user.id,
         )
     )).scalar_one()
 
@@ -124,7 +124,7 @@ async def _build_workspace_summary(user: User, db: AsyncSession) -> dict:
         select(PaperSession)
         .where(
             PaperSession.session_type == "paper_replay",
-            (PaperSession.user_id == user.id) | (PaperSession.user_id.is_(None)),
+            PaperSession.user_id == user.id,
         )
         .order_by(PaperSession.created_at.desc())
         .limit(4)
@@ -138,7 +138,7 @@ async def _build_workspace_summary(user: User, db: AsyncSession) -> dict:
 
     batch_rows = (await db.execute(
         select(SessionBatch)
-        .where((SessionBatch.created_by == user.id) | (SessionBatch.created_by.is_(None)))
+        .where(SessionBatch.created_by == user.id)
         .order_by(SessionBatch.created_at.desc())
         .limit(4)
     )).scalars().all()
@@ -207,7 +207,7 @@ async def list_runs(
             select(PaperSession)
             .where(
                 PaperSession.session_type == "paper_replay",
-                (PaperSession.user_id == current_user.id) | (PaperSession.user_id.is_(None)),
+                PaperSession.user_id == current_user.id,
             )
             .order_by(PaperSession.created_at.desc())
         )
@@ -227,7 +227,7 @@ async def list_runs(
     if kind in (None, "historical_batch"):
         batch_query = (
             select(SessionBatch)
-            .where((SessionBatch.created_by == current_user.id) | (SessionBatch.created_by.is_(None)))
+            .where(SessionBatch.created_by == current_user.id)
             .order_by(SessionBatch.created_at.desc())
         )
         if kind == "historical_batch":
