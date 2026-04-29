@@ -990,7 +990,12 @@ async def get_strategy_run_replay_csv(
 
 
 class ExportBundleRequest(BaseModel):
-    run_ids: list[str] = Field(..., min_length=1, max_length=20)
+    run_ids: list[str] = Field(..., min_length=1)
+
+
+# Runs at or below this threshold → single multi-section CSV.
+# Above → ZIP of individual CSVs (one per run, no hard cap).
+_BUNDLE_CSV_THRESHOLD = 20
 
 
 @router.post("/runs/strategy_run/export-bundle")
@@ -1000,12 +1005,13 @@ async def export_strategy_runs_bundle(
     current_user: User = Depends(get_current_active_user),
 ):
     """
-    Multi-run CSV bundle: all selected strategy runs stacked in one file,
-    each separated by a clear run-divider. Mirrors the single-run section
-    layout exactly. Limited to 20 runs per request.
+    ≤20 runs  → single multi-section CSV (all runs stacked, divider between each).
+    >20 runs  → ZIP of individual single-run CSVs (one file per run).
+    Filename: {strategy_id}_{date_from}_to_{date_to}_bundle.{csv|zip}
     """
     import csv
     import io
+    import zipfile
     from fastapi.responses import StreamingResponse
 
     run_uuids = [_parse_uuid(rid) for rid in body.run_ids]
@@ -1021,41 +1027,62 @@ async def export_strategy_runs_bundle(
     if not ordered_rows:
         raise HTTPException(status_code=404, detail="No matching runs found.")
 
-    output = io.StringIO()
-    w      = csv.writer(output)
-    total  = len(ordered_rows)
+    total = len(ordered_rows)
 
-    w.writerow([f"=== BUNDLE EXPORT: {total} RUN{'S' if total > 1 else ''} ==="])
+    # Filename components
+    strategy_ids = list(dict.fromkeys(r.strategy_id for r in ordered_rows))
+    strategy_slug = strategy_ids[0] if len(strategy_ids) == 1 else "multi_strategy"
+    dates         = sorted(r.trade_date.isoformat() for r in ordered_rows)
+    date_range    = dates[0] if len(dates) == 1 else f"{dates[0]}_to_{dates[-1]}"
 
-    for i, run_row in enumerate(ordered_rows, 1):
-        payload = await _build_strategy_run_replay_payload(db, run_row)
-        run     = payload["run"]
+    if total <= _BUNDLE_CSV_THRESHOLD:
+        # ── Single stacked CSV ──────────────────────────────────────────
+        output = io.StringIO()
+        w      = csv.writer(output)
+        w.writerow([f"=== BUNDLE EXPORT: {total} RUN{'S' if total > 1 else ''} ==="])
 
-        # Run-level divider — unmistakable boundary between dates
-        w.writerow([])
-        w.writerow([])
-        w.writerow(["=" * 80])
-        w.writerow([
-            f"=== RUN {i} / {total}:  "
-            f"{run.get('instrument')}  |  "
-            f"{run.get('trade_date')}  |  "
-            f"{run.get('strategy_id')}  |  "
-            f"Net P&L: {_csv_inr(run.get('realized_net_pnl'))} ==="
-        ])
-        w.writerow(["=" * 80])
+        for i, run_row in enumerate(ordered_rows, 1):
+            payload = await _build_strategy_run_replay_payload(db, run_row)
+            run     = payload["run"]
+            w.writerow([])
+            w.writerow([])
+            w.writerow(["=" * 80])
+            w.writerow([
+                f"=== RUN {i} / {total}:  "
+                f"{run.get('instrument')}  |  "
+                f"{run.get('trade_date')}  |  "
+                f"{run.get('strategy_id')}  |  "
+                f"Net P&L: {_csv_inr(run.get('realized_net_pnl'))} ==="
+            ])
+            w.writerow(["=" * 80])
+            _write_run_sections_to_csv(w, payload, run_row)
 
-        _write_run_sections_to_csv(w, payload, run_row)
+        csv_bytes = output.getvalue().encode("utf-8-sig")
+        filename  = f"{strategy_slug}_{date_range}_bundle.csv"
+        return StreamingResponse(
+            io.BytesIO(csv_bytes),
+            media_type="text/csv",
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        )
 
-    csv_bytes  = output.getvalue().encode("utf-8-sig")
-    dates      = sorted(r.trade_date.isoformat() for r in ordered_rows)
-    date_range = dates[0] if len(dates) == 1 else f"{dates[0]}_to_{dates[-1]}"
-    instrument = ordered_rows[0].instrument
-    filename   = f"bundle_{instrument}_{date_range}_{total}runs.csv"
-    return StreamingResponse(
-        io.BytesIO(csv_bytes),
-        media_type="text/csv",
-        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
-    )
+    else:
+        # ── ZIP of individual CSVs ──────────────────────────────────────
+        zip_buffer = io.BytesIO()
+        with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
+            for run_row in ordered_rows:
+                payload    = await _build_strategy_run_replay_payload(db, run_row)
+                csv_output = io.StringIO()
+                _write_run_sections_to_csv(csv.writer(csv_output), payload, run_row)
+                entry_name = f"{run_row.strategy_id}_{run_row.trade_date.isoformat()}_replay.csv"
+                zf.writestr(entry_name, csv_output.getvalue().encode("utf-8-sig"))
+
+        zip_buffer.seek(0)
+        filename = f"{strategy_slug}_{date_range}_bundle.zip"
+        return StreamingResponse(
+            zip_buffer,
+            media_type="application/zip",
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        )
 
 
 @router.get("/runs/compare")
