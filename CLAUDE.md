@@ -156,7 +156,7 @@ Adaptive_options/
             ├── RunBuilder.jsx        ← Configure + launch a run (guided + advanced mode)
             ├── ReplayDesk.jsx        ← Paper session list + replay entry point
             ├── ReplayAnalyzer.jsx    ← Per-session replay: charts, decision stream, legs
-            ├── RunsLibrary.jsx       ← Saved runs list with compare + history
+            ├── RunsLibrary.jsx       ← Saved runs list; checkbox multi-select → CSV/ZIP bundle export
             ├── WorkbenchHistoryDetail.jsx ← Batch or session history detail
             ├── Backtest.jsx          ← (legacy) Synthetic backtest form
             ├── Dashboard.jsx         ← (legacy) Backtest results dashboard
@@ -334,17 +334,27 @@ SELL ATM CE + SELL ATM PE at `entry_time`. Profits from premium decay when spot 
 
 ```
 {
-  run:              { id, trade_date, entry_time, exit_time, status, exit_reason, ... }
-  legs:             [{ leg_index, side, option_type, strike, expiry_date, entry_price, exit_price }]
-  spot_series_full: [{ timestamp, close }]   ← full day 09:15–15:29 (375 rows)
-  mtm_series:       [{ timestamp, gross_mtm, net_mtm, trail_stop_level, event_code }]  ← trade window only
-  shadow_mtm_series:[{ timestamp, net_mtm }] ← exit_time+1 → 15:25, hypothetical "if held"
+  run:              { id, trade_date, entry_time, exit_time, status, exit_reason,
+                      capital, lots, lot_size, entry_credit_per_unit, entry_credit_total,
+                      gross_pnl, total_charges, realized_net_pnl,
+                      mfe, mae, max_drawdown, warnings }
+  legs:             [{ leg_index, side, option_type, strike, expiry_date,
+                       quantity, lots, lot_size, entry_price, exit_price, gross_leg_pnl }]
+  spot_series_full: [{ timestamp, open, high, low, close }]  ← full day 09:15–15:29, OHLC
+  vix_series_full:  [{ timestamp, vix_close, vix_source }]   ← "actual"|"forward_filled"|"missing"
+  mtm_series:       [{ timestamp, gross_mtm, net_mtm, trail_stop_level, event_code,
+                       ce_mtm, pe_mtm }]                     ← trade window only
+  shadow_mtm_series:[{ timestamp, net_mtm }]                 ← exit_time+1 → 15:25
+  leg_candles:      { "0": [{timestamp,open,high,low,close}], ... } ← per-leg OHLC
   minute_table:     flat join spot + leg prices per minute
   events:           ENTRY / HOLD / EXIT events with payload_json
+  data_quality:     [{ type, message }]  ← "missing_vix" | "forward_filled_vix"
 }
 ```
 
-`ReplayAnalyzer.jsx` uses `spot_series_full` as the x-axis backbone for both the Spot and MTM charts so the full trading day (09:15–15:29) is always visible. The MTM line renders only for the trade window (null before entry, null after exit, `connectNulls={false}`). The shadow MTM line (`#a78bfa` dashed) continues from exit to 15:25. `ReferenceLine` marks entry (green IN) and exit (red OUT) on both charts.
+`strategy_replay_serializer.py::strategy_run_replay_payload()` is the single source of truth for this shape — both the JSON endpoint and the CSV endpoint call it via `_build_strategy_run_replay_payload()` in `workbench.py` so the data is guaranteed to match.
+
+`ReplayAnalyzer.jsx` uses `spot_series_full` as the x-axis backbone for both the Spot and MTM charts so the full trading day (09:15–15:29) is always visible. The MTM line renders only for the trade window (null before entry, null after exit, `connectNulls={false}`). The shadow MTM line (`#a78bfa` dashed) continues from exit to 15:25. CE/PE MTM lines (amber/cyan) come from `ce_mtm`/`pe_mtm` per row. The VIX series appears on a secondary right Y-axis. `ReferenceLine` marks entry (green IN) and exit (red OUT) on both charts.
 
 ### instrument_contract_specs
 
@@ -427,6 +437,8 @@ All under `/api/v2`. Strategy catalog endpoints are intentionally public (no aut
 | POST | `/v2/runs/validate` | Dry-run validation — resolves contract, expiry, lots; no DB writes |
 | GET | `/v2/runs/{kind}/{id}` | Run detail; `kind` ∈ `paper_session`, `historical_batch`, `historical_session`, `strategy_run` |
 | GET | `/v2/runs/{kind}/{id}/replay` | Full replay payload; `strategy_run` kind returns PRD §13 shape |
+| GET | `/v2/runs/strategy_run/{id}/replay/csv` | Full replay as 9-section CSV (Trade Summary, Execution Summary, Contracts, MTM Series, CE Premium, PE Premium, NIFTY Spot OHLC, India VIX, Decision Log). UTF-8 BOM for Excel. |
+| POST | `/v2/runs/strategy_run/export-bundle` | Multi-run export: body `{run_ids:[...]}`. ≤20 runs → single stacked CSV; >20 → ZIP of individual CSVs. Filename: `{strategy}_{from}_to_{to}_bundle.{ext}`. Raises 404 if any ID not found/owned. |
 | GET | `/v2/runs/compare` | Compare up to 4 runs by comma-separated `refs` (`kind:uuid,...`); supports `paper_session`, `historical_batch`, `strategy_run` |
 
 ### Zerodha Auth
@@ -505,7 +517,7 @@ JSONB columns: `legs` (option leg objects), `min_data` (`{time, spot, pnl}` per 
 | `/workbench/run` | `RunBuilder.jsx` | Configure + launch a run |
 | `/workbench/replay` | `ReplayDesk.jsx` | Paper session list + replay entry |
 | `/workbench/replay/:kind/:id` | `ReplayAnalyzer.jsx` | Per-session: full-day spot + MTM charts with IN/OUT markers, shadow MTM, decisions, legs |
-| `/workbench/history` | `RunsLibrary.jsx` | All saved runs, sorted date desc, infinite scroll (20 rows at a time) |
+| `/workbench/history` | `RunsLibrary.jsx` | All saved runs, sorted date desc, infinite scroll (20/page); checkbox multi-select on `strategy_run` rows → export ≤20 as single CSV, >20 as ZIP |
 | `/workbench/history/:kind/:id` | `WorkbenchHistoryDetail.jsx` | Batch or session detail |
 
 ### Historical Backtest
