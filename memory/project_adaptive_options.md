@@ -1,37 +1,68 @@
 ---
-name: Adaptive Options Project
-description: Full-stack options backtesting + paper trading MVP. Docker Compose, FastAPI + React, runs at localhost:3000
+name: Adaptive Options Project — current state
+description: Full-stack NSE options backtesting + paper trading platform. Five modules, Railway-deployed, CI on GitHub Actions.
 type: project
 ---
 
-Full-stack NSE options platform with two independent modules:
+Full-stack NSE index options platform. Docker Compose locally; Railway (3 services) in production.
+Frontend: React 18 + Vite at localhost:3000. Backend: FastAPI at localhost:8000. DB: PostgreSQL 15.
 
-## Backtest Module (synthetic data)
-- Single-day, regime-based strategy (10 regimes, signal engine, R-multiple stops)
-- Synthetic candle generator (deterministic RNG from date+instrument)
-- EMA9/21/50, RSI14, ATR14 indicators
-- Frontend: Dashboard (results table with regime_detail, signal_type, signal_score, atr14, r_multiple), TradeBook (per-day drill-down)
+**Why:** Educational backtesting and paper trading for Nifty/BankNifty strategies. No live order placement.
 
-## Paper Trading Module (real Zerodha data)
-- ORB (Opening Range Breakout) strategy — PRD v2 logic
-- G1–G7 gate stack evaluated every minute from 09:30
-- Bull Call Spread (bullish) / Bear Put Spread (bearish)
-- Position sizing: spread_debit × lot_size, max 2% capital risk, 0.5% target
-- Full minute audit log: ~375 rows/session in strategy_minute_decisions table
-- Access token passed per-request (never stored), expires 6 AM IST daily
-- Expiry resolution: scans instruments master for actual nearest expiry >= trade_date (handles expired contracts and holiday shifts)
-- Frontend: /paper (form), /paper/sessions (list), /paper/session/:id (audit log + MTM chart)
+**How to apply:** When suggesting changes or additions, check whether the work fits inside an existing executor (generic_v1 just needs a catalog entry) before proposing new files.
 
-## Key technical notes
-- Zerodha tokens expire daily at 6 AM IST — user must get fresh token via /api/auth/zerodha/login-url flow
-- April 10, 2026 = NSE holiday (no spot data); April 9 = last Thursday expiry for that week
-- docker-compose uses .env file for ZERODHA_API_KEY / ZERODHA_API_SECRET (never committed)
-- Adaptive_options/ has its own embedded .git repo — commits go inside that repo, not the outer Claude-test repo
+---
 
-## DB tables
-- backtest_sessions (existing)
-- paper_sessions, strategy_minute_decisions, paper_trade_headers, paper_trade_minute_marks, paper_trade_legs (paper trading)
+## Five Modules
 
-## Running
-cd Adaptive_options/ && docker compose up -d
-Frontend: localhost:3000 | Backend: localhost:8000 | DB: localhost:5432
+1. **V2 Workbench** — primary UI (Strategy Catalog → Run Builder → Replay Analyzer → Runs Library). Two live executors: `orb_v1` (ORB paper/historical) and `generic_v1` (generic single-session backtest). Route: `/workbench/...`
+
+2. **Generic Strategy Engine** — `generic_executor.py`. Any strategy expressed as `leg_template + entry_rule_id + exit_rule` in `workbench_catalog.py` runs with zero custom code. Short Straddle is the first live strategy.
+
+3. **Historical Backtest** — batch-runs against a warehoused 1-min candle DB. Multi-day. Results accessible from Runs Library.
+
+4. **Paper Trading ORB Replay** — live Zerodha candle data, G1–G7 gate stack, Bull Call / Bear Put spreads. Zerodha tokens expire daily at 6 AM IST.
+
+5. **Synthetic Backtest** — deterministic RNG (seed = MD5(date+instrument)), Iron Condor / Bull Put / Bear Call via EMA/RSI/IV Rank regime detection. Legacy module.
+
+---
+
+## Strategy Replay V2 (feat/replay-v2, merged into main)
+
+Upgraded `strategy_run` replay into a full trade diagnosis screen:
+
+- **Serializer** (`strategy_replay_serializer.py`): CE/PE MTM split (`ce_mtm`/`pe_mtm` per minute), VIX forward-fill with `vix_source` tagging, MFE/MAE/max_drawdown in `run`, `data_quality` warnings, full OHLC in `spot_series_full`, `lots`/`lot_size` in legs. 19 unit tests in `test_strategy_replay_serializer.py`.
+- **Replay JSON payload** (`GET /api/v2/runs/strategy_run/{id}/replay`): spot OHLC full day, VIX full day, CE/PE MTM series, leg_candles OHLC, shadow MTM.
+- **CSV export** (`GET /api/v2/runs/strategy_run/{id}/replay/csv`): 9-section human-readable CSV with UTF-8 BOM. Sections: Trade Summary, Execution Summary, Contracts, MTM Series, CE Premium, PE Premium, NIFTY Spot OHLC, India VIX, Decision Log.
+- **Bundle export** (`POST /api/v2/runs/strategy_run/export-bundle`): multi-run. ≤20 → single stacked CSV; >20 → ZIP. Raises 404 if any IDs not found/owned. Filename: `{strategy}_{from}_to_{to}_bundle.{ext}`. ZIP entries unique via `_{id[:8]}`.
+- **Runs Library** (`RunsLibrary.jsx`): compare panel removed (user request). Checkbox multi-select on strategy_run rows only. Select-all with indeterminate state. Export button appears after selection; turns blue+ZIP for >20 runs. Status bar shows "N selected (M visible)" + Clear button.
+- **Single source of truth**: `_build_strategy_run_replay_payload()` in `workbench.py` is called by both JSON and CSV endpoints. `_write_run_sections_to_csv()` is called by both single-run and bundle endpoints — no drift.
+
+---
+
+## Test Counts (current)
+
+- Backend: **229 passed** (`python3 -m pytest tests/ --ignore=tests/test_router_helpers.py`)
+- Frontend: **49 passed** (`npm test`)
+
+---
+
+## Key File Locations
+
+- Strategy catalog + visual_hints: `backend/app/services/workbench_catalog.py`
+- Replay serializer: `backend/app/services/strategy_replay_serializer.py`
+- Workbench router (CSV, bundle, replay): `backend/app/routers/workbench.py`
+- Generic executor: `backend/app/services/generic_executor.py`
+- Replay UI: `frontend/src/pages/ReplayAnalyzer.jsx`
+- Runs Library: `frontend/src/pages/RunsLibrary.jsx`
+- API wrappers: `frontend/src/api/index.js`
+
+---
+
+## Repository Notes
+
+- `Adaptive_options/` has its own embedded `.git` repo — commits go inside it, not the outer Claude-test repo.
+- Main branch: `main`. Feature branches merged via PR. CI gates every PR (pytest + vitest).
+- After Python changes: `docker compose build --no-cache backend && docker compose up -d --force-recreate backend`
+- After JS changes: `docker compose build --no-cache frontend && docker compose up -d --force-recreate frontend`
+- If 502 after restart: `docker compose restart frontend` (nginx may have cached old backend IP).

@@ -216,8 +216,9 @@ ATM = `round(spot_at_entry / strike_step) * strike_step`
 
 | Condition | Trigger |
 |-----------|---------|
-| `TARGET_EXIT` | net_mtm ≥ 30% of entry credit |
-| `STOP_EXIT` | net_mtm ≤ −150% of entry credit |
+| `TARGET_EXIT` | Suppressed when trail is active — trail manages profit exit |
+| `TRAIL_EXIT` | Activates once net_mtm ≥ ₹12,000; exits when net_mtm falls to 50% of peak. P&L locked at trail stop level (not candle close). |
+| `STOP_EXIT` | net_mtm ≤ −1.5% of capital (capital-based, not credit-based) |
 | `TIME_EXIT` | 15:25 |
 | `DATA_GAP_EXIT` | option price stale > 1 minute |
 
@@ -452,9 +453,11 @@ This is why IV Rank drives strategy selection — you want to sell premium when 
 | Backend | pytest | `test_contract_spec_service.py` | ATM strike rounding (incl. banker's rounding edge cases), leg template expansion |
 | Backend | pytest | `test_charges_service.py` | Brokerage math: entry/exit/total charges, STT, GST, monotonicity |
 | Backend | pytest | `test_generic_executor.py` | `validate_run` (7 tests) + `execute_run` (6 tests) via async fake DB and service patches |
+| Backend | pytest | `test_strategy_replay_serializer.py` | 19 tests: CE/PE MTM grouping, MFE/MAE/drawdown, VIX forward-fill + source tagging, spot OHLC completeness, data quality warnings, legs shape (lots/lot_size), payload regression |
 | Frontend | Vitest | `TopNav.test.jsx` | Primary + legacy nav links, workbench visibility rules, active state |
 | Frontend | Vitest | `Backtest.test.jsx` | Form, API call, loading state |
 | Frontend | Vitest | `Dashboard.test.jsx` | Data render, navigation, empty/error states |
+| Frontend | Vitest | `RunsLibrary.test.jsx` | Table render; checkboxes only on strategy_run rows; export button appears after selection |
 | Frontend | Vitest | `RegimeBadge / MetricCard / PnlChart` | Component rendering |
 | Frontend | Vitest | `api/index.test.js` | Export contract, base URL, timeout, workbench API functions |
 

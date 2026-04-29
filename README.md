@@ -453,7 +453,7 @@ backend/
 | `src/api/index.js` | All API calls — axios wrappers for every endpoint group |
 | `src/pages/RunBuilder.jsx` | Run config form with `normalizeVisual()`, `countWeekdaysInRange()` |
 | `src/pages/ReplayAnalyzer.jsx` | Full-day Spot + MTM charts (09:15–15:29) with green IN / red OUT markers; purple dashed "If held" shadow MTM line after exit; gate-by-gate audit, legs table |
-| `src/pages/RunsLibrary.jsx` | All saved runs sorted by date desc; infinite scroll (loads 20 rows on sentinel intersection) |
+| `src/pages/RunsLibrary.jsx` | All saved runs sorted by date desc; infinite scroll (20/page); checkbox multi-select on `strategy_run` rows → export ≤20 as single CSV or >20 as ZIP bundle |
 | `src/components/TopNav.jsx` | Primary workbench nav + legacy links (hidden on workbench) |
 | `src/index.css` | `wb-*` CSS token classes (wb-card, wb-kicker, wb-grid, wb-chip, etc.) |
 
@@ -555,8 +555,10 @@ Base URL: `http://localhost:8000/api`
 | POST | `/v2/runs/validate` | Dry-run: resolve contract without DB writes |
 | POST | `/v2/runs` | Create a new run (`paper_replay`, `historical_backtest`, `single_session_backtest`) |
 | GET | `/v2/runs/:kind/:id` | Run detail (`kind`: `paper_session`, `historical_batch`, `historical_session`, `strategy_run`) |
-| GET | `/v2/runs/:kind/:id/replay` | Full replay payload: decisions/events, marks, candles, explainability |
-| POST | `/v2/runs/compare` | Compare two runs side-by-side |
+| GET | `/v2/runs/:kind/:id/replay` | Full replay payload: decisions/events, marks, candles, CE/PE MTM split, VIX series, MFE/MAE |
+| GET | `/v2/runs/strategy_run/:id/replay/csv` | Full 9-section replay CSV (Trade Summary, Execution Summary, Contracts, MTM Series, CE Premium, PE Premium, NIFTY Spot OHLC, India VIX, Decision Log) |
+| POST | `/v2/runs/strategy_run/export-bundle` | Multi-run bundle: `{run_ids:[...]}`. ≤20 → single stacked CSV; >20 → ZIP. Raises 404 for any unknown ID. |
+| GET | `/v2/runs/compare` | Compare up to 4 runs by comma-separated `refs` |
 
 ### Historical Backtest
 
@@ -692,6 +694,7 @@ cd backend && python -m pytest tests/ -v
 | `test_contract_spec_service.py` | ATM strike rounding (incl. banker's rounding edge cases), leg template expansion |
 | `test_charges_service.py` | Brokerage math: entry/exit/total charges, STT, GST, monotonicity |
 | `test_generic_executor.py` | `validate_run` (7 tests) + `execute_run` (6 tests) via async fake DB and service-layer patches |
+| `test_strategy_replay_serializer.py` | 19 tests: CE/PE MTM grouping, MFE/MAE/drawdown, VIX forward-fill + source tagging, spot OHLC completeness, data quality warnings, legs shape, payload regression |
 
 ### Frontend (Vitest)
 
@@ -704,6 +707,7 @@ cd frontend && npm test
 | `TopNav.test.jsx` | Primary + legacy nav links, active state, workbench visibility rules |
 | `Backtest.test.jsx` | Single-date form, API call, loading state |
 | `Dashboard.test.jsx` | Data render, navigation, empty/error states |
+| `RunsLibrary.test.jsx` | Table render; checkboxes only on strategy_run rows; export button appears after selection |
 | `RegimeBadge / MetricCard / PnlChart` | Component rendering |
 | `api/index.test.js` | Export contract, base URL, timeout, workbench API functions |
 
