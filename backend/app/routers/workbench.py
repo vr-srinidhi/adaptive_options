@@ -13,7 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db
 from app.dependencies.auth import get_current_active_user
-from app.models.historical import OptionsCandle, SessionBatch, SpotCandle, TradingDay
+from app.models.historical import OptionsCandle, SessionBatch, SpotCandle, TradingDay, VixCandle
 from app.services.charges_service import compute_entry_charges, compute_exit_charges_estimate
 from app.models.paper_trade import (
     MinuteDecision,
@@ -714,39 +714,8 @@ async def get_run_replay(
         if run_row is None:
             raise HTTPException(status_code=404, detail="Run not found.")
 
-        legs = (await db.execute(
-            select(StrategyRunLeg)
-            .where(StrategyRunLeg.run_id == run_id)
-            .order_by(StrategyRunLeg.leg_index)
-        )).scalars().all()
-        mtm_rows = (await db.execute(
-            select(StrategyRunMtm)
-            .where(StrategyRunMtm.run_id == run_id)
-            .order_by(StrategyRunMtm.timestamp)
-        )).scalars().all()
-        leg_mtm_rows = (await db.execute(
-            select(StrategyLegMtm)
-            .where(StrategyLegMtm.run_id == run_id)
-            .order_by(StrategyLegMtm.timestamp)
-        )).scalars().all()
-        events = (await db.execute(
-            select(StrategyRunEvent)
-            .where(StrategyRunEvent.run_id == run_id)
-            .order_by(StrategyRunEvent.timestamp)
-        )).scalars().all()
-
-        spot_candles_full = (await db.execute(
-            select(SpotCandle)
-            .where(
-                SpotCandle.symbol == run_row.instrument,
-                SpotCandle.trade_date == run_row.trade_date,
-            )
-            .order_by(SpotCandle.timestamp)
-        )).scalars().all()
-
-        shadow_mtm = await _compute_shadow_mtm(db, run_row, legs)
-
-        return strategy_run_replay_payload(run_row, legs, mtm_rows, leg_mtm_rows, events, spot_candles_full, shadow_mtm)
+        payload = await _build_strategy_run_replay_payload(db, run_row)
+        return payload
 
     if kind not in {"paper_session", "historical_session"}:
         raise HTTPException(status_code=404, detail="Replay is only available for session-level runs.")
@@ -786,6 +755,346 @@ async def get_run_replay(
         candle_series=candle_series,
         legs=legs,
     )
+
+
+async def _build_strategy_run_replay_payload(db: AsyncSession, run_row: "StrategyRun") -> dict:
+    """
+    Single source of truth for all replay data.
+    Called by both the replay endpoint and the CSV endpoint so screen values
+    and export values are guaranteed to match.
+    """
+    run_id = run_row.id
+
+    legs = (await db.execute(
+        select(StrategyRunLeg)
+        .where(StrategyRunLeg.run_id == run_id)
+        .order_by(StrategyRunLeg.leg_index)
+    )).scalars().all()
+    mtm_rows = (await db.execute(
+        select(StrategyRunMtm)
+        .where(StrategyRunMtm.run_id == run_id)
+        .order_by(StrategyRunMtm.timestamp)
+    )).scalars().all()
+    leg_mtm_rows = (await db.execute(
+        select(StrategyLegMtm)
+        .where(StrategyLegMtm.run_id == run_id)
+        .order_by(StrategyLegMtm.timestamp)
+    )).scalars().all()
+    events = (await db.execute(
+        select(StrategyRunEvent)
+        .where(StrategyRunEvent.run_id == run_id)
+        .order_by(StrategyRunEvent.timestamp)
+    )).scalars().all()
+    spot_candles_full = (await db.execute(
+        select(SpotCandle)
+        .where(SpotCandle.symbol == run_row.instrument, SpotCandle.trade_date == run_row.trade_date)
+        .order_by(SpotCandle.timestamp)
+    )).scalars().all()
+    vix_candles_full = (await db.execute(
+        select(VixCandle)
+        .where(VixCandle.trade_date == run_row.trade_date)
+        .order_by(VixCandle.timestamp)
+    )).scalars().all()
+
+    shadow_mtm = await _compute_shadow_mtm(db, run_row, legs)
+
+    # Full-day option OHLC per leg (not trade-window only — PRD requires full-day premium charts)
+    leg_candles: dict = {}
+    for leg in legs:
+        ohlc_rows = (await db.execute(
+            select(OptionsCandle)
+            .where(
+                OptionsCandle.symbol     == run_row.instrument,
+                OptionsCandle.trade_date == run_row.trade_date,
+                OptionsCandle.expiry_date == leg.expiry_date,
+                OptionsCandle.strike      == leg.strike,
+                OptionsCandle.option_type == leg.option_type,
+            )
+            .order_by(OptionsCandle.timestamp)
+        )).scalars().all()
+        leg_candles[str(leg.leg_index)] = [
+            {
+                "timestamp": r.timestamp.isoformat(),
+                "open":  float(r.open)  if r.open  is not None else None,
+                "high":  float(r.high)  if r.high  is not None else None,
+                "low":   float(r.low)   if r.low   is not None else None,
+                "close": float(r.close) if r.close is not None else None,
+            }
+            for r in ohlc_rows
+        ]
+
+    return strategy_run_replay_payload(
+        run_row, legs, mtm_rows, leg_mtm_rows, events,
+        spot_candles_full=spot_candles_full,
+        shadow_mtm_rows=shadow_mtm,
+        vix_candles_full=vix_candles_full,
+        leg_candles=leg_candles,
+    )
+
+
+def _csv_f(v) -> str:
+    return "" if v is None else str(round(float(v), 2))
+
+
+def _csv_inr(v) -> str:
+    if v is None:
+        return ""
+    f = float(v)
+    sign = "-" if f < 0 else ""
+    return f"{sign}Rs.{abs(f):,.2f}"
+
+
+def _write_run_sections_to_csv(w, payload: dict, run_row) -> None:
+    """Write all 8 sections for one strategy run to an open csv.writer instance."""
+    run    = payload["run"]
+    legs   = payload["legs"]
+    events = payload["events"]
+
+    def sec(title: str) -> None:
+        w.writerow([])
+        w.writerow([f"=== {title} ==="])
+
+    # Section 1: Trade Summary
+    sec("TRADE SUMMARY")
+    w.writerow(["Field", "Value"])
+    w.writerow(["Strategy",    run.get("strategy_id", "")])
+    w.writerow(["Date",        run.get("trade_date", "")])
+    w.writerow(["Instrument",  run.get("instrument", "")])
+    w.writerow(["Status",      run.get("status", "")])
+    w.writerow(["Exit Reason", run.get("exit_reason", "")])
+    w.writerow(["Net P&L",     _csv_inr(run.get("realized_net_pnl"))])
+    w.writerow(["Gross P&L",   _csv_inr(run.get("gross_pnl"))])
+    w.writerow(["Charges",     _csv_inr(run.get("total_charges"))])
+
+    # Section 2: Execution Summary
+    sec("EXECUTION SUMMARY")
+    w.writerow(["Field", "Value"])
+    lots     = run.get("lots") or 0
+    lot_size = run.get("lot_size") or 0
+    w.writerow(["Capital",      _csv_inr(run.get("capital"))])
+    w.writerow(["Lots",         lots])
+    w.writerow(["Lot Size",     lot_size])
+    w.writerow(["Total Qty",    lots * lot_size])
+    w.writerow(["Entry Time",   run.get("entry_time", "")])
+    w.writerow(["Exit Time",    run.get("exit_time", "")])
+    w.writerow(["Entry Credit", _csv_inr(run.get("entry_credit_total"))])
+    w.writerow(["MFE",          _csv_inr(run.get("mfe"))])
+    w.writerow(["MAE",          _csv_inr(run.get("mae"))])
+    w.writerow(["Max Drawdown", _csv_inr(run.get("max_drawdown"))])
+
+    # Section 3: Contracts Executed
+    sec("CONTRACTS EXECUTED")
+    w.writerow(["Leg", "Side", "Type", "Strike", "Expiry", "Qty", "Entry Price", "Exit Price", "Gross P&L"])
+    for leg in legs:
+        w.writerow([
+            leg.get("leg_index", ""),
+            leg.get("side", ""),
+            leg.get("option_type", ""),
+            leg.get("strike", ""),
+            leg.get("expiry_date", ""),
+            leg.get("quantity", ""),
+            _csv_f(leg.get("entry_price")),
+            _csv_f(leg.get("exit_price")),
+            _csv_f(leg.get("gross_leg_pnl")),
+        ])
+
+    # Section 4: MTM Series (trade window + shadow)
+    events_by_ts: dict = {}
+    for ev in events:
+        ts = ev["timestamp"]
+        if ts not in events_by_ts:
+            events_by_ts[ts] = {"event_type": [], "reason": []}
+        events_by_ts[ts]["event_type"].append(ev.get("event_type") or "")
+        events_by_ts[ts]["reason"].append(ev.get("reason_code") or "")
+
+    sec("MTM SERIES — Trade Window + Hypothetical Shadow (after exit)")
+    w.writerow(["Timestamp", "Net MTM", "CE MTM", "PE MTM", "Trail Stop", "Event", "Reason", "Series"])
+    for row in payload["mtm_series"]:
+        ts = row["timestamp"]
+        ev = events_by_ts.get(ts, {})
+        w.writerow([
+            ts,
+            _csv_f(row.get("net_mtm")),
+            _csv_f(row.get("ce_mtm")),
+            _csv_f(row.get("pe_mtm")),
+            _csv_f(row.get("trail_stop_level")),
+            "|".join(ev.get("event_type", [])),
+            "|".join(ev.get("reason", [])),
+            "actual",
+        ])
+    for row in payload["shadow_mtm_series"]:
+        w.writerow([row["timestamp"], _csv_f(row.get("net_mtm")), "", "", "", "", "", "shadow (hypothetical)"])
+
+    # Sections 5+: CE then PE premium candles
+    ce_legs = [l for l in legs if l["option_type"] == "CE"]
+    pe_legs = [l for l in legs if l["option_type"] == "PE"]
+
+    for leg in ce_legs:
+        sec(f"CE PREMIUM — {run_row.instrument}{leg['strike']}CE {leg.get('expiry_date', '')} (1-min candles, full day)")
+        w.writerow(["Timestamp", "Open", "High", "Low", "Close"])
+        for c in payload["leg_candles"].get(str(leg["leg_index"]), []):
+            w.writerow([c["timestamp"], _csv_f(c.get("open")), _csv_f(c.get("high")), _csv_f(c.get("low")), _csv_f(c.get("close"))])
+
+    for leg in pe_legs:
+        sec(f"PE PREMIUM — {run_row.instrument}{leg['strike']}PE {leg.get('expiry_date', '')} (1-min candles, full day)")
+        w.writerow(["Timestamp", "Open", "High", "Low", "Close"])
+        for c in payload["leg_candles"].get(str(leg["leg_index"]), []):
+            w.writerow([c["timestamp"], _csv_f(c.get("open")), _csv_f(c.get("high")), _csv_f(c.get("low")), _csv_f(c.get("close"))])
+
+    # NIFTY Spot OHLC
+    sec(f"NIFTY SPOT OHLC — Full Day ({run.get('trade_date', '')})")
+    w.writerow(["Timestamp", "Open", "High", "Low", "Close"])
+    for r in payload["spot_series_full"]:
+        w.writerow([r["timestamp"], _csv_f(r.get("open")), _csv_f(r.get("high")), _csv_f(r.get("low")), _csv_f(r.get("close"))])
+
+    # India VIX
+    sec(f"INDIA VIX — Full Day ({run.get('trade_date', '')})")
+    w.writerow(["Timestamp", "VIX Close", "Source"])
+    for r in payload["vix_series_full"]:
+        w.writerow([r["timestamp"], _csv_f(r.get("vix_close")), r.get("vix_source", "")])
+
+    # Decision Log
+    sec("DECISION LOG")
+    w.writerow(["Timestamp", "Event Type", "Reason Code", "Reason Text"])
+    for ev in events:
+        w.writerow([ev.get("timestamp", ""), ev.get("event_type", ""), ev.get("reason_code") or "", ev.get("reason_text") or ""])
+
+
+@router.get("/runs/strategy_run/{item_id}/replay/csv")
+async def get_strategy_run_replay_csv(
+    item_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_active_user),
+):
+    """Single-run multi-section CSV export."""
+    import csv
+    import io
+    from fastapi.responses import StreamingResponse
+
+    run_id = _parse_uuid(item_id)
+    run_row = (await db.execute(
+        select(StrategyRun).where(
+            StrategyRun.id == run_id,
+            StrategyRun.user_id == current_user.id,
+        )
+    )).scalar_one_or_none()
+    if run_row is None:
+        raise HTTPException(status_code=404, detail="Run not found.")
+
+    payload = await _build_strategy_run_replay_payload(db, run_row)
+    output  = io.StringIO()
+    w       = csv.writer(output)
+    _write_run_sections_to_csv(w, payload, run_row)
+
+    csv_bytes = output.getvalue().encode("utf-8-sig")
+    filename  = f"replay_{run_row.instrument}_{run_row.trade_date.isoformat()}_{item_id[:8]}.csv"
+    return StreamingResponse(
+        io.BytesIO(csv_bytes),
+        media_type="text/csv",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+class ExportBundleRequest(BaseModel):
+    run_ids: list[str] = Field(..., min_length=1)
+
+
+# Runs at or below this threshold → single multi-section CSV.
+# Above → ZIP of individual CSVs (one per run, no hard cap).
+_BUNDLE_CSV_THRESHOLD = 20
+
+
+@router.post("/runs/strategy_run/export-bundle")
+async def export_strategy_runs_bundle(
+    body: ExportBundleRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_active_user),
+):
+    """
+    ≤20 runs  → single multi-section CSV (all runs stacked, divider between each).
+    >20 runs  → ZIP of individual single-run CSVs (one file per run).
+    Filename: {strategy_id}_{date_from}_to_{date_to}_bundle.{csv|zip}
+    """
+    import csv
+    import io
+    import zipfile
+    from fastapi.responses import StreamingResponse
+
+    run_uuids = [_parse_uuid(rid) for rid in body.run_ids]
+    run_rows  = (await db.execute(
+        select(StrategyRun).where(
+            StrategyRun.id.in_(run_uuids),
+            StrategyRun.user_id == current_user.id,
+        )
+    )).scalars().all()
+
+    run_map      = {row.id: row for row in run_rows}
+    ordered_rows = [run_map[uid] for uid in run_uuids if uid in run_map]
+    if not ordered_rows:
+        raise HTTPException(status_code=404, detail="No matching runs found.")
+    if len(ordered_rows) != len(run_uuids):
+        missing = len(run_uuids) - len(ordered_rows)
+        raise HTTPException(
+            status_code=404,
+            detail=f"{missing} run(s) not found or not accessible. Verify all IDs belong to your account.",
+        )
+
+    total = len(ordered_rows)
+
+    # Filename components
+    strategy_ids = list(dict.fromkeys(r.strategy_id for r in ordered_rows))
+    strategy_slug = strategy_ids[0] if len(strategy_ids) == 1 else "multi_strategy"
+    dates         = sorted(r.trade_date.isoformat() for r in ordered_rows)
+    date_range    = dates[0] if len(dates) == 1 else f"{dates[0]}_to_{dates[-1]}"
+
+    if total <= _BUNDLE_CSV_THRESHOLD:
+        # ── Single stacked CSV ──────────────────────────────────────────
+        output = io.StringIO()
+        w      = csv.writer(output)
+        w.writerow([f"=== BUNDLE EXPORT: {total} RUN{'S' if total > 1 else ''} ==="])
+
+        for i, run_row in enumerate(ordered_rows, 1):
+            payload = await _build_strategy_run_replay_payload(db, run_row)
+            run     = payload["run"]
+            w.writerow([])
+            w.writerow([])
+            w.writerow(["=" * 80])
+            w.writerow([
+                f"=== RUN {i} / {total}:  "
+                f"{run.get('instrument')}  |  "
+                f"{run.get('trade_date')}  |  "
+                f"{run.get('strategy_id')}  |  "
+                f"Net P&L: {_csv_inr(run.get('realized_net_pnl'))} ==="
+            ])
+            w.writerow(["=" * 80])
+            _write_run_sections_to_csv(w, payload, run_row)
+
+        csv_bytes = output.getvalue().encode("utf-8-sig")
+        filename  = f"{strategy_slug}_{date_range}_bundle.csv"
+        return StreamingResponse(
+            io.BytesIO(csv_bytes),
+            media_type="text/csv",
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        )
+
+    else:
+        # ── ZIP of individual CSVs ──────────────────────────────────────
+        zip_buffer = io.BytesIO()
+        with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
+            for run_row in ordered_rows:
+                payload    = await _build_strategy_run_replay_payload(db, run_row)
+                csv_output = io.StringIO()
+                _write_run_sections_to_csv(csv.writer(csv_output), payload, run_row)
+                entry_name = f"{run_row.strategy_id}_{run_row.trade_date.isoformat()}_{str(run_row.id)[:8]}_replay.csv"
+                zf.writestr(entry_name, csv_output.getvalue().encode("utf-8-sig"))
+
+        zip_buffer.seek(0)
+        filename = f"{strategy_slug}_{date_range}_bundle.zip"
+        return StreamingResponse(
+            zip_buffer,
+            media_type="application/zip",
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        )
 
 
 @router.get("/runs/compare")

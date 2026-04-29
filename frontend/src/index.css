@@ -287,3 +287,43 @@ body {
     padding: 1.25rem;
   }
 }
+
+@media print {
+  /* Hide navigation, sidebar, and interactive controls */
+  nav, header, aside, .no-print { display: none !important; }
+
+  body { background: #fff !important; color: #000 !important; font-size: 11pt; }
+
+  .replay-v2-container {
+    padding: 0 !important;
+    max-width: 100% !important;
+  }
+
+  /* Force white background on cards */
+  .wb-card, .print-section {
+    background: #fff !important;
+    border: 1px solid #ccc !important;
+    box-shadow: none !important;
+    break-inside: avoid;
+    page-break-inside: avoid;
+    margin-bottom: 12pt !important;
+  }
+
+  /* Keep text readable */
+  .wb-card *, .print-section * {
+    color: #111 !important;
+  }
+
+  /* Charts need a fixed height for print */
+  .print-section .recharts-responsive-container {
+    height: 200px !important;
+  }
+
+  /* Avoid page breaks mid-chart */
+  .wb-grid-2 > * { break-inside: avoid; }
+
+  /* Show grid as single column */
+  .wb-grid-2, .wb-grid-3, .wb-grid-4 {
+    grid-template-columns: 1fr !important;
+  }
+}

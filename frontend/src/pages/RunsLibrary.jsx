@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useNavigate, useSearchParams } from 'react-router-dom'
-import { compareWorkbenchRuns, getWorkbenchRuns } from '../api'
+import { exportStrategyRunsBundle, getWorkbenchRuns } from '../api'
 import { fmtDateTime, fmtINR, fmtShortDate, runKindLabel, runStatusTone } from '../utils/workbench'
 
 const PALETTE = {
@@ -18,6 +18,7 @@ const PALETTE = {
 
 const KIND_FILTERS = [
   { value: 'all', label: 'All Runs' },
+  { value: 'strategy_run', label: 'Strategy Runs' },
   { value: 'paper_session', label: 'Paper Replay' },
   { value: 'historical_batch', label: 'Historical Batch' },
 ]
@@ -41,66 +42,6 @@ function StatusBadge({ status }) {
   )
 }
 
-function CompareBars({ items }) {
-  const points = items
-    .map(item => ({
-      key: `${item.kind}:${item.id}`,
-      label: item.strategy_name || item.title,
-      value: Number(item.pnl || 0),
-      color: Number(item.pnl || 0) >= 0 ? PALETTE.blue : PALETTE.amber,
-    }))
-
-  const maxAbs = Math.max(...points.map(point => Math.abs(point.value)), 1)
-  const width = 520
-  const height = 90
-  const zeroX = width / 2
-  const rowHeight = height / Math.max(points.length, 1)
-
-  return (
-    <div>
-      <svg viewBox={`0 0 ${width} ${height}`} style={{ width: '100%', height: 82, display: 'block' }}>
-        <line x1={zeroX} y1={0} x2={zeroX} y2={height} stroke="rgba(51,65,85,0.85)" strokeWidth="1" />
-        {points.map((point, index) => {
-          const y = index * rowHeight + rowHeight / 2
-          const barWidth = (Math.abs(point.value) / maxAbs) * (width / 2 - 22)
-          const x = point.value >= 0 ? zeroX : zeroX - barWidth
-          return (
-            <g key={point.key}>
-              <rect
-                x={x}
-                y={y - 8}
-                width={Math.max(barWidth, 6)}
-                height={16}
-                rx={4}
-                fill={point.color}
-                fillOpacity="0.2"
-                stroke={point.color}
-                strokeOpacity="0.5"
-              />
-              <text
-                x={point.value >= 0 ? x + Math.max(barWidth, 6) + 8 : x - 8}
-                y={y + 3}
-                textAnchor={point.value >= 0 ? 'start' : 'end'}
-                style={{ fontSize: 9, fill: point.color, fontWeight: 700 }}
-              >
-                {fmtINR(point.value)}
-              </text>
-            </g>
-          )
-        })}
-      </svg>
-      <div className="flex flex-wrap gap-3" style={{ marginTop: 6 }}>
-        {points.map(point => (
-          <div key={point.key} className="flex items-center gap-2">
-            <div style={{ width: 16, height: 2, background: point.color, borderRadius: 1 }} />
-            <span style={{ fontSize: 9, color: '#64748b' }}>{point.label}</span>
-          </div>
-        ))}
-      </div>
-    </div>
-  )
-}
-
 export default function RunsLibrary() {
   const navigate = useNavigate()
   const [searchParams] = useSearchParams()
@@ -109,11 +50,10 @@ export default function RunsLibrary() {
   const [query, setQuery] = useState('')
   const [page, setPage] = useState(0)
   const [hasMore, setHasMore] = useState(false)
-  const [selectedRefs, setSelectedRefs] = useState([])
-  const [compareItems, setCompareItems] = useState([])
+  const [selectedIds, setSelectedIds] = useState(new Set())
   const [loading, setLoading] = useState(true)
   const [loadingMore, setLoadingMore] = useState(false)
-  const [comparing, setComparing] = useState(false)
+  const [exporting, setExporting] = useState(false)
   const [error, setError] = useState(null)
   const sentinelRef = useRef(null)
 
@@ -124,6 +64,7 @@ export default function RunsLibrary() {
     setRuns([])
     setPage(0)
     setHasMore(false)
+    setSelectedIds(new Set())
     const params = {
       limit: PAGE_SIZE + 1,
       offset: 0,
@@ -132,15 +73,14 @@ export default function RunsLibrary() {
     getWorkbenchRuns(params)
       .then(res => {
         const allRows = res.data.runs || []
-        const nextRuns = allRows.slice(0, PAGE_SIZE)
         setHasMore(allRows.length > PAGE_SIZE)
-        setRuns(nextRuns)
+        setRuns(allRows.slice(0, PAGE_SIZE))
       })
       .catch(err => setError(err.response?.data?.detail || err.message))
       .finally(() => setLoading(false))
   }, [kind])
 
-  // Subsequent pages: append to list
+  // Subsequent pages: append
   useEffect(() => {
     if (page === 0) return
     setLoadingMore(true)
@@ -153,15 +93,14 @@ export default function RunsLibrary() {
     getWorkbenchRuns(params)
       .then(res => {
         const allRows = res.data.runs || []
-        const nextRuns = allRows.slice(0, PAGE_SIZE)
         setHasMore(allRows.length > PAGE_SIZE)
-        setRuns(prev => [...prev, ...nextRuns])
+        setRuns(prev => [...prev, ...allRows.slice(0, PAGE_SIZE)])
       })
       .catch(err => setError(err.response?.data?.detail || err.message))
       .finally(() => setLoadingMore(false))
   }, [page]) // eslint-disable-line react-hooks/exhaustive-deps
 
-  // IntersectionObserver: increment page when sentinel comes into view
+  // IntersectionObserver: load next page when sentinel enters view
   useEffect(() => {
     if (!sentinelRef.current) return
     const observer = new IntersectionObserver(
@@ -170,7 +109,7 @@ export default function RunsLibrary() {
           setPage(p => p + 1)
         }
       },
-      { threshold: 0.1 }
+      { threshold: 0.1 },
     )
     observer.observe(sentinelRef.current)
     return () => observer.disconnect()
@@ -179,19 +118,6 @@ export default function RunsLibrary() {
   const handleKindChange = useCallback((nextKind) => {
     setKind(nextKind)
   }, [])
-
-  useEffect(() => {
-    if (selectedRefs.length < 2) {
-      setCompareItems([])
-      return
-    }
-    setComparing(true)
-    setError(null)
-    compareWorkbenchRuns(selectedRefs.join(','))
-      .then(res => setCompareItems(res.data.items || []))
-      .catch(err => setError(err.response?.data?.detail || err.message))
-      .finally(() => setComparing(false))
-  }, [selectedRefs])
 
   const filtered = useMemo(() => {
     const q = query.trim().toLowerCase()
@@ -204,40 +130,98 @@ export default function RunsLibrary() {
     })
   }, [runs, query])
 
-  const toggleCompare = run => {
-    const ref = `${run.kind}:${run.id}`
-    setSelectedRefs(prev => {
-      if (prev.includes(ref)) return prev.filter(item => item !== ref)
-      if (prev.length >= 4) return prev
-      return [...prev, ref]
+  // IDs of visible strategy_run rows — the only ones eligible for CSV export
+  const visibleStrategyRunIds = useMemo(
+    () => filtered.filter(r => r.kind === 'strategy_run').map(r => r.id),
+    [filtered],
+  )
+
+  const allSelected =
+    visibleStrategyRunIds.length > 0 &&
+    visibleStrategyRunIds.every(id => selectedIds.has(id))
+  const someSelected = visibleStrategyRunIds.some(id => selectedIds.has(id))
+
+  const toggleSelectAll = () => {
+    setSelectedIds(prev => {
+      const next = new Set(prev)
+      if (allSelected) {
+        visibleStrategyRunIds.forEach(id => next.delete(id))
+      } else {
+        visibleStrategyRunIds.forEach(id => next.add(id))
+      }
+      return next
     })
   }
 
-  const compareSummary = useMemo(() => {
-    if (compareItems.length < 2) return null
-    const positive = compareItems.filter(item => Number(item.pnl || 0) >= 0).length
-    const totalPnl = compareItems.reduce((sum, item) => sum + Number(item.pnl || 0), 0)
-    return {
-      totalPnl,
-      winners: positive,
+  const toggleSelectOne = run => {
+    if (run.kind !== 'strategy_run') return
+    setSelectedIds(prev => {
+      const next = new Set(prev)
+      if (next.has(run.id)) next.delete(run.id)
+      else next.add(run.id)
+      return next
+    })
+  }
+
+  const exportableIds       = [...selectedIds]
+  const exportCount         = exportableIds.length
+  const willBeZip           = exportCount > 20
+  const visibleSelectedCount = visibleStrategyRunIds.filter(id => selectedIds.has(id)).length
+
+  const handleBundleExport = async () => {
+    if (exportCount === 0 || exporting) return
+    setExporting(true)
+    setError(null)
+    try {
+      const res         = await exportStrategyRunsBundle(exportableIds)
+      const contentDisp = res.headers?.['content-disposition'] || ''
+      const match       = contentDisp.match(/filename="([^"]+)"/)
+      const filename    = match ? match[1] : `bundle_${exportCount}runs.${willBeZip ? 'zip' : 'csv'}`
+      const blob        = new Blob([res.data], { type: res.headers?.['content-type'] || 'text/csv' })
+      const url         = URL.createObjectURL(blob)
+      const a           = document.createElement('a')
+      a.href     = url
+      a.download = filename
+      document.body.appendChild(a)
+      a.click()
+      document.body.removeChild(a)
+      URL.revokeObjectURL(url)
+    } catch (err) {
+      setError(err.response?.data?.detail || 'Bundle export failed.')
+    } finally {
+      setExporting(false)
     }
-  }, [compareItems])
+  }
 
   return (
     <div className="mx-auto max-w-[1360px]" style={{ padding: '18px 20px 0', fontSize: 12 }}>
       <div className="space-y-4">
+        {/* ── Header ── */}
         <div className="flex items-start justify-between gap-4">
           <div>
             <div style={{ fontSize: 15, fontWeight: 700, color: PALETTE.text, marginBottom: 3 }}>
               Runs Library
             </div>
-            <div style={{ fontSize: 10, color: PALETTE.muted }}>
-              {runs.length} loaded{hasMore ? ' · scroll for more' : ' · all loaded'} · select 2 or more for compare
+            <div style={{ fontSize: 10, color: PALETTE.muted }} className="flex items-center gap-2">
+              <span>
+                {runs.length} loaded{hasMore ? ' · scroll for more' : ' · all loaded'}
+                {exportCount > 0
+                  ? ` · ${exportCount} selected${visibleSelectedCount < exportCount ? ` (${visibleSelectedCount} visible)` : ''}`
+                  : ''}
+              </span>
+              {exportCount > 0 && (
+                <button
+                  type="button"
+                  onClick={() => setSelectedIds(new Set())}
+                  style={{ color: PALETTE.muted, background: 'transparent', cursor: 'pointer', fontSize: 9, textDecoration: 'underline' }}
+                >
+                  Clear
+                </button>
+              )}
             </div>
           </div>
 
           <div className="flex flex-wrap items-center gap-2">
-            <span style={{ fontSize: 10, color: PALETTE.muted }}>{selectedRefs.length} selected</span>
             {KIND_FILTERS.map(filter => (
               <button
                 key={filter.value}
@@ -256,6 +240,7 @@ export default function RunsLibrary() {
                 {filter.label}
               </button>
             ))}
+
             <input
               value={query}
               onChange={e => setQuery(e.target.value)}
@@ -269,75 +254,37 @@ export default function RunsLibrary() {
                 fontSize: 10,
               }}
             />
+
+            {exportCount > 0 && (
+              <button
+                type="button"
+                onClick={handleBundleExport}
+                disabled={exporting}
+                className="rounded-md px-3 py-1.5"
+                style={{
+                  background: willBeZip ? 'rgba(59,130,246,0.12)' : 'rgba(34,197,94,0.12)',
+                  border: `1px solid ${willBeZip ? 'rgba(59,130,246,0.4)' : 'rgba(34,197,94,0.4)'}`,
+                  color: willBeZip ? PALETTE.blue : PALETTE.green,
+                  fontSize: 9,
+                  fontWeight: 700,
+                  cursor: exporting ? 'not-allowed' : 'pointer',
+                  opacity: exporting ? 0.6 : 1,
+                }}
+                title={willBeZip ? `>20 runs — downloads as ZIP of individual CSVs` : `Download ${exportCount} run${exportCount > 1 ? 's' : ''} as single CSV`}
+              >
+                {exporting
+                  ? 'Exporting…'
+                  : willBeZip
+                    ? `↓ Export ${exportCount} runs  ZIP`
+                    : `↓ Export ${exportCount} run${exportCount > 1 ? 's' : ''}  CSV`}
+              </button>
+            )}
           </div>
         </div>
 
         {error ? <div className="wb-alert-error">{error}</div> : null}
 
-        {compareItems.length >= 2 ? (
-          <section
-            className="rounded-[10px]"
-            style={{
-              background: PALETTE.card,
-              border: '1px solid rgba(59,130,246,0.3)',
-              padding: 14,
-            }}
-          >
-            <div
-              className="mb-3 text-[10px] uppercase tracking-[0.08em]"
-              style={{ color: PALETTE.muted, fontWeight: 500 }}
-            >
-              Compare: P&amp;L Snapshot
-            </div>
-
-            <div className="grid gap-3 md:grid-cols-2" style={{ marginBottom: 12 }}>
-              {compareItems.map(item => (
-                <div
-                  key={`${item.kind}:${item.id}`}
-                  className="rounded-[7px]"
-                  style={{
-                    background: PALETTE.bg,
-                    border: `1px solid rgba(59,130,246,0.25)`,
-                    padding: '9px 12px',
-                  }}
-                >
-                  <div style={{ fontSize: 11, fontWeight: 600, color: PALETTE.text, marginBottom: 2 }}>
-                    {item.strategy_name || item.title}
-                  </div>
-                  <div style={{ fontSize: 9, color: PALETTE.muted, marginBottom: 6 }}>
-                    {fmtShortDate(item.date_label || item.subtitle)} · {item.instrument || runKindLabel(item.kind)}
-                  </div>
-                  <div
-                    style={{
-                      fontSize: 13,
-                      fontWeight: 700,
-                      color: Number(item.pnl || 0) >= 0 ? PALETTE.green : PALETTE.red,
-                    }}
-                  >
-                    {fmtINR(item.pnl)}
-                  </div>
-                </div>
-              ))}
-            </div>
-
-            <CompareBars items={compareItems} />
-
-            {compareSummary ? (
-              <div className="mt-3 flex flex-wrap gap-4" style={{ fontSize: 10, color: PALETTE.muted }}>
-                <span>Total compare P&amp;L: <strong style={{ color: compareSummary.totalPnl >= 0 ? PALETTE.green : PALETTE.red }}>{fmtINR(compareSummary.totalPnl)}</strong></span>
-                <span>Positive runs: <strong style={{ color: PALETTE.text }}>{compareSummary.winners}</strong></span>
-                <button
-                  type="button"
-                  onClick={() => setSelectedRefs([])}
-                  style={{ color: PALETTE.blue, background: 'transparent', cursor: 'pointer', fontSize: 10, fontWeight: 600 }}
-                >
-                  Clear compare
-                </button>
-              </div>
-            ) : null}
-          </section>
-        ) : null}
-
+        {/* ── Table ── */}
         {loading ? (
           <div className="flex items-center justify-center h-64 gap-2" style={{ color: PALETTE.muted }}>
             <span className="spinner" /> Loading library…
@@ -350,7 +297,19 @@ export default function RunsLibrary() {
             <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 11 }}>
               <thead>
                 <tr style={{ background: '#334155' }}>
-                  <th style={{ padding: '8px 12px', width: 36 }} />
+                  {/* Select-all checkbox — only meaningful when strategy_run rows are visible */}
+                  <th style={{ padding: '8px 12px', width: 36 }}>
+                    {visibleStrategyRunIds.length > 0 && (
+                      <input
+                        type="checkbox"
+                        checked={allSelected}
+                        ref={el => { if (el) el.indeterminate = someSelected && !allSelected }}
+                        onChange={toggleSelectAll}
+                        title={allSelected ? 'Deselect all' : `Select all ${visibleStrategyRunIds.length} strategy runs`}
+                        style={{ cursor: 'pointer' }}
+                      />
+                    )}
+                  </th>
                   {['Date', 'Strategy', 'Instrument', 'Type', 'Created', 'Net P&L', 'Status', ''].map(header => (
                     <th
                       key={header}
@@ -371,23 +330,26 @@ export default function RunsLibrary() {
               </thead>
               <tbody>
                 {filtered.map(run => {
-                  const ref = `${run.kind}:${run.id}`
-                  const selected = selectedRefs.includes(ref)
+                  const isStrategyRun = run.kind === 'strategy_run'
+                  const selected      = isStrategyRun && selectedIds.has(run.id)
                   return (
                     <tr
-                      key={ref}
+                      key={run.id}
                       style={{
                         borderTop: `0.5px solid ${PALETTE.border}`,
-                        background: selected ? 'rgba(59,130,246,0.04)' : 'transparent',
+                        background: selected ? 'rgba(34,197,94,0.04)' : 'transparent',
                       }}
                     >
                       <td style={{ padding: '8px 12px' }}>
-                        <input
-                          type="checkbox"
-                          checked={selected}
-                          onChange={() => toggleCompare(run)}
-                          aria-label={`compare ${run.title}`}
-                        />
+                        {isStrategyRun ? (
+                          <input
+                            type="checkbox"
+                            checked={selected}
+                            onChange={() => toggleSelectOne(run)}
+                            aria-label={`select ${run.title}`}
+                            style={{ cursor: 'pointer' }}
+                          />
+                        ) : null}
                       </td>
                       <td style={{ padding: '8px 12px', fontWeight: 600, color: PALETTE.text }}>
                         {fmtShortDate(run.date_label || run.subtitle)}
@@ -459,11 +421,10 @@ export default function RunsLibrary() {
                 justifyContent: 'space-between',
               }}
             >
-              <span>Click a row action to open replay or detail view. Compare supports up to 4 runs.</span>
+              <span>Check strategy run rows to export. ≤20 runs → single CSV · &gt;20 runs → ZIP of individual CSVs.</span>
               <span>{filtered.length} rows shown</span>
             </div>
 
-            {/* Infinite scroll sentinel */}
             <div ref={sentinelRef} style={{ height: 1 }} />
 
             {loadingMore && (
@@ -486,21 +447,6 @@ export default function RunsLibrary() {
           </section>
         )}
       </div>
-
-      {comparing ? (
-        <div
-          className="fixed bottom-5 right-5 rounded-[8px]"
-          style={{
-            background: PALETTE.card,
-            border: `1px solid ${PALETTE.border}`,
-            color: PALETTE.muted,
-            fontSize: 10,
-            padding: '10px 14px',
-          }}
-        >
-          Preparing compare view…
-        </div>
-      ) : null}
 
       <div
         className="text-center"
