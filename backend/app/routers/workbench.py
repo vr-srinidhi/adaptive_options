@@ -839,9 +839,9 @@ async def get_strategy_run_replay_csv(
     current_user: User = Depends(get_current_active_user),
 ):
     """
-    Full replay CSV export (PRD §7.3 schema).
-    Built from the same serializer output as the replay endpoint so screen
-    values and CSV values are guaranteed to match.
+    Multi-section replay CSV — mirrors the strategy run UI screen exactly.
+    Sections: Trade Summary · Execution Summary · Contracts · MTM Series ·
+    CE/PE Premium Candles · NIFTY Spot · Decision Log.
     """
     import csv
     import io
@@ -859,113 +859,140 @@ async def get_strategy_run_replay_csv(
         raise HTTPException(status_code=404, detail="Run not found.")
 
     payload = await _build_strategy_run_replay_payload(db, run_row)
-
-    # ── Build lookup maps from serializer output (single source of truth) ──
-    spot_by_ts    = {r["timestamp"]: r for r in payload["spot_series_full"]}
-    vix_by_ts     = {r["timestamp"]: r for r in payload["vix_series_full"]}
-    mtm_by_ts     = {r["timestamp"]: r for r in payload["mtm_series"]}
-
-    # Aggregate multiple events per minute joined with "|"
-    events_by_ts: dict = {}
-    for ev in payload["events"]:
-        ts = ev["timestamp"]
-        if ts not in events_by_ts:
-            events_by_ts[ts] = {"event_type": [], "event_reason": []}
-        events_by_ts[ts]["event_type"].append(ev["event_type"]  or "")
-        events_by_ts[ts]["event_reason"].append(ev["reason_code"] or "")
-
-    # Per-leg candles keyed by (leg_index_str, timestamp)
-    leg_candle_by_ts: dict = {}
-    for leg_idx_str, candles in payload["leg_candles"].items():
-        for c in candles:
-            leg_candle_by_ts[(leg_idx_str, c["timestamp"])] = c
-
-    serialized_legs = payload["legs"]
-    ce_legs = [l for l in serialized_legs if l["option_type"] == "CE"]
-    pe_legs = [l for l in serialized_legs if l["option_type"] == "PE"]
+    run    = payload["run"]
+    legs   = payload["legs"]
+    events = payload["events"]
 
     def _f(v) -> str:
         return "" if v is None else str(round(float(v), 2))
 
+    def _inr(v) -> str:
+        if v is None:
+            return ""
+        f = float(v)
+        sign = "-" if f < 0 else ""
+        return f"{sign}Rs.{abs(f):,.2f}"
+
     output = io.StringIO()
-    fieldnames = [
-        "strategy_run_id", "trading_date", "timestamp",
-        "nifty_open", "nifty_high", "nifty_low", "nifty_close",
-        "india_vix", "vix_source",
-    ]
-    # CE and PE OHLC columns per leg (numbered if >1 leg per side)
-    for i, leg in enumerate(ce_legs):
-        pfx = f"ce{i+1}" if len(ce_legs) > 1 else "ce"
-        fieldnames += [f"{pfx}_symbol", f"{pfx}_expiry", f"{pfx}_strike",
-                       f"{pfx}_open", f"{pfx}_high", f"{pfx}_low", f"{pfx}_close"]
-    for i, leg in enumerate(pe_legs):
-        pfx = f"pe{i+1}" if len(pe_legs) > 1 else "pe"
-        fieldnames += [f"{pfx}_symbol", f"{pfx}_expiry", f"{pfx}_strike",
-                       f"{pfx}_open", f"{pfx}_high", f"{pfx}_low", f"{pfx}_close"]
-    # Aggregate MTM columns — same formula as the screen (no per-leg confusion)
-    fieldnames += ["ce_mtm", "pe_mtm", "net_mtm", "trail_stop", "event_type", "event_reason"]
+    w = csv.writer(output)
 
-    writer = csv.DictWriter(output, fieldnames=fieldnames, extrasaction="ignore")
-    writer.writeheader()
+    def section(title: str) -> None:
+        w.writerow([])
+        w.writerow([f"=== {title} ==="])
 
-    trade_date_str = run_row.trade_date.isoformat()
-    run_id_str     = str(run_row.id)
+    # ── Section 1: Trade Summary ──────────────────────────────────────────
+    section("TRADE SUMMARY")
+    w.writerow(["Field", "Value"])
+    w.writerow(["Strategy",    run.get("strategy_id", "")])
+    w.writerow(["Date",        run.get("trade_date", "")])
+    w.writerow(["Instrument",  run.get("instrument", "")])
+    w.writerow(["Status",      run.get("status", "")])
+    w.writerow(["Exit Reason", run.get("exit_reason", "")])
+    w.writerow(["Net P&L",     _inr(run.get("realized_net_pnl"))])
+    w.writerow(["Gross P&L",   _inr(run.get("gross_pnl"))])
+    w.writerow(["Charges",     _inr(run.get("total_charges"))])
 
-    for ts_key, spot in spot_by_ts.items():
-        vix_row = vix_by_ts.get(ts_key, {})
-        mtm_row = mtm_by_ts.get(ts_key, {})
-        ev_agg  = events_by_ts.get(ts_key)
+    # ── Section 2: Execution Summary ─────────────────────────────────────
+    section("EXECUTION SUMMARY")
+    w.writerow(["Field", "Value"])
+    lots     = run.get("lots") or 0
+    lot_size = run.get("lot_size") or 0
+    w.writerow(["Capital",         _inr(run.get("capital"))])
+    w.writerow(["Lots",            lots])
+    w.writerow(["Lot Size",        lot_size])
+    w.writerow(["Total Qty",       lots * lot_size])
+    w.writerow(["Entry Time",      run.get("entry_time", "")])
+    w.writerow(["Exit Time",       run.get("exit_time", "")])
+    w.writerow(["Entry Credit",    _inr(run.get("entry_credit_total"))])
+    w.writerow(["MFE",             _inr(run.get("mfe"))])
+    w.writerow(["MAE",             _inr(run.get("mae"))])
+    w.writerow(["Max Drawdown",    _inr(run.get("max_drawdown"))])
 
-        row: dict = {
-            "strategy_run_id": run_id_str,
-            "trading_date":    trade_date_str,
-            "timestamp":       ts_key,
-            "nifty_open":      _f(spot.get("open")  if "open"  in spot else None),
-            "nifty_high":      _f(spot.get("high")  if "high"  in spot else None),
-            "nifty_low":       _f(spot.get("low")   if "low"   in spot else None),
-            "nifty_close":     _f(spot.get("close") if "close" in spot else None),
-            "india_vix":       _f(vix_row.get("vix_close")),
-            "vix_source":      vix_row.get("vix_source", "missing"),
-            "ce_mtm":          _f(mtm_row.get("ce_mtm")),
-            "pe_mtm":          _f(mtm_row.get("pe_mtm")),
-            "net_mtm":         _f(mtm_row.get("net_mtm")),
-            "trail_stop":      _f(mtm_row.get("trail_stop_level")),
-            "event_type":      "|".join(ev_agg["event_type"])   if ev_agg else "",
-            "event_reason":    "|".join(ev_agg["event_reason"]) if ev_agg else "",
-        }
+    # ── Section 3: Contracts Executed ────────────────────────────────────
+    section("CONTRACTS EXECUTED")
+    w.writerow(["Leg", "Side", "Type", "Strike", "Expiry", "Qty", "Entry Price", "Exit Price", "Gross P&L"])
+    for leg in legs:
+        w.writerow([
+            leg.get("leg_index", ""),
+            leg.get("side", ""),
+            leg.get("option_type", ""),
+            leg.get("strike", ""),
+            leg.get("expiry_date", ""),
+            leg.get("quantity", ""),
+            _f(leg.get("entry_price")),
+            _f(leg.get("exit_price")),
+            _f(leg.get("gross_leg_pnl")),
+        ])
 
-        for i, leg in enumerate(ce_legs):
-            pfx = f"ce{i+1}" if len(ce_legs) > 1 else "ce"
-            ohlc = leg_candle_by_ts.get((str(leg["leg_index"]), ts_key), {})
-            expiry_str = leg.get("expiry_date", "")
-            row.update({
-                f"{pfx}_symbol": f"{run_row.instrument}{leg['strike']}CE{expiry_str}",
-                f"{pfx}_expiry": expiry_str,
-                f"{pfx}_strike": str(leg["strike"]),
-                f"{pfx}_open":   _f(ohlc.get("open")),
-                f"{pfx}_high":   _f(ohlc.get("high")),
-                f"{pfx}_low":    _f(ohlc.get("low")),
-                f"{pfx}_close":  _f(ohlc.get("close")),
-            })
+    # ── Section 4: MTM Series (Trade Window + Shadow) ─────────────────────
+    events_by_ts: dict = {}
+    for ev in events:
+        ts = ev["timestamp"]
+        if ts not in events_by_ts:
+            events_by_ts[ts] = {"event_type": [], "reason": []}
+        events_by_ts[ts]["event_type"].append(ev.get("event_type") or "")
+        events_by_ts[ts]["reason"].append(ev.get("reason_code") or "")
 
-        for i, leg in enumerate(pe_legs):
-            pfx = f"pe{i+1}" if len(pe_legs) > 1 else "pe"
-            ohlc = leg_candle_by_ts.get((str(leg["leg_index"]), ts_key), {})
-            expiry_str = leg.get("expiry_date", "")
-            row.update({
-                f"{pfx}_symbol": f"{run_row.instrument}{leg['strike']}PE{expiry_str}",
-                f"{pfx}_expiry": expiry_str,
-                f"{pfx}_strike": str(leg["strike"]),
-                f"{pfx}_open":   _f(ohlc.get("open")),
-                f"{pfx}_high":   _f(ohlc.get("high")),
-                f"{pfx}_low":    _f(ohlc.get("low")),
-                f"{pfx}_close":  _f(ohlc.get("close")),
-            })
+    section("MTM SERIES — Trade Window + Hypothetical Shadow (after exit)")
+    w.writerow(["Timestamp", "Net MTM", "CE MTM", "PE MTM", "Trail Stop", "Event", "Reason", "Series"])
+    for row in payload["mtm_series"]:
+        ts = row["timestamp"]
+        ev = events_by_ts.get(ts, {})
+        w.writerow([
+            ts,
+            _f(row.get("net_mtm")),
+            _f(row.get("ce_mtm")),
+            _f(row.get("pe_mtm")),
+            _f(row.get("trail_stop_level")),
+            "|".join(ev.get("event_type", [])),
+            "|".join(ev.get("reason", [])),
+            "actual",
+        ])
+    for row in payload["shadow_mtm_series"]:
+        w.writerow([
+            row["timestamp"],
+            _f(row.get("net_mtm")),
+            "", "", "", "", "",
+            "shadow (hypothetical)",
+        ])
 
-        writer.writerow(row)
+    # ── Sections 5+: CE then PE premium candles ───────────────────────────
+    ce_legs = [l for l in legs if l["option_type"] == "CE"]
+    pe_legs = [l for l in legs if l["option_type"] == "PE"]
 
-    csv_bytes = output.getvalue().encode("utf-8")
-    filename = f"replay_{run_row.instrument}_{trade_date_str}_{item_id[:8]}.csv"
+    for leg in ce_legs:
+        symbol = f"{run_row.instrument}{leg['strike']}CE {leg.get('expiry_date', '')}"
+        section(f"CE PREMIUM — {symbol} (1-min candles, full day)")
+        w.writerow(["Timestamp", "Open", "High", "Low", "Close"])
+        for c in payload["leg_candles"].get(str(leg["leg_index"]), []):
+            w.writerow([c["timestamp"], _f(c.get("open")), _f(c.get("high")), _f(c.get("low")), _f(c.get("close"))])
+
+    for leg in pe_legs:
+        symbol = f"{run_row.instrument}{leg['strike']}PE {leg.get('expiry_date', '')}"
+        section(f"PE PREMIUM — {symbol} (1-min candles, full day)")
+        w.writerow(["Timestamp", "Open", "High", "Low", "Close"])
+        for c in payload["leg_candles"].get(str(leg["leg_index"]), []):
+            w.writerow([c["timestamp"], _f(c.get("open")), _f(c.get("high")), _f(c.get("low")), _f(c.get("close"))])
+
+    # ── Section: NIFTY Spot OHLC ─────────────────────────────────────────
+    section(f"NIFTY SPOT OHLC — Full Day ({run.get('trade_date', '')})")
+    w.writerow(["Timestamp", "Open", "High", "Low", "Close"])
+    for r in payload["spot_series_full"]:
+        w.writerow([r["timestamp"], _f(r.get("open")), _f(r.get("high")), _f(r.get("low")), _f(r.get("close"))])
+
+    # ── Section: Decision Log ────────────────────────────────────────────
+    section("DECISION LOG")
+    w.writerow(["Timestamp", "Event Type", "Reason Code", "Reason Text"])
+    for ev in events:
+        w.writerow([
+            ev.get("timestamp", ""),
+            ev.get("event_type", ""),
+            ev.get("reason_code") or "",
+            ev.get("reason_text") or "",
+        ])
+
+    csv_bytes = output.getvalue().encode("utf-8-sig")  # BOM for Excel auto-detect
+    filename = f"replay_{run_row.instrument}_{run_row.trade_date.isoformat()}_{item_id[:8]}.csv"
     return StreamingResponse(
         io.BytesIO(csv_bytes),
         media_type="text/csv",
