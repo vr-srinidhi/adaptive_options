@@ -127,5 +127,10 @@ export const getWorkbenchRun = (kind, id) => api.get(`/v2/runs/${kind}/${id}`)
 export const getWorkbenchReplay = (kind, id) => api.get(`/v2/runs/${kind}/${id}/replay`)
 export const compareWorkbenchRuns = (refs) => api.get('/v2/runs/compare', { params: { refs } })
 export const getStrategyRunReplayCsv = (id) => api.get(`/v2/runs/strategy_run/${id}/replay/csv`, { responseType: 'blob' })
+export const exportStrategyRunsBundle = (runIds) => api.post(
+  '/v2/runs/strategy_run/export-bundle',
+  { run_ids: runIds },
+  { responseType: 'blob', timeout: 300000 },
+)
 
 export default api

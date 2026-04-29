@@ -832,20 +832,137 @@ async def _build_strategy_run_replay_payload(db: AsyncSession, run_row: "Strateg
     )
 
 
+def _csv_f(v) -> str:
+    return "" if v is None else str(round(float(v), 2))
+
+
+def _csv_inr(v) -> str:
+    if v is None:
+        return ""
+    f = float(v)
+    sign = "-" if f < 0 else ""
+    return f"{sign}Rs.{abs(f):,.2f}"
+
+
+def _write_run_sections_to_csv(w, payload: dict, run_row) -> None:
+    """Write all 8 sections for one strategy run to an open csv.writer instance."""
+    run    = payload["run"]
+    legs   = payload["legs"]
+    events = payload["events"]
+
+    def sec(title: str) -> None:
+        w.writerow([])
+        w.writerow([f"=== {title} ==="])
+
+    # Section 1: Trade Summary
+    sec("TRADE SUMMARY")
+    w.writerow(["Field", "Value"])
+    w.writerow(["Strategy",    run.get("strategy_id", "")])
+    w.writerow(["Date",        run.get("trade_date", "")])
+    w.writerow(["Instrument",  run.get("instrument", "")])
+    w.writerow(["Status",      run.get("status", "")])
+    w.writerow(["Exit Reason", run.get("exit_reason", "")])
+    w.writerow(["Net P&L",     _csv_inr(run.get("realized_net_pnl"))])
+    w.writerow(["Gross P&L",   _csv_inr(run.get("gross_pnl"))])
+    w.writerow(["Charges",     _csv_inr(run.get("total_charges"))])
+
+    # Section 2: Execution Summary
+    sec("EXECUTION SUMMARY")
+    w.writerow(["Field", "Value"])
+    lots     = run.get("lots") or 0
+    lot_size = run.get("lot_size") or 0
+    w.writerow(["Capital",      _csv_inr(run.get("capital"))])
+    w.writerow(["Lots",         lots])
+    w.writerow(["Lot Size",     lot_size])
+    w.writerow(["Total Qty",    lots * lot_size])
+    w.writerow(["Entry Time",   run.get("entry_time", "")])
+    w.writerow(["Exit Time",    run.get("exit_time", "")])
+    w.writerow(["Entry Credit", _csv_inr(run.get("entry_credit_total"))])
+    w.writerow(["MFE",          _csv_inr(run.get("mfe"))])
+    w.writerow(["MAE",          _csv_inr(run.get("mae"))])
+    w.writerow(["Max Drawdown", _csv_inr(run.get("max_drawdown"))])
+
+    # Section 3: Contracts Executed
+    sec("CONTRACTS EXECUTED")
+    w.writerow(["Leg", "Side", "Type", "Strike", "Expiry", "Qty", "Entry Price", "Exit Price", "Gross P&L"])
+    for leg in legs:
+        w.writerow([
+            leg.get("leg_index", ""),
+            leg.get("side", ""),
+            leg.get("option_type", ""),
+            leg.get("strike", ""),
+            leg.get("expiry_date", ""),
+            leg.get("quantity", ""),
+            _csv_f(leg.get("entry_price")),
+            _csv_f(leg.get("exit_price")),
+            _csv_f(leg.get("gross_leg_pnl")),
+        ])
+
+    # Section 4: MTM Series (trade window + shadow)
+    events_by_ts: dict = {}
+    for ev in events:
+        ts = ev["timestamp"]
+        if ts not in events_by_ts:
+            events_by_ts[ts] = {"event_type": [], "reason": []}
+        events_by_ts[ts]["event_type"].append(ev.get("event_type") or "")
+        events_by_ts[ts]["reason"].append(ev.get("reason_code") or "")
+
+    sec("MTM SERIES — Trade Window + Hypothetical Shadow (after exit)")
+    w.writerow(["Timestamp", "Net MTM", "CE MTM", "PE MTM", "Trail Stop", "Event", "Reason", "Series"])
+    for row in payload["mtm_series"]:
+        ts = row["timestamp"]
+        ev = events_by_ts.get(ts, {})
+        w.writerow([
+            ts,
+            _csv_f(row.get("net_mtm")),
+            _csv_f(row.get("ce_mtm")),
+            _csv_f(row.get("pe_mtm")),
+            _csv_f(row.get("trail_stop_level")),
+            "|".join(ev.get("event_type", [])),
+            "|".join(ev.get("reason", [])),
+            "actual",
+        ])
+    for row in payload["shadow_mtm_series"]:
+        w.writerow([row["timestamp"], _csv_f(row.get("net_mtm")), "", "", "", "", "", "shadow (hypothetical)"])
+
+    # Sections 5+: CE then PE premium candles
+    ce_legs = [l for l in legs if l["option_type"] == "CE"]
+    pe_legs = [l for l in legs if l["option_type"] == "PE"]
+
+    for leg in ce_legs:
+        sec(f"CE PREMIUM — {run_row.instrument}{leg['strike']}CE {leg.get('expiry_date', '')} (1-min candles, full day)")
+        w.writerow(["Timestamp", "Open", "High", "Low", "Close"])
+        for c in payload["leg_candles"].get(str(leg["leg_index"]), []):
+            w.writerow([c["timestamp"], _csv_f(c.get("open")), _csv_f(c.get("high")), _csv_f(c.get("low")), _csv_f(c.get("close"))])
+
+    for leg in pe_legs:
+        sec(f"PE PREMIUM — {run_row.instrument}{leg['strike']}PE {leg.get('expiry_date', '')} (1-min candles, full day)")
+        w.writerow(["Timestamp", "Open", "High", "Low", "Close"])
+        for c in payload["leg_candles"].get(str(leg["leg_index"]), []):
+            w.writerow([c["timestamp"], _csv_f(c.get("open")), _csv_f(c.get("high")), _csv_f(c.get("low")), _csv_f(c.get("close"))])
+
+    # NIFTY Spot OHLC
+    sec(f"NIFTY SPOT OHLC — Full Day ({run.get('trade_date', '')})")
+    w.writerow(["Timestamp", "Open", "High", "Low", "Close"])
+    for r in payload["spot_series_full"]:
+        w.writerow([r["timestamp"], _csv_f(r.get("open")), _csv_f(r.get("high")), _csv_f(r.get("low")), _csv_f(r.get("close"))])
+
+    # Decision Log
+    sec("DECISION LOG")
+    w.writerow(["Timestamp", "Event Type", "Reason Code", "Reason Text"])
+    for ev in events:
+        w.writerow([ev.get("timestamp", ""), ev.get("event_type", ""), ev.get("reason_code") or "", ev.get("reason_text") or ""])
+
+
 @router.get("/runs/strategy_run/{item_id}/replay/csv")
 async def get_strategy_run_replay_csv(
     item_id: str,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_active_user),
 ):
-    """
-    Multi-section replay CSV — mirrors the strategy run UI screen exactly.
-    Sections: Trade Summary · Execution Summary · Contracts · MTM Series ·
-    CE/PE Premium Candles · NIFTY Spot · Decision Log.
-    """
+    """Single-run multi-section CSV export."""
     import csv
     import io
-
     from fastapi.responses import StreamingResponse
 
     run_id = _parse_uuid(item_id)
@@ -859,140 +976,81 @@ async def get_strategy_run_replay_csv(
         raise HTTPException(status_code=404, detail="Run not found.")
 
     payload = await _build_strategy_run_replay_payload(db, run_row)
-    run    = payload["run"]
-    legs   = payload["legs"]
-    events = payload["events"]
+    output  = io.StringIO()
+    w       = csv.writer(output)
+    _write_run_sections_to_csv(w, payload, run_row)
 
-    def _f(v) -> str:
-        return "" if v is None else str(round(float(v), 2))
+    csv_bytes = output.getvalue().encode("utf-8-sig")
+    filename  = f"replay_{run_row.instrument}_{run_row.trade_date.isoformat()}_{item_id[:8]}.csv"
+    return StreamingResponse(
+        io.BytesIO(csv_bytes),
+        media_type="text/csv",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
 
-    def _inr(v) -> str:
-        if v is None:
-            return ""
-        f = float(v)
-        sign = "-" if f < 0 else ""
-        return f"{sign}Rs.{abs(f):,.2f}"
+
+class ExportBundleRequest(BaseModel):
+    run_ids: list[str] = Field(..., min_length=1, max_length=20)
+
+
+@router.post("/runs/strategy_run/export-bundle")
+async def export_strategy_runs_bundle(
+    body: ExportBundleRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_active_user),
+):
+    """
+    Multi-run CSV bundle: all selected strategy runs stacked in one file,
+    each separated by a clear run-divider. Mirrors the single-run section
+    layout exactly. Limited to 20 runs per request.
+    """
+    import csv
+    import io
+    from fastapi.responses import StreamingResponse
+
+    run_uuids = [_parse_uuid(rid) for rid in body.run_ids]
+    run_rows  = (await db.execute(
+        select(StrategyRun).where(
+            StrategyRun.id.in_(run_uuids),
+            StrategyRun.user_id == current_user.id,
+        )
+    )).scalars().all()
+
+    run_map      = {row.id: row for row in run_rows}
+    ordered_rows = [run_map[uid] for uid in run_uuids if uid in run_map]
+    if not ordered_rows:
+        raise HTTPException(status_code=404, detail="No matching runs found.")
 
     output = io.StringIO()
-    w = csv.writer(output)
+    w      = csv.writer(output)
+    total  = len(ordered_rows)
 
-    def section(title: str) -> None:
+    w.writerow([f"=== BUNDLE EXPORT: {total} RUN{'S' if total > 1 else ''} ==="])
+
+    for i, run_row in enumerate(ordered_rows, 1):
+        payload = await _build_strategy_run_replay_payload(db, run_row)
+        run     = payload["run"]
+
+        # Run-level divider — unmistakable boundary between dates
         w.writerow([])
-        w.writerow([f"=== {title} ==="])
-
-    # ── Section 1: Trade Summary ──────────────────────────────────────────
-    section("TRADE SUMMARY")
-    w.writerow(["Field", "Value"])
-    w.writerow(["Strategy",    run.get("strategy_id", "")])
-    w.writerow(["Date",        run.get("trade_date", "")])
-    w.writerow(["Instrument",  run.get("instrument", "")])
-    w.writerow(["Status",      run.get("status", "")])
-    w.writerow(["Exit Reason", run.get("exit_reason", "")])
-    w.writerow(["Net P&L",     _inr(run.get("realized_net_pnl"))])
-    w.writerow(["Gross P&L",   _inr(run.get("gross_pnl"))])
-    w.writerow(["Charges",     _inr(run.get("total_charges"))])
-
-    # ── Section 2: Execution Summary ─────────────────────────────────────
-    section("EXECUTION SUMMARY")
-    w.writerow(["Field", "Value"])
-    lots     = run.get("lots") or 0
-    lot_size = run.get("lot_size") or 0
-    w.writerow(["Capital",         _inr(run.get("capital"))])
-    w.writerow(["Lots",            lots])
-    w.writerow(["Lot Size",        lot_size])
-    w.writerow(["Total Qty",       lots * lot_size])
-    w.writerow(["Entry Time",      run.get("entry_time", "")])
-    w.writerow(["Exit Time",       run.get("exit_time", "")])
-    w.writerow(["Entry Credit",    _inr(run.get("entry_credit_total"))])
-    w.writerow(["MFE",             _inr(run.get("mfe"))])
-    w.writerow(["MAE",             _inr(run.get("mae"))])
-    w.writerow(["Max Drawdown",    _inr(run.get("max_drawdown"))])
-
-    # ── Section 3: Contracts Executed ────────────────────────────────────
-    section("CONTRACTS EXECUTED")
-    w.writerow(["Leg", "Side", "Type", "Strike", "Expiry", "Qty", "Entry Price", "Exit Price", "Gross P&L"])
-    for leg in legs:
+        w.writerow([])
+        w.writerow(["=" * 80])
         w.writerow([
-            leg.get("leg_index", ""),
-            leg.get("side", ""),
-            leg.get("option_type", ""),
-            leg.get("strike", ""),
-            leg.get("expiry_date", ""),
-            leg.get("quantity", ""),
-            _f(leg.get("entry_price")),
-            _f(leg.get("exit_price")),
-            _f(leg.get("gross_leg_pnl")),
+            f"=== RUN {i} / {total}:  "
+            f"{run.get('instrument')}  |  "
+            f"{run.get('trade_date')}  |  "
+            f"{run.get('strategy_id')}  |  "
+            f"Net P&L: {_csv_inr(run.get('realized_net_pnl'))} ==="
         ])
+        w.writerow(["=" * 80])
 
-    # ── Section 4: MTM Series (Trade Window + Shadow) ─────────────────────
-    events_by_ts: dict = {}
-    for ev in events:
-        ts = ev["timestamp"]
-        if ts not in events_by_ts:
-            events_by_ts[ts] = {"event_type": [], "reason": []}
-        events_by_ts[ts]["event_type"].append(ev.get("event_type") or "")
-        events_by_ts[ts]["reason"].append(ev.get("reason_code") or "")
+        _write_run_sections_to_csv(w, payload, run_row)
 
-    section("MTM SERIES — Trade Window + Hypothetical Shadow (after exit)")
-    w.writerow(["Timestamp", "Net MTM", "CE MTM", "PE MTM", "Trail Stop", "Event", "Reason", "Series"])
-    for row in payload["mtm_series"]:
-        ts = row["timestamp"]
-        ev = events_by_ts.get(ts, {})
-        w.writerow([
-            ts,
-            _f(row.get("net_mtm")),
-            _f(row.get("ce_mtm")),
-            _f(row.get("pe_mtm")),
-            _f(row.get("trail_stop_level")),
-            "|".join(ev.get("event_type", [])),
-            "|".join(ev.get("reason", [])),
-            "actual",
-        ])
-    for row in payload["shadow_mtm_series"]:
-        w.writerow([
-            row["timestamp"],
-            _f(row.get("net_mtm")),
-            "", "", "", "", "",
-            "shadow (hypothetical)",
-        ])
-
-    # ── Sections 5+: CE then PE premium candles ───────────────────────────
-    ce_legs = [l for l in legs if l["option_type"] == "CE"]
-    pe_legs = [l for l in legs if l["option_type"] == "PE"]
-
-    for leg in ce_legs:
-        symbol = f"{run_row.instrument}{leg['strike']}CE {leg.get('expiry_date', '')}"
-        section(f"CE PREMIUM — {symbol} (1-min candles, full day)")
-        w.writerow(["Timestamp", "Open", "High", "Low", "Close"])
-        for c in payload["leg_candles"].get(str(leg["leg_index"]), []):
-            w.writerow([c["timestamp"], _f(c.get("open")), _f(c.get("high")), _f(c.get("low")), _f(c.get("close"))])
-
-    for leg in pe_legs:
-        symbol = f"{run_row.instrument}{leg['strike']}PE {leg.get('expiry_date', '')}"
-        section(f"PE PREMIUM — {symbol} (1-min candles, full day)")
-        w.writerow(["Timestamp", "Open", "High", "Low", "Close"])
-        for c in payload["leg_candles"].get(str(leg["leg_index"]), []):
-            w.writerow([c["timestamp"], _f(c.get("open")), _f(c.get("high")), _f(c.get("low")), _f(c.get("close"))])
-
-    # ── Section: NIFTY Spot OHLC ─────────────────────────────────────────
-    section(f"NIFTY SPOT OHLC — Full Day ({run.get('trade_date', '')})")
-    w.writerow(["Timestamp", "Open", "High", "Low", "Close"])
-    for r in payload["spot_series_full"]:
-        w.writerow([r["timestamp"], _f(r.get("open")), _f(r.get("high")), _f(r.get("low")), _f(r.get("close"))])
-
-    # ── Section: Decision Log ────────────────────────────────────────────
-    section("DECISION LOG")
-    w.writerow(["Timestamp", "Event Type", "Reason Code", "Reason Text"])
-    for ev in events:
-        w.writerow([
-            ev.get("timestamp", ""),
-            ev.get("event_type", ""),
-            ev.get("reason_code") or "",
-            ev.get("reason_text") or "",
-        ])
-
-    csv_bytes = output.getvalue().encode("utf-8-sig")  # BOM for Excel auto-detect
-    filename = f"replay_{run_row.instrument}_{run_row.trade_date.isoformat()}_{item_id[:8]}.csv"
+    csv_bytes  = output.getvalue().encode("utf-8-sig")
+    dates      = sorted(r.trade_date.isoformat() for r in ordered_rows)
+    date_range = dates[0] if len(dates) == 1 else f"{dates[0]}_to_{dates[-1]}"
+    instrument = ordered_rows[0].instrument
+    filename   = f"bundle_{instrument}_{date_range}_{total}runs.csv"
     return StreamingResponse(
         io.BytesIO(csv_bytes),
         media_type="text/csv",

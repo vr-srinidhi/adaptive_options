@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useNavigate, useSearchParams } from 'react-router-dom'
-import { compareWorkbenchRuns, getWorkbenchRuns } from '../api'
+import { compareWorkbenchRuns, exportStrategyRunsBundle, getWorkbenchRuns } from '../api'
 import { fmtDateTime, fmtINR, fmtShortDate, runKindLabel, runStatusTone } from '../utils/workbench'
 
 const PALETTE = {
@@ -18,9 +18,12 @@ const PALETTE = {
 
 const KIND_FILTERS = [
   { value: 'all', label: 'All Runs' },
+  { value: 'strategy_run', label: 'Strategy Runs' },
   { value: 'paper_session', label: 'Paper Replay' },
   { value: 'historical_batch', label: 'Historical Batch' },
 ]
+
+const BUNDLE_LIMIT = 20
 
 const PAGE_SIZE = 20
 
@@ -114,6 +117,7 @@ export default function RunsLibrary() {
   const [loading, setLoading] = useState(true)
   const [loadingMore, setLoadingMore] = useState(false)
   const [comparing, setComparing] = useState(false)
+  const [exporting, setExporting] = useState(false)
   const [error, setError] = useState(null)
   const sentinelRef = useRef(null)
 
@@ -213,6 +217,35 @@ export default function RunsLibrary() {
     })
   }
 
+  // IDs of selected strategy_run rows — these are the ones eligible for bundle CSV export
+  const exportableIds = useMemo(
+    () => selectedRefs.filter(r => r.startsWith('strategy_run:')).map(r => r.split(':')[1]),
+    [selectedRefs],
+  )
+
+  const handleBundleExport = async () => {
+    if (exportableIds.length === 0 || exporting) return
+    setExporting(true)
+    setError(null)
+    try {
+      const res = await exportStrategyRunsBundle(exportableIds)
+      const blob = new Blob([res.data], { type: 'text/csv' })
+      const url  = URL.createObjectURL(blob)
+      const a    = document.createElement('a')
+      a.href     = url
+      const dates = exportableIds.length === 1 ? exportableIds[0].slice(0, 8) : `${exportableIds.length}runs`
+      a.download = `bundle_${dates}.csv`
+      document.body.appendChild(a)
+      a.click()
+      document.body.removeChild(a)
+      URL.revokeObjectURL(url)
+    } catch (err) {
+      setError(err.response?.data?.detail || 'Bundle export failed.')
+    } finally {
+      setExporting(false)
+    }
+  }
+
   const compareSummary = useMemo(() => {
     if (compareItems.length < 2) return null
     const positive = compareItems.filter(item => Number(item.pnl || 0) >= 0).length
@@ -269,6 +302,30 @@ export default function RunsLibrary() {
                 fontSize: 10,
               }}
             />
+            {exportableIds.length > 0 && (
+              <button
+                type="button"
+                onClick={handleBundleExport}
+                disabled={exporting || exportableIds.length > BUNDLE_LIMIT}
+                className="rounded-md px-3 py-1.5"
+                style={{
+                  background: exportableIds.length > BUNDLE_LIMIT ? 'rgba(245,158,11,0.1)' : 'rgba(34,197,94,0.12)',
+                  border: `1px solid ${exportableIds.length > BUNDLE_LIMIT ? 'rgba(245,158,11,0.4)' : 'rgba(34,197,94,0.4)'}`,
+                  color: exportableIds.length > BUNDLE_LIMIT ? PALETTE.amber : PALETTE.green,
+                  fontSize: 9,
+                  fontWeight: 700,
+                  cursor: exportableIds.length > BUNDLE_LIMIT || exporting ? 'not-allowed' : 'pointer',
+                  opacity: exporting ? 0.6 : 1,
+                }}
+                title={exportableIds.length > BUNDLE_LIMIT ? `Max ${BUNDLE_LIMIT} runs per export` : `Export ${exportableIds.length} run${exportableIds.length > 1 ? 's' : ''} as CSV`}
+              >
+                {exporting
+                  ? 'Exporting…'
+                  : exportableIds.length > BUNDLE_LIMIT
+                    ? `Max ${BUNDLE_LIMIT} (${exportableIds.length} selected)`
+                    : `↓ Export ${exportableIds.length} run${exportableIds.length > 1 ? 's' : ''} CSV`}
+              </button>
+            )}
           </div>
         </div>
 
