@@ -163,9 +163,10 @@ export default function RunsLibrary() {
     })
   }
 
-  const exportableIds = [...selectedIds]
-  const exportCount   = exportableIds.length
-  const willBeZip     = exportCount > 20
+  const exportableIds       = [...selectedIds]
+  const exportCount         = exportableIds.length
+  const willBeZip           = exportCount > 20
+  const visibleSelectedCount = visibleStrategyRunIds.filter(id => selectedIds.has(id)).length
 
   const handleBundleExport = async () => {
     if (exportCount === 0 || exporting) return
@@ -201,9 +202,22 @@ export default function RunsLibrary() {
             <div style={{ fontSize: 15, fontWeight: 700, color: PALETTE.text, marginBottom: 3 }}>
               Runs Library
             </div>
-            <div style={{ fontSize: 10, color: PALETTE.muted }}>
-              {runs.length} loaded{hasMore ? ' · scroll for more' : ' · all loaded'}
-              {exportCount > 0 ? ` · ${exportCount} selected` : ''}
+            <div style={{ fontSize: 10, color: PALETTE.muted }} className="flex items-center gap-2">
+              <span>
+                {runs.length} loaded{hasMore ? ' · scroll for more' : ' · all loaded'}
+                {exportCount > 0
+                  ? ` · ${exportCount} selected${visibleSelectedCount < exportCount ? ` (${visibleSelectedCount} visible)` : ''}`
+                  : ''}
+              </span>
+              {exportCount > 0 && (
+                <button
+                  type="button"
+                  onClick={() => setSelectedIds(new Set())}
+                  style={{ color: PALETTE.muted, background: 'transparent', cursor: 'pointer', fontSize: 9, textDecoration: 'underline' }}
+                >
+                  Clear
+                </button>
+              )}
             </div>
           </div>
 

@@ -339,6 +339,23 @@ def test_mtm_series_includes_ce_pe_mtm_keys():
     assert "pe_mtm" in row
 
 
+# ── vix_series_full regression — must survive CSV section write ──────────────
+
+def test_vix_series_full_present_in_payload():
+    """vix_series_full must be present so the CSV India VIX section can be written."""
+    spot_candles = [_spot_candle("2026-04-07T09:15:00", 23000)]
+    vix_candles  = [_vix_candle("2026-04-07T09:15:00", 15.5)]
+    payload = strategy_run_replay_payload(
+        _run(), [], [], [], [],
+        spot_candles_full=spot_candles,
+        vix_candles_full=vix_candles,
+    )
+    assert "vix_series_full" in payload
+    row = payload["vix_series_full"][0]
+    assert row["vix_close"] == 15.5
+    assert row["vix_source"] == "actual"
+
+
 # ── Library item ──────────────────────────────────────────────────────────────
 
 def test_strategy_run_library_item_shape():

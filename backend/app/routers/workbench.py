@@ -947,6 +947,12 @@ def _write_run_sections_to_csv(w, payload: dict, run_row) -> None:
     for r in payload["spot_series_full"]:
         w.writerow([r["timestamp"], _csv_f(r.get("open")), _csv_f(r.get("high")), _csv_f(r.get("low")), _csv_f(r.get("close"))])
 
+    # India VIX
+    sec(f"INDIA VIX — Full Day ({run.get('trade_date', '')})")
+    w.writerow(["Timestamp", "VIX Close", "Source"])
+    for r in payload["vix_series_full"]:
+        w.writerow([r["timestamp"], _csv_f(r.get("vix_close")), r.get("vix_source", "")])
+
     # Decision Log
     sec("DECISION LOG")
     w.writerow(["Timestamp", "Event Type", "Reason Code", "Reason Text"])
@@ -1026,6 +1032,12 @@ async def export_strategy_runs_bundle(
     ordered_rows = [run_map[uid] for uid in run_uuids if uid in run_map]
     if not ordered_rows:
         raise HTTPException(status_code=404, detail="No matching runs found.")
+    if len(ordered_rows) != len(run_uuids):
+        missing = len(run_uuids) - len(ordered_rows)
+        raise HTTPException(
+            status_code=404,
+            detail=f"{missing} run(s) not found or not accessible. Verify all IDs belong to your account.",
+        )
 
     total = len(ordered_rows)
 
@@ -1073,7 +1085,7 @@ async def export_strategy_runs_bundle(
                 payload    = await _build_strategy_run_replay_payload(db, run_row)
                 csv_output = io.StringIO()
                 _write_run_sections_to_csv(csv.writer(csv_output), payload, run_row)
-                entry_name = f"{run_row.strategy_id}_{run_row.trade_date.isoformat()}_replay.csv"
+                entry_name = f"{run_row.strategy_id}_{run_row.trade_date.isoformat()}_{str(run_row.id)[:8]}_replay.csv"
                 zf.writestr(entry_name, csv_output.getvalue().encode("utf-8-sig"))
 
         zip_buffer.seek(0)
