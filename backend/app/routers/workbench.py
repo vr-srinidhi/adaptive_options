@@ -34,6 +34,10 @@ from app.models.user import User
 from app.services import zerodha_client
 from app.services.audit import log_event
 from app.services.generic_executor import execute_run, validate_run
+from app.services.straddle_adjustment_executor import (
+    execute_run as sa_execute_run,
+    validate_run as sa_validate_run,
+)
 from app.services.paper_engine import run_paper_engine
 from app.services.strategy_config import (
     WORKBENCH_STRATEGY_ID,
@@ -486,12 +490,18 @@ async def create_run(
         }
 
     if body.run_type == "single_session_backtest":
-        validation = await validate_run(db, strategy, config)
+        executor_type = strategy.get("executor", "generic_v1")
+        if executor_type == "straddle_adjustment_v1":
+            _validate_fn, _execute_fn = sa_validate_run, sa_execute_run
+        else:
+            _validate_fn, _execute_fn = validate_run, execute_run
+
+        validation = await _validate_fn(db, strategy, config)
         if validation.error:
             raise HTTPException(status_code=422, detail=validation.error)
 
         run_id = uuid.uuid4()
-        result = await execute_run(db, run_id, strategy, config, validation, current_user.id)
+        result = await _execute_fn(db, run_id, strategy, config, validation, current_user.id)
 
         if result.status == "ERROR":
             raise HTTPException(status_code=500, detail=result.exit_reason or "Execution failed.")
@@ -578,7 +588,8 @@ async def validate_run_endpoint(
     if body.strategy_id not in supported_strategy_ids():
         raise HTTPException(status_code=422, detail="Strategy is catalogued but not executable yet.")
 
-    validation = await validate_run(db, strategy, body.config or {})
+    _vfn = sa_validate_run if strategy.get("executor") == "straddle_adjustment_v1" else validate_run
+    validation = await _vfn(db, strategy, body.config or {})
     if validation.error:
         raise HTTPException(status_code=422, detail=validation.error)
 

@@ -320,6 +320,101 @@ _STRATEGIES = [
         ],
     },
     {
+        "id": "short_straddle_profit_lock",
+        "name": "Short Straddle — Profit Lock",
+        "bias": "neutral",
+        "status": "available",
+        "executor": "straddle_adjustment_v1",
+        "entry_rule_id": "timed_entry",
+        "leg_template": [
+            {"side": "SELL", "option_type": "CE", "strike_offset_steps": 0},
+            {"side": "SELL", "option_type": "PE", "strike_offset_steps": 0},
+        ],
+        "exit_rule": {
+            "stop_capital_pct": 0.015,
+            "time_exit":        "15:25",
+            "data_gap_exit":    True,
+            "trail_trigger":    12000,
+            "trail_pct":        0.50,
+            "lock_trigger":     20000,
+            "wing_width_steps": 2,
+        },
+        "sizing": {
+            "model": "credit_selling",
+        },
+        "modes": ["single_session_backtest"],
+        "family": "neutral",
+        "playbook": (
+            "Enter as Short Straddle. Once net MTM crosses the lock trigger, "
+            "buy OTM wings mid-session to convert to Iron Condor and cap downside."
+        ),
+        "description": (
+            "Sell ATM CE + PE at entry time. If the trade reaches the profit lock threshold "
+            "intraday, buy OTM wings to protect the gain. Trailing stop manages the exit."
+        ),
+        "chips": ["Neutral", "Short vol", "Adaptive hedge", "Intraday"],
+        "params_schema": [
+            {"key": "trade_date",    "label": "Trade Date",         "type": "date",    "required": True},
+            {"key": "entry_time",    "label": "Entry Time",         "type": "time",    "required": True, "default": "09:50"},
+            {"key": "capital",       "label": "Capital",            "type": "number",  "required": True, "min": 100000, "max": 50000000},
+            {"key": "lock_trigger",  "label": "Lock Trigger ₹",    "type": "number",  "required": False, "default": 20000, "min": 5000},
+            {"key": "wing_width_steps", "label": "Wing Steps",      "type": "number",  "required": False, "default": 2, "min": 1, "max": 5},
+            {"key": "trail_trigger", "label": "Trail Trigger ₹",   "type": "number",  "required": False, "default": 12000, "min": 0},
+            {"key": "trail_pct",     "label": "Trail % of Peak",    "type": "number",  "required": False, "default": 0.50, "min": 0.1, "max": 0.99},
+            {"key": "stop_capital_pct", "label": "Stop % Capital",  "type": "number",  "required": False, "default": 0.015, "min": 0.001, "max": 1},
+            {"key": "vix_guardrail_enabled", "label": "VIX Guardrail", "type": "boolean", "required": False, "default": False},
+            {"key": "vix_min", "label": "VIX Min", "type": "number", "required": False, "default": 14, "depends_on": "vix_guardrail_enabled"},
+            {"key": "vix_max", "label": "VIX Max", "type": "number", "required": False, "default": 30, "depends_on": "vix_guardrail_enabled"},
+        ],
+        "defaults": {
+            "single_session_backtest": {
+                "instrument":    "NIFTY",
+                "trade_date":    None,
+                "entry_time":    "09:50",
+                "capital":       2500000,
+                "lock_trigger":  20000,
+                "wing_width_steps": 2,
+                "trail_trigger": 12000,
+                "trail_pct":     0.50,
+                "stop_capital_pct": 0.015,
+                "vix_guardrail_enabled": False,
+            },
+        },
+        "visual_hints": {
+            "badge": "Profit Lock",
+            "assumption": "Fills use candle close price. Wing purchase at lock minute close. Results may slightly overestimate entry/exit quality.",
+            "summary_title": "Short Straddle — Profit Lock",
+            "summary_copy": (
+                "Sell ATM CE + PE. When net MTM crosses the lock trigger, buy OTM wings "
+                "mid-session to cap further loss. Trailing stop manages profit exit."
+            ),
+            "shape": "tent",
+            "expiry_label": "Weekly (auto)",
+            "exit_rule": "Lock ₹20k → buy wings / Trail 50% of peak / Stop 1.5% / Time 15:25",
+            "constraint_fields": [
+                {"label": "Lock trigger", "value": "₹20,000", "hint": "buy wings when MTM crosses"},
+                {"label": "Wing steps",   "value": "2",        "hint": "ATM ± steps"},
+                {"label": "Trail trigger","value": "₹12,000",  "hint": "activate trailing stop"},
+                {"label": "Trail %",      "value": "50%",      "hint": "lock in % of peak MTM"},
+                {"label": "Stop",         "value": "1.5%",     "hint": "of capital"},
+                {"label": "Time exit",    "value": "15:25",    "hint": ""},
+            ],
+            "legs": [
+                {"side": "SELL", "option_type": "CE", "strike": "ATM",       "expiry": "Weekly", "premium": "auto"},
+                {"side": "SELL", "option_type": "PE", "strike": "ATM",       "expiry": "Weekly", "premium": "auto"},
+                {"side": "BUY",  "option_type": "CE", "strike": "ATM+steps", "expiry": "Weekly", "premium": "auto (on lock)"},
+                {"side": "BUY",  "option_type": "PE", "strike": "ATM-steps", "expiry": "Weekly", "premium": "auto (on lock)"},
+            ],
+            "payoff_hint": "Starts as a tent (unlimited risk); converts to an Iron Condor once the lock fires.",
+            "metrics": {"max_profit_ratio": 0.008, "max_risk_ratio": None, "margin_ratio": 0.07, "max_loss_text": "Capped post-lock"},
+        },
+        "notes": [
+            "Uses straddle_adjustment_v1 executor which supports mid-session leg addition.",
+            "Wings are bought at market price at the lock trigger minute.",
+            "If wing prices are unavailable at lock time, the position stays as a plain straddle.",
+        ],
+    },
+    {
         "id": "short_strangle",
         "name": "Short Strangle",
         "bias": "neutral",
