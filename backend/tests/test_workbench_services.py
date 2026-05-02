@@ -32,6 +32,7 @@ def test_iron_butterfly_catalog_is_executable_four_leg_strategy():
     assert strategy["modes"] == ["single_session_backtest"]
     assert len(strategy["leg_template"]) == 4
     assert strategy["sizing"]["model"] == "defined_risk_credit"
+    assert strategy["sizing"]["margin_floor_per_lot"] == 100000
 
 
 def test_get_strategy_returns_copy_not_shared_reference():

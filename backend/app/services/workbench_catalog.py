@@ -389,6 +389,7 @@ _STRATEGIES = [
         "sizing": {
             "model": "defined_risk_credit",
             "wing_width_steps_key": "wing_width_steps",
+            "margin_floor_per_lot": 100000,
         },
         "modes": ["single_session_backtest"],
         "family": "neutral",

@@ -184,6 +184,7 @@ _IRON_BUTTERFLY = {
     "sizing": {
         "model": "defined_risk_credit",
         "wing_width_steps_key": "wing_width_steps",
+        "margin_floor_per_lot": 100000,
     },
 }
 
@@ -305,8 +306,33 @@ def test_validate_run_resolves_iron_butterfly_wings_and_defined_risk_margin():
         ("BUY", "CE", 22_500),
         ("BUY", "PE", 22_300),
     ]
-    assert result.estimated_margin < 500_000
-    assert result.approved_lots == 66
+    assert result.estimated_margin == 500_000
+    assert result.approved_lots == 5
+
+
+def test_validate_run_iron_butterfly_margin_floor_prevents_tiny_risk_oversizing():
+    entry_dt = datetime.combine(_TRADE_DATE, time(9, 50))
+    priced_rows = [
+        SimpleNamespace(option_type="CE", timestamp=entry_dt, expiry_date=_EXPIRY, close=241.0),
+        SimpleNamespace(option_type="PE", timestamp=entry_dt, expiry_date=_EXPIRY, close=213.0),
+        SimpleNamespace(option_type="CE", timestamp=entry_dt, expiry_date=_EXPIRY, close=189.0),
+        SimpleNamespace(option_type="PE", timestamp=entry_dt, expiry_date=_EXPIRY, close=173.0),
+    ]
+    db = FakeDB(
+        td_row=_make_trading_day(),
+        spec_row=_make_spec_row(),
+        spot_row=_make_spot_row(close=23_750.0),
+        option_rows=priced_rows,
+        leg_price_rows=priced_rows,
+    )
+    result = _run(validate_run(
+        db,
+        _IRON_BUTTERFLY,
+        {**_BASE_CONFIG, "wing_width_steps": 2, "capital": 2_500_000},
+    ))
+    assert result.validated
+    assert result.approved_lots == 25
+    assert result.estimated_margin == 2_500_000
 
 
 # ── execute_run tests (patch service-layer dependencies) ─────────────────────

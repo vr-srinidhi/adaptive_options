@@ -150,7 +150,16 @@ def _defined_risk_margin_per_lot(
         return None
 
     max_loss_per_unit = max(float(wing_width_points) - net_credit, float(wing_width_points) * 0.05)
-    return max_loss_per_unit * lot_size
+    theoretical_margin = max_loss_per_unit * lot_size
+
+    margin_floor = sizing.get("margin_floor_per_lot")
+    if margin_floor is not None:
+        try:
+            theoretical_margin = max(theoretical_margin, float(margin_floor))
+        except (TypeError, ValueError):
+            pass
+
+    return theoretical_margin
 
 
 @dataclass
