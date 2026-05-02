@@ -21,6 +21,7 @@ import ReplayDesk from './pages/ReplayDesk'
 import ReplayAnalyzer from './pages/ReplayAnalyzer'
 import RunsLibrary from './pages/RunsLibrary'
 import WorkbenchHistoryDetail from './pages/WorkbenchHistoryDetail'
+import StrategyReport from './pages/StrategyReport'
 
 export default function App() {
   return (
@@ -46,6 +47,7 @@ export default function App() {
                     <Route path="/workbench/replay/:kind/:id" element={<ReplayAnalyzer />} />
                     <Route path="/workbench/history" element={<RunsLibrary />} />
                     <Route path="/workbench/history/:kind/:id" element={<WorkbenchHistoryDetail />} />
+                    <Route path="/workbench/report/:strategyId" element={<StrategyReport />} />
                     {/* Zerodha connect */}
                     <Route path="/zerodha-connect" element={<ZerodhaConnect />} />
                     {/* Backtest module */}

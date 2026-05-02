@@ -175,6 +175,95 @@ async def get_workspace_summary(
     return await _build_workspace_summary(current_user, db)
 
 
+@router.get("/workspace/strategy-dashboard")
+async def get_strategy_dashboard(
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_active_user),
+):
+    from app.services.workbench_catalog import get_strategy as _cat_get
+
+    rows = (await db.execute(
+        select(StrategyRun)
+        .where(
+            StrategyRun.user_id == current_user.id,
+            StrategyRun.status == "completed",
+        )
+        .order_by(StrategyRun.trade_date)
+    )).scalars().all()
+
+    # Group by strategy_id
+    by_strategy: dict[str, list] = defaultdict(list)
+    for r in rows:
+        by_strategy[r.strategy_id].append(r)
+
+    results = []
+    for sid, sruns in by_strategy.items():
+        cat = _cat_get(sid)
+        name = cat["name"] if cat else sid
+
+        daily = []
+        cum = 0.0
+        wins = losses = 0
+        win_total = loss_total = 0.0
+        best = worst = None
+
+        monthly: dict[str, dict] = {}
+
+        for r in sruns:
+            pnl = float(r.realized_net_pnl or 0)
+            cum += pnl
+            daily.append({
+                "date": r.trade_date.isoformat(),
+                "pnl": round(pnl, 2),
+                "cumulative_pnl": round(cum, 2),
+                "exit_reason": r.exit_reason or "TIME_EXIT",
+            })
+            if pnl > 0:
+                wins += 1
+                win_total += pnl
+            else:
+                losses += 1
+                loss_total += pnl
+            if best is None or pnl > best["pnl"]:
+                best = {"date": r.trade_date.isoformat(), "pnl": round(pnl, 2)}
+            if worst is None or pnl < worst["pnl"]:
+                worst = {"date": r.trade_date.isoformat(), "pnl": round(pnl, 2)}
+
+            mkey = r.trade_date.strftime("%Y-%m")
+            if mkey not in monthly:
+                monthly[mkey] = {"month": mkey, "pnl": 0.0, "wins": 0, "losses": 0, "runs": 0}
+            monthly[mkey]["pnl"] = round(monthly[mkey]["pnl"] + pnl, 2)
+            monthly[mkey]["runs"] += 1
+            if pnl > 0:
+                monthly[mkey]["wins"] += 1
+            else:
+                monthly[mkey]["losses"] += 1
+
+        total = wins + losses
+        results.append({
+            "strategy_id": sid,
+            "strategy_name": name,
+            "total_runs": total,
+            "wins": wins,
+            "losses": losses,
+            "net_pnl": round(cum, 2),
+            "win_rate": round(wins / total * 100, 1) if total else 0,
+            "avg_win": round(win_total / wins, 2) if wins else 0,
+            "avg_loss": round(loss_total / losses, 2) if losses else 0,
+            "best_day": best,
+            "worst_day": worst,
+            "date_range": {
+                "from": sruns[0].trade_date.isoformat(),
+                "to": sruns[-1].trade_date.isoformat(),
+            },
+            "monthly_pnl": sorted(monthly.values(), key=lambda x: x["month"]),
+            "daily_pnl": daily,
+        })
+
+    results.sort(key=lambda x: x["total_runs"], reverse=True)
+    return {"strategies": results}
+
+
 @router.get("/strategies")
 async def get_strategies():
     # Catalog metadata is intentionally public so the workbench shell can render
