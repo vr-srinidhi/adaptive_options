@@ -255,7 +255,24 @@ The minimum is always 1 lot. Never remove this floor.
 
 ### Generic Strategy Engine (generic_v1)
 
-**Adding a new strategy requires only a catalog entry** — no new Python files:
+**Adding a new strategy requires only a catalog entry** — no new Python files.
+
+### Acceptance Criteria for Every New generic_v1 Strategy
+
+Before marking a strategy as `"status": "available"`, every AC below must be met:
+
+1. **Catalog entry**: `id`, `name`, `bias`, `status`, `executor`, `entry_rule_id`, `leg_template`, `exit_rule`, `sizing`, `modes`, `params_schema`, `defaults`, `visual_hints`, `chips`, `description`, `playbook`, `notes` all populated.
+2. **Auto-fill defaults**: `defaults.<run_type>` block must pre-fill every editable field (instrument, trade_date, entry_time, capital, all strategy-specific params like wing_width_steps, target_pct, stop_capital_pct, vix_min, vix_max). For `single_session_backtest`, `trade_date` must be dynamically injected via `_materialize_strategy()` with `latest_weekday()`.
+3. **Correct payoff shape**: `visual_hints.shape` must match the strategy's actual payoff profile — use `butterfly` for IB-style 4-leg defined-risk, `tent` for Short Straddle-style unlimited, `spread` for directional spreads.
+4. **Params schema**: every `params_schema` field must have `key`, `label`, `type`, and `required`. Use `depends_on` for VIX sub-fields. Scope to run type via `modes` when the field only applies to one mode.
+5. **constraint_fields**: `visual_hints.constraint_fields` must show accurate hardcoded reference values (not live config) for target, stop, wing widths, VIX bounds, time exit.
+6. **Mixed-side MTM formula** (if BUY legs present): SELL → `entry − current`; BUY → `current − entry`. Verify sign is correct in `generic_executor.py` for the new leg combination.
+7. **Exit charges flipping**: closing a BUY leg = SELL order, closing a SELL leg = BUY order. Confirm `charges_service.py` receives the correct side for each leg at exit.
+8. **Margin sizing model**: specify `sizing.model`. Use `defined_risk_credit` for strategies with known max loss (e.g., IB, IC); omit or use `credit_selling` for unlimited-loss strategies.
+9. **Unit tests**: add focused tests for catalog entry shape, leg MTM signs, sizing, exit charges, and CSV export sections. Minimum 6 tests per strategy.
+10. **Replay screen**: verify CE/PE MTM series split correctly in `strategy_replay_serializer.py` — it groups by `option_type`, so SELL + BUY legs of the same option type automatically combine.
+
+
 
 ```python
 {

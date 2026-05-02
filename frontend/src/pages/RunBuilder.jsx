@@ -26,6 +26,7 @@ const PAYOFF_SHAPES = {
   adaptive: '4,88 30,88 44,40 58,40 72,88 96,88',
   spread: '4,88 30,88 48,56 66,24 88,24 96,24',
   tent: '4,88 30,88 46,28 62,28 78,88 96,88',
+  butterfly: '4,88 26,88 50,18 74,88 96,88',
   call: '4,88 42,88 58,66 74,24 96,24',
   put: '4,24 28,24 44,70 60,88 96,88',
 }
@@ -586,14 +587,20 @@ function buildPrimaryLayout(runType, fieldMap, preview) {
   }
 
   if (runType === 'single_session_backtest') {
-    return [
+    const base = [
       { key: 'instrument', label: 'Instrument', field: fieldMap.instrument },
       { key: 'trade_date', label: 'Trade Date', field: fieldMap.trade_date },
       { key: 'entry_time', label: 'Entry Time', field: fieldMap.entry_time },
       { key: 'capital', label: 'Capital (₹)', field: fieldMap.capital },
+    ]
+    if (fieldMap.wing_width_steps) base.push({ key: 'wing_width_steps', label: fieldMap.wing_width_steps.label, field: fieldMap.wing_width_steps })
+    if (fieldMap.target_pct) base.push({ key: 'target_pct', label: fieldMap.target_pct.label, field: fieldMap.target_pct })
+    if (fieldMap.stop_capital_pct) base.push({ key: 'stop_capital_pct', label: fieldMap.stop_capital_pct.label, field: fieldMap.stop_capital_pct })
+    base.push(
       { key: 'expiry', label: 'Expiry', displayValue: preview.visual.expiryLabel },
       { key: 'exit_rule', label: 'Exit Rule', displayValue: preview.visual.exitRule },
-    ]
+    )
+    return base
   }
 
   return [
@@ -968,7 +975,7 @@ export default function RunBuilder() {
             {error ? <div className="wb-alert-error">{error}</div> : null}
             {!canSubmit ? (
               <div className="wb-alert-warning">
-                This strategy is catalogued in the workbench, but the backend executor is not live yet. The shell is accurate, submission stays disabled.
+                This strategy is in preview — the executor is scheduled for a future release. The shell is accurate; submission is disabled until it launches.
               </div>
             ) : null}
 

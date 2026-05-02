@@ -429,7 +429,7 @@ _STRATEGIES = [
             "assumption": "Fills use candle close price for all four legs. Bid/ask and live margin are not available in the current warehouse replay.",
             "summary_title": "Iron Butterfly",
             "summary_copy": "Sell ATM CE + PE and buy symmetric wings. Profit when spot stays near the center strike, with capped loss beyond either wing.",
-            "shape": "tent",
+            "shape": "butterfly",
             "expiry_label": "Weekly (auto)",
             "exit_rule": "Stop / Target / Time / Data gap",
             "constraint_fields": [
