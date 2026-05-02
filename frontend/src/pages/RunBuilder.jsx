@@ -202,7 +202,7 @@ function orderFields(fields, runType) {
   const order = runType === 'paper_replay'
     ? ['instrument', 'date', 'capital', 'request_token']
     : runType === 'single_session_backtest'
-      ? ['instrument', 'trade_date', 'entry_time', 'capital', 'wing_width_steps', 'target_pct', 'stop_capital_pct', 'vix_guardrail_enabled', 'vix_min', 'vix_max']
+      ? ['instrument', 'trade_date', 'entry_time', 'capital', 'wing_width_steps', 'target_amount', 'stop_loss_amount', 'target_pct', 'stop_capital_pct', 'vix_guardrail_enabled', 'vix_min', 'vix_max']
       : ['instrument', 'start_date', 'end_date', 'name', 'capital', 'execution_order', 'autorun']
 
   return [...fields].sort((a, b) => {
@@ -642,8 +642,15 @@ export default function RunBuilder() {
     ])
       .then(([strategyRes, tradingDaysRes]) => {
         const list = strategyRes.data.strategies || []
+        const days = tradingDaysRes.data || []
         setStrategies(list)
-        setReadyDays(tradingDaysRes.data || [])
+        setReadyDays(days)
+
+        // Use latest warehouse-ready date so the form never auto-fills a date
+        // that has no candle data (latest_weekday() from the server may be today).
+        const latestReady = days.length
+          ? [...days].sort((a, b) => b.trade_date.localeCompare(a.trade_date))[0].trade_date
+          : null
 
         const requested = searchParams.get('strategy')
         const selected = list.find(item => item.id === requested) || list.find(item => item.id === 'orb_intraday_spread') || list[0]
@@ -651,7 +658,9 @@ export default function RunBuilder() {
           const nextRunType = defaultRunTypeFor(selected)
           setStrategyId(selected.id)
           setRunType(nextRunType)
-          setConfig(normalizeConfig(selected, nextRunType))
+          const cfg = normalizeConfig(selected, nextRunType)
+          if (latestReady && 'trade_date' in cfg) cfg.trade_date = latestReady
+          setConfig(cfg)
         }
       })
       .catch(err => setError(err.response?.data?.detail || err.message))
@@ -690,7 +699,7 @@ export default function RunBuilder() {
       }
     }, 600)
     return () => clearTimeout(validateTimer.current)
-  }, [runType, strategyId, config.trade_date, config.entry_time, config.capital, config.instrument, config.wing_width_steps, config.target_pct, config.stop_capital_pct, config.vix_guardrail_enabled, config.vix_min, config.vix_max])
+  }, [runType, strategyId, config.trade_date, config.entry_time, config.capital, config.instrument, config.wing_width_steps, config.target_amount, config.stop_loss_amount, config.target_pct, config.stop_capital_pct, config.vix_guardrail_enabled, config.vix_min, config.vix_max])
 
   const scopedFields = useMemo(() => {
     const schema = (strategy?.params_schema || []).filter(field => !field.modes || field.modes.includes(runType))

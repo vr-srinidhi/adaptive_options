@@ -417,7 +417,9 @@ async def execute_run(
 
     exit_rule = strategy.get("exit_rule", {})
     target_pct        = float(config.get("target_pct") or exit_rule.get("target_pct", 0.30))
+    target_amount     = float(config.get("target_amount") or exit_rule.get("target_amount") or 0)
     stop_multiple     = float(exit_rule.get("stop_multiple", 1.5))
+    stop_loss_amount  = float(config.get("stop_loss_amount") or exit_rule.get("stop_loss_amount") or 0)
     stop_capital_pct  = float(config.get("stop_capital_pct") or exit_rule.get("stop_capital_pct") or 0)
     sq_time           = _parse_time(
         config.get("exit_rule", {}).get("time_exit") or exit_rule.get("time_exit", "15:25"),
@@ -566,8 +568,10 @@ async def execute_run(
         net_mtm = gross_mtm_total - entry_charges - est_exit_charges
 
         # Exit conditions
-        target_threshold = entry_credit_total * target_pct
-        if stop_capital_pct > 0 and capital_amount > 0:
+        target_threshold = target_amount if target_amount > 0 else entry_credit_total * target_pct
+        if stop_loss_amount > 0:
+            stop_threshold = -stop_loss_amount
+        elif stop_capital_pct > 0 and capital_amount > 0:
             stop_threshold = -(capital_amount * stop_capital_pct)
         else:
             stop_threshold = -(entry_credit_total * stop_multiple)
