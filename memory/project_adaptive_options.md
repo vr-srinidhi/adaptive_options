@@ -9,7 +9,7 @@ Frontend: React 18 + Vite at localhost:3000. Backend: FastAPI at localhost:8000.
 
 **Why:** Educational backtesting and paper trading for Nifty/BankNifty strategies. No live order placement.
 
-**How to apply:** When suggesting changes or additions, check whether the work fits inside an existing executor (generic_v1 just needs a catalog entry) before proposing new files.
+**How to apply:** When suggesting changes or additions, check whether the work fits inside an existing executor (generic_v1 just needs a catalog entry) before proposing new files. For strategies with configurable wing widths, use `strike_offset_steps_from_config` + `strike_offset_sign` in leg_template — the executor resolves the offset from `config[key] × sign` at runtime.
 
 ---
 
@@ -17,7 +17,7 @@ Frontend: React 18 + Vite at localhost:3000. Backend: FastAPI at localhost:8000.
 
 1. **V2 Workbench** — primary UI (Strategy Catalog → Run Builder → Replay Analyzer → Runs Library). Two live executors: `orb_v1` (ORB paper/historical) and `generic_v1` (generic single-session backtest). Route: `/workbench/...`
 
-2. **Generic Strategy Engine** — `generic_executor.py`. Any strategy expressed as `leg_template + entry_rule_id + exit_rule` in `workbench_catalog.py` runs with zero custom code. Short Straddle is the first live strategy.
+2. **Generic Strategy Engine** — `generic_executor.py`. Any strategy expressed as `leg_template + entry_rule_id + exit_rule` in `workbench_catalog.py` runs with zero custom code. Short Straddle and Iron Butterfly are live; 10 more catalogued.
 
 3. **Historical Backtest** — batch-runs against a warehoused 1-min candle DB. Multi-day. Results accessible from Runs Library.
 
@@ -40,9 +40,21 @@ Upgraded `strategy_run` replay into a full trade diagnosis screen:
 
 ---
 
-## Test Counts (current)
+## Iron Butterfly (PR #28, pending merge)
 
-- Backend: **229 passed** (`python3 -m pytest tests/ --ignore=tests/test_router_helpers.py`)
+- 4-leg defined-risk neutral strategy: SELL ATM CE/PE + BUY OTM CE/PE wings
+- Wing width is runtime config (`wing_width_steps`) via `strike_offset_steps_from_config` in leg_template
+- MTM formula is sign-aware: SELL `entry−current`, BUY `current−entry`
+- Margin sizing via `_defined_risk_margin_per_lot()` (wing_width × step × lot_size − net_credit)
+- Exit charges flip correctly: closing BUY leg = SELL order, closing SELL leg = BUY order
+- `ce_mtm`/`pe_mtm` sum ALL legs of that option_type (SELL + BUY) — serializer unchanged
+- 8 new focused tests covering catalog, wing resolution, MTM signs, charges, CSV
+
+---
+
+## Test Counts (current, after IB merge)
+
+- Backend: **~237 passed** (229 baseline + 8 IB tests)
 - Frontend: **49 passed** (`npm test`)
 
 ---

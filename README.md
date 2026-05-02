@@ -3,7 +3,7 @@
 A production-quality options strategy platform for Nifty 50 and Bank Nifty with five independent modules:
 
 1. **V2 Workbench** — strategy-agnostic shell for running, replaying, and comparing any supported strategy. Primary UI entry point.
-2. **Generic Strategy Engine** — declarative executor (`generic_v1`) that runs any strategy expressed as a `leg_template + entry_rule + exit_rule`. Powers the Short Straddle and all future catalog strategies with zero custom code per strategy.
+2. **Generic Strategy Engine** — declarative executor (`generic_v1`) that runs any strategy expressed as a `leg_template + entry_rule + exit_rule`. Powers the Short Straddle, Iron Butterfly, and all future catalog strategies with zero custom code per strategy.
 3. **Synthetic Backtest** — simulates Iron Condor, Bull Put Spread, and Bear Call Spread strategies using deterministic synthetic candle data with auto-regime detection (EMA/RSI/IV Rank).
 4. **Historical Backtest** — batch-runs any registered strategy over real Zerodha candle data stored in a local warehouse. Supports multi-day runs with full per-session audit trails.
 5. **Paper Trading ORB Replay** — replays any historical trading day using **live Zerodha market data**, evaluates an Opening Range Breakout strategy through a seven-gate decision engine, and produces full per-minute audit logs, trade detail, and raw candle exports.
@@ -108,7 +108,7 @@ Strategy Catalog → Run Builder → [Run] → Replay Analyzer
 | `planned` | On roadmap; UI shows "coming soon" |
 | `research` | Under investigation; shown in catalog but not runnable |
 
-Currently available: **orb_intraday_spread** (Opening Range Spread) and **short_straddle** (Short Straddle via generic_v1).
+Currently available: **orb_intraday_spread** (Opening Range Spread), **short_straddle** (Short Straddle via generic_v1), and **iron_butterfly** (Iron Butterfly via generic_v1).
 
 ### Run Types
 
@@ -171,7 +171,7 @@ Returns: {valid, instrument, trade_date, expiry, atm_strike, spot_at_entry,
 
 The RunBuilder fires this 600 ms after any config change, showing a live contract resolution panel before the user submits.
 
-### Short Straddle (first generic_v1 strategy)
+### Short Straddle (generic_v1)
 
 Sells ATM CE + ATM PE simultaneously. Profit if spot stays range-bound; loss if it moves sharply.
 
@@ -186,6 +186,27 @@ Exit rules:
 - **Time exit**: 15:25
 
 When a TRAIL_EXIT fires, realized P&L is locked at the trail stop level (not the candle close, which may gap through the stop).
+
+### Iron Butterfly (generic_v1)
+
+Sells ATM straddle and buys OTM wings to cap the loss. Defined-risk neutral strategy.
+
+| Leg | Strike | Rationale |
+|-----|--------|-----------|
+| SELL CE | ATM | Collect call premium |
+| SELL PE | ATM | Collect put premium |
+| BUY CE | ATM + N×step | Cap upside risk |
+| BUY PE | ATM − N×step | Cap downside risk |
+
+Wing width N is set by the user via `wing_width_steps` — resolved at runtime from `config["wing_width_steps"] × strike_step`. No code change needed to vary the wing.
+
+MTM formula for mixed legs: SELL legs use `entry − current`; BUY legs use `current − entry`. Margin sizing uses `_defined_risk_margin_per_lot()` — max_loss = wing_width × strike_step × lot_size − net_credit.
+
+Exit rules:
+- **Stop**: configurable `stop_capital_pct` of capital (default 1.5%)
+- **Target**: configurable `target_pct` of entry credit (default 30%)
+- **Trail**: disabled by default
+- **Time exit**: 15:25
 
 ---
 
@@ -695,6 +716,7 @@ cd backend && python -m pytest tests/ -v
 | `test_charges_service.py` | Brokerage math: entry/exit/total charges, STT, GST, monotonicity |
 | `test_generic_executor.py` | `validate_run` (7 tests) + `execute_run` (6 tests) via async fake DB and service-layer patches |
 | `test_strategy_replay_serializer.py` | 19 tests: CE/PE MTM grouping, MFE/MAE/drawdown, VIX forward-fill + source tagging, spot OHLC completeness, data quality warnings, legs shape, payload regression |
+| `test_iron_butterfly_*.py` | 8 tests: catalog entry, 4-leg CE/PE MTM grouping, config-driven wing offsets, mixed BUY/SELL MTM signs, defined-risk margin sizing, mixed-leg charges (entry + exit + round-trip), 9-section CSV with 4 contracts |
 
 ### Frontend (Vitest)
 

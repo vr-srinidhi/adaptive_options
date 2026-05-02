@@ -12,6 +12,7 @@ Technical reference for all strategies implemented or catalogued in Adaptive Opt
 |----|------|----------|----------|------|--------|
 | `orb_intraday_spread` | Opening Range Spread | `orb_v1` | paper_replay / historical_backtest | Directional | **available** |
 | `short_straddle` | Short Straddle | `generic_v1` | single_session_backtest | Neutral | **available** |
+| `iron_butterfly` | Iron Butterfly | `generic_v1` | single_session_backtest | Neutral | **available** |
 
 ### Synthetic Backtest Strategies
 
@@ -23,12 +24,13 @@ Technical reference for all strategies implemented or catalogued in Adaptive Opt
 
 ### Catalogued Strategies (Planned / Research)
 
-The workbench catalog (`workbench_catalog.py`) lists 13 strategies total. Two are `available`; the rest are `planned` or `research`. Adding any of the planned strategies requires only a catalog entry — `generic_executor.py` handles execution.
+The workbench catalog (`workbench_catalog.py`) lists 13 strategies total. Three are `available`; the rest are `planned` or `research`. Adding any of the planned strategies requires only a catalog entry — `generic_executor.py` handles execution.
 
 | Name | Bias | Executor | Status |
 |------|------|----------|--------|
 | Opening Range Spread | Directional | orb_v1 | available |
 | Short Straddle | Neutral | generic_v1 | **available** |
+| Iron Butterfly | Neutral / Defined risk | generic_v1 | **available** |
 | Iron Condor | Neutral | generic_v1 | planned |
 | Bull Put Spread | Bullish | generic_v1 | planned |
 | Bear Call Spread | Bearish | generic_v1 | planned |
@@ -36,7 +38,6 @@ The workbench catalog (`workbench_catalog.py`) lists 13 strategies total. Two ar
 | Short Strangle | Neutral (low vol) | generic_v1 | planned |
 | Calendar Spread | Time decay | generic_v1 | research |
 | Ratio Back Spread | Directional | generic_v1 | research |
-| Butterfly | Neutral (tight range) | generic_v1 | research |
 | Jade Lizard | Bullish slight | generic_v1 | research |
 | … | … | generic_v1 | planned/research |
 
@@ -221,6 +222,85 @@ ATM = `round(spot_at_entry / strike_step) * strike_step`
 | `STOP_EXIT` | net_mtm ≤ −1.5% of capital (capital-based, not credit-based) |
 | `TIME_EXIT` | 15:25 |
 | `DATA_GAP_EXIT` | option price stale > 1 minute |
+
+---
+
+## Iron Butterfly Strategy
+
+### Concept
+
+Sell the ATM straddle and buy OTM wings to cap maximum loss. Defined-risk version of the short straddle — collects premium from premium decay while capping tail risk.
+
+```
+Payoff at expiry
+        ▲ Profit
+        │     /\
+        │    /  \
+────────┼───/────\───────── Spot
+        │__/      \__
+       Max loss (capped)
+BUY PE  SELL PE  SELL CE  BUY CE
+ATM-N   ATM      ATM      ATM+N
+```
+
+### Legs
+
+| Action | Type | Strike | Rationale |
+|--------|------|--------|-----------|
+| SELL | CE | ATM | Collect call premium |
+| SELL | PE | ATM | Collect put premium |
+| BUY  | CE | ATM + N×step | Cap upside loss |
+| BUY  | PE | ATM − N×step | Cap downside loss |
+
+N = `wing_width_steps` (user input); step = `strike_step` from `instrument_contract_specs`.
+
+### Parameters
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `trade_date` | latest weekday | Date to run |
+| `entry_time` | `09:50` | Minute to enter |
+| `capital` | — | Required |
+| `wing_width_steps` | 2 | Number of strike steps for OTM wings (e.g. 2 × 50 = 100 pts for NIFTY) |
+| `target_pct` | 0.30 | Exit when net_mtm ≥ target_pct × entry_credit_total |
+| `stop_capital_pct` | 0.015 | Exit when net_mtm ≤ −stop_capital_pct × capital |
+| `vix_guardrail_enabled` | true | Skip trade if VIX outside [vix_min, vix_max] |
+| `vix_min` | 14 | Minimum VIX |
+| `vix_max` | 22 | Maximum VIX |
+
+### MTM Formula
+
+Mixed SELL/BUY legs require sign-aware computation:
+
+```
+gross_mtm_per_unit = Σ (entry_price_i − current_price_i)   for SELL legs
+                   + Σ (current_price_i − entry_price_i)   for BUY legs
+gross_mtm_total    = gross_mtm_per_unit × lot_size × approved_lots
+net_mtm            = gross_mtm_total − entry_charges − est_exit_charges
+```
+
+Margin sizing uses `_defined_risk_margin_per_lot()`:
+```
+max_loss_per_lot = wing_width_steps × strike_step × lot_size − net_credit_per_lot
+approved_lots    = floor(capital / max_loss_per_lot)
+```
+
+### Exit Conditions
+
+| Condition | Trigger |
+|-----------|---------|
+| `TARGET_EXIT` | net_mtm ≥ target_pct × entry_credit_total |
+| `STOP_EXIT` | net_mtm ≤ −stop_capital_pct × capital |
+| `TIME_EXIT` | 15:25 |
+| `DATA_GAP_EXIT` | any option price stale > 1 minute |
+
+Trail disabled by default. Can be enabled via `trail_trigger` / `trail_pct` config params.
+
+### Charge Handling
+
+Closing a BUY leg is a SELL order; closing a SELL leg is a BUY order:
+- Entry: 4 orders (2 SELL + 2 BUY) — STT on SELL legs only
+- Exit: 4 orders (2 BUY to close shorts + 2 SELL to close longs) — STT on SELL (close of BUY legs)
 
 ---
 
@@ -454,6 +534,7 @@ This is why IV Rank drives strategy selection — you want to sell premium when 
 | Backend | pytest | `test_charges_service.py` | Brokerage math: entry/exit/total charges, STT, GST, monotonicity |
 | Backend | pytest | `test_generic_executor.py` | `validate_run` (7 tests) + `execute_run` (6 tests) via async fake DB and service patches |
 | Backend | pytest | `test_strategy_replay_serializer.py` | 19 tests: CE/PE MTM grouping, MFE/MAE/drawdown, VIX forward-fill + source tagging, spot OHLC completeness, data quality warnings, legs shape (lots/lot_size), payload regression |
+| Backend | pytest | `test_iron_butterfly_*.py` | 8 tests: catalog entry, config-driven wing offsets, 4-leg CE/PE MTM grouping (SELL+BUY per type), mixed BUY/SELL MTM signs, defined-risk margin sizing, mixed-leg entry/exit/round-trip charges, 9-section CSV with 4 contracts |
 | Frontend | Vitest | `TopNav.test.jsx` | Primary + legacy nav links, workbench visibility rules, active state |
 | Frontend | Vitest | `Backtest.test.jsx` | Form, API call, loading state |
 | Frontend | Vitest | `Dashboard.test.jsx` | Data render, navigation, empty/error states |
