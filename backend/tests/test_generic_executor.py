@@ -164,6 +164,29 @@ _SHORT_STRADDLE = {
     },
 }
 
+_IRON_BUTTERFLY = {
+    "id": "iron_butterfly",
+    "name": "Iron Butterfly",
+    "executor": "generic_v1",
+    "entry_rule_id": "timed_entry",
+    "leg_template": [
+        {"side": "SELL", "option_type": "CE", "strike_offset_steps": 0},
+        {"side": "SELL", "option_type": "PE", "strike_offset_steps": 0},
+        {"side": "BUY", "option_type": "CE", "strike_offset_steps_from_config": "wing_width_steps", "strike_offset_sign": 1},
+        {"side": "BUY", "option_type": "PE", "strike_offset_steps_from_config": "wing_width_steps", "strike_offset_sign": -1},
+    ],
+    "exit_rule": {
+        "target_pct": 0.30,
+        "stop_capital_pct": 0.015,
+        "time_exit": "15:25",
+        "data_gap_exit": True,
+    },
+    "sizing": {
+        "model": "defined_risk_credit",
+        "wing_width_steps_key": "wing_width_steps",
+    },
+}
+
 _BASE_CONFIG = {
     "instrument": "NIFTY",
     "trade_date": _TRADE_DATE.isoformat(),
@@ -255,6 +278,35 @@ def test_validate_run_resolves_both_legs():
     types = {c["option_type"] for c in result.contracts}
     assert sides == {"SELL"}
     assert types == {"CE", "PE"}
+
+
+def test_validate_run_resolves_iron_butterfly_wings_and_defined_risk_margin():
+    entry_dt = datetime.combine(_TRADE_DATE, time(9, 50))
+    priced_rows = [
+        SimpleNamespace(option_type="CE", timestamp=entry_dt, expiry_date=_EXPIRY, close=100.0),
+        SimpleNamespace(option_type="PE", timestamp=entry_dt, expiry_date=_EXPIRY, close=100.0),
+    ]
+    db = FakeDB(
+        td_row=_make_trading_day(),
+        spec_row=_make_spec_row(),
+        spot_row=_make_spot_row(close=22_400.0),
+        option_rows=priced_rows,
+        leg_price_rows=priced_rows,
+    )
+    result = _run(validate_run(
+        db,
+        _IRON_BUTTERFLY,
+        {**_BASE_CONFIG, "wing_width_steps": 2, "capital": 500_000},
+    ))
+    assert result.validated
+    assert [(c["side"], c["option_type"], c["strike"]) for c in result.contracts] == [
+        ("SELL", "CE", 22_400),
+        ("SELL", "PE", 22_400),
+        ("BUY", "CE", 22_500),
+        ("BUY", "PE", 22_300),
+    ]
+    assert result.estimated_margin < 500_000
+    assert result.approved_lots == 66
 
 
 # ── execute_run tests (patch service-layer dependencies) ─────────────────────
@@ -521,6 +573,41 @@ def _run_execute_direct(validation, spot_candles, option_index, *, entry_time="0
     return result, db
 
 
+def _run_execute_strategy_direct(strategy, validation, spot_candles, option_index, *, config_overrides=None, entry_time="09:16"):
+    from app.services.generic_executor import execute_run
+
+    config = {
+        **_BASE_CONFIG,
+        "trade_date": validation.trade_date,
+        "entry_time": entry_time,
+        "exit_rule": strategy["exit_rule"],
+        **(config_overrides or {}),
+    }
+    db = _fake_db_for_execute()
+    run_id = uuid.uuid4()
+
+    from dataclasses import replace
+    val = replace(validation, entry_time=entry_time)
+
+    with (
+        patch("app.services.generic_executor.get_contract_spec",
+              new=AsyncMock(return_value=SimpleNamespace(
+                  lot_size=val.lot_size, strike_step=50,
+                  weekly_expiry_weekday=3, estimated_margin_per_lot=180_000.0,
+              ))),
+        patch("app.services.generic_executor.load_spot_candles",
+              new=AsyncMock(return_value=spot_candles)),
+        patch("app.services.generic_executor.load_vix_candles",
+              new=AsyncMock(return_value=[])),
+        patch("app.services.generic_executor.load_option_candles_for_strikes",
+              new=AsyncMock(return_value=(option_index, {}))),
+    ):
+        result = asyncio.get_event_loop().run_until_complete(
+            execute_run(db, run_id, strategy, config, val, user_id=uuid.uuid4())
+        )
+    return result, db
+
+
 def test_execute_run_data_gap_exit_uses_gap_minute_not_last_mtm():
     """
     DATA_GAP_EXIT must record the minute it fires as exit_time, not the last MTM minute.
@@ -593,3 +680,36 @@ def test_execute_run_leg_gross_pnl_populated_after_trade():
         assert leg_row.gross_leg_pnl > 0, (
             f"Expected positive P&L (SELL at 100, exit at 20) but got {leg_row.gross_leg_pnl}"
         )
+
+
+def test_execute_run_iron_butterfly_uses_buy_sell_mtm_signs():
+    from app.models.strategy_run import StrategyLegMtm
+
+    validation = _make_validation(atm_strike=22_400, approved_lots=1)
+    spot = _make_minute_spot_candles(_TRADE_DATE, count=4)
+    option_index = {
+        (22_400, "CE"): {1: {"price": 100.0}, 2: {"price": 80.0}},
+        (22_400, "PE"): {1: {"price": 100.0}, 2: {"price": 90.0}},
+        (22_500, "CE"): {1: {"price": 40.0}, 2: {"price": 30.0}},
+        (22_300, "PE"): {1: {"price": 40.0}, 2: {"price": 45.0}},
+    }
+    strategy = {
+        **_IRON_BUTTERFLY,
+        "exit_rule": {**_IRON_BUTTERFLY["exit_rule"], "time_exit": "09:17"},
+    }
+
+    result, db = _run_execute_strategy_direct(
+        strategy,
+        validation,
+        spot,
+        option_index,
+        config_overrides={"wing_width_steps": 2},
+        entry_time="09:16",
+    )
+
+    assert result.exit_reason == "TIME_EXIT"
+    leg_mtm_rows = [
+        call.args[0] for call in db.add.call_args_list
+        if isinstance(call.args[0], StrategyLegMtm)
+    ]
+    assert [row.gross_leg_pnl for row in leg_mtm_rows] == [1500.0, 750.0, -750.0, 375.0]

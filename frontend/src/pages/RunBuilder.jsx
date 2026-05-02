@@ -124,7 +124,7 @@ function buildPreview(strategy, runType, config, readyDays) {
   const capitalValid = Number.isFinite(capital) && capital > 0
   const visual = normalizeVisual(strategy)
   const readySet = new Set((readyDays || []).map(item => item.trade_date))
-  const selectedDate = config.date || config.start_date
+  const selectedDate = config.date || config.trade_date || config.start_date
   const exactDayReady = selectedDate ? readySet.has(selectedDate) : false
   const expectedRangeDays = runType === 'historical_backtest'
     ? countWeekdaysInRange(config.start_date, config.end_date)
@@ -134,6 +134,8 @@ function buildPreview(strategy, runType, config, readyDays) {
     : 0
   const historicalReady = expectedRangeDays > 0 && readyRangeDays >= expectedRangeDays
   const tone = strategyStatusTone(strategy?.status)
+  const vixMinField = visual.constraintFields.find(item => item.label.toLowerCase().includes('vix min'))
+  const vixMaxField = visual.constraintFields.find(item => item.label.toLowerCase().includes('vix max'))
 
   const readinessItems = [
     {
@@ -154,7 +156,7 @@ function buildPreview(strategy, runType, config, readyDays) {
     },
     {
       label: 'VIX data',
-      detail: `${visual.constraintFields[2]?.value || 'Auto'} to ${visual.constraintFields[3]?.value || 'Auto'} guardrail`,
+      detail: `${vixMinField?.value || 'Auto'} to ${vixMaxField?.value || 'Auto'} guardrail`,
       level: 'good',
     },
     {
@@ -199,7 +201,7 @@ function orderFields(fields, runType) {
   const order = runType === 'paper_replay'
     ? ['instrument', 'date', 'capital', 'request_token']
     : runType === 'single_session_backtest'
-      ? ['instrument', 'trade_date', 'entry_time', 'capital', 'vix_guardrail_enabled', 'vix_min', 'vix_max']
+      ? ['instrument', 'trade_date', 'entry_time', 'capital', 'wing_width_steps', 'target_pct', 'stop_capital_pct', 'vix_guardrail_enabled', 'vix_min', 'vix_max']
       : ['instrument', 'start_date', 'end_date', 'name', 'capital', 'execution_order', 'autorun']
 
   return [...fields].sort((a, b) => {
@@ -681,7 +683,7 @@ export default function RunBuilder() {
       }
     }, 600)
     return () => clearTimeout(validateTimer.current)
-  }, [runType, strategyId, config.trade_date, config.entry_time, config.capital, config.instrument, config.vix_guardrail_enabled, config.vix_min, config.vix_max])
+  }, [runType, strategyId, config.trade_date, config.entry_time, config.capital, config.instrument, config.wing_width_steps, config.target_pct, config.stop_capital_pct, config.vix_guardrail_enabled, config.vix_min, config.vix_max])
 
   const scopedFields = useMemo(() => {
     const schema = (strategy?.params_schema || []).filter(field => !field.modes || field.modes.includes(runType))

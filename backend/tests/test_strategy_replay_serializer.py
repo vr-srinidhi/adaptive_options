@@ -169,6 +169,31 @@ def test_multiple_ce_legs_summed():
     assert abs(row["ce_mtm"] - 4800) < 0.01  # 3000 + 1800
 
 
+def test_iron_butterfly_ce_pe_mtm_sums_short_and_long_wings():
+    short_ce = _leg(0, "SELL", "CE", 22400, 100, 80, 1500)
+    short_pe = _leg(1, "SELL", "PE", 22400, 100, 90, 750)
+    long_ce = _leg(2, "BUY", "CE", 22500, 40, 30, -750)
+    long_pe = _leg(3, "BUY", "PE", 22300, 40, 45, 375)
+    ts = "2026-04-07T09:50:00"
+    mtm_rows = [_mtm(ts, net_mtm=1875)]
+    leg_mtm_rows = [
+        _leg_mtm(short_ce.id, ts, 80, 1500),
+        _leg_mtm(short_pe.id, ts, 90, 750),
+        _leg_mtm(long_ce.id, ts, 30, -750),
+        _leg_mtm(long_pe.id, ts, 45, 375),
+    ]
+    payload = strategy_run_replay_payload(
+        _run(strategy_id="iron_butterfly"),
+        [short_ce, short_pe, long_ce, long_pe],
+        mtm_rows,
+        leg_mtm_rows,
+        [],
+    )
+    row = payload["mtm_series"][0]
+    assert row["ce_mtm"] == 750.0
+    assert row["pe_mtm"] == 1125.0
+
+
 # ── MFE / MAE / max_drawdown tests ───────────────────────────────────────────
 
 def test_mfe_mae_computed_from_net_mtm():

@@ -16,6 +16,9 @@ Public API
 compute_entry_charges(lots, lot_size, leg_prices)        → float
 compute_exit_charges_estimate(lots, lot_size, leg_prices) → float
 compute_total_charges(lots, lot_size, entry_prices, exit_prices) → float
+compute_leg_entry_charges(lots, lot_size, legs, prices)   → float
+compute_leg_exit_charges_estimate(lots, lot_size, legs, prices) → float
+compute_leg_total_charges(lots, lot_size, legs, entry_prices, exit_prices) → float
 """
 from __future__ import annotations
 
@@ -102,4 +105,88 @@ def compute_total_charges(
         buy_prices=exit_prices,
         n_sell_orders=len(entry_prices),
         n_buy_orders=len(exit_prices),
+    )
+
+
+def compute_leg_entry_charges(
+    lots: int,
+    lot_size: int,
+    legs: List[tuple],
+    prices: List[float],
+) -> float:
+    """Entry charges for mixed BUY/SELL multi-leg strategies."""
+    sell_prices = [
+        price for (side, _, _), price in zip(legs, prices)
+        if side == "SELL" and price is not None
+    ]
+    buy_prices = [
+        price for (side, _, _), price in zip(legs, prices)
+        if side == "BUY" and price is not None
+    ]
+    return _charges(
+        lots, lot_size,
+        sell_prices=sell_prices,
+        buy_prices=buy_prices,
+        n_sell_orders=len(sell_prices),
+        n_buy_orders=len(buy_prices),
+    )
+
+
+def compute_leg_exit_charges_estimate(
+    lots: int,
+    lot_size: int,
+    legs: List[tuple],
+    current_prices: List[float],
+) -> float:
+    """Estimated exit charges using current prices for mixed BUY/SELL legs."""
+    # Closing a short leg is a BUY. Closing a long leg is a SELL.
+    sell_prices = [
+        price for (side, _, _), price in zip(legs, current_prices)
+        if side == "BUY" and price is not None
+    ]
+    buy_prices = [
+        price for (side, _, _), price in zip(legs, current_prices)
+        if side == "SELL" and price is not None
+    ]
+    return _charges(
+        lots, lot_size,
+        sell_prices=sell_prices,
+        buy_prices=buy_prices,
+        n_sell_orders=len(sell_prices),
+        n_buy_orders=len(buy_prices),
+    )
+
+
+def compute_leg_total_charges(
+    lots: int,
+    lot_size: int,
+    legs: List[tuple],
+    entry_prices: List[float],
+    exit_prices: List[float],
+) -> float:
+    """Round-trip charges for mixed BUY/SELL multi-leg strategies."""
+    entry_sell = [
+        price for (side, _, _), price in zip(legs, entry_prices)
+        if side == "SELL" and price is not None
+    ]
+    entry_buy = [
+        price for (side, _, _), price in zip(legs, entry_prices)
+        if side == "BUY" and price is not None
+    ]
+    exit_sell = [
+        price for (side, _, _), price in zip(legs, exit_prices)
+        if side == "BUY" and price is not None
+    ]
+    exit_buy = [
+        price for (side, _, _), price in zip(legs, exit_prices)
+        if side == "SELL" and price is not None
+    ]
+    sell_prices = [*entry_sell, *exit_sell]
+    buy_prices = [*entry_buy, *exit_buy]
+    return _charges(
+        lots, lot_size,
+        sell_prices=sell_prices,
+        buy_prices=buy_prices,
+        n_sell_orders=len(sell_prices),
+        n_buy_orders=len(buy_prices),
     )

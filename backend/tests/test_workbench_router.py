@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import csv
+import io
 import json
 import sys
 import types
@@ -238,3 +240,49 @@ def test_list_runs_supports_offset_pagination_over_http():
     # sort is date_label desc; session_b "2026-04-06" sorts above batch_a "2026-04-01 – 2026-04-07"
     assert [item["id"] for item in runs] == [str(session_b.id), str(batch_a.id)]
     assert runs[0]["strategy_name"] == "Opening Range Spread"
+
+
+def test_strategy_run_csv_has_nine_sections_and_four_contracts():
+    payload = {
+        "run": {
+            "strategy_id": "iron_butterfly",
+            "trade_date": "2026-04-07",
+            "instrument": "NIFTY",
+            "status": "completed",
+            "exit_reason": "TIME_EXIT",
+            "realized_net_pnl": 1200,
+            "gross_pnl": 1600,
+            "total_charges": 400,
+            "capital": 500000,
+            "lots": 1,
+            "lot_size": 75,
+            "entry_time": "09:50",
+            "exit_time": "15:25",
+            "entry_credit_total": 9000,
+            "mfe": 2000,
+            "mae": -500,
+            "max_drawdown": -750,
+        },
+        "legs": [
+            {"leg_index": 0, "side": "SELL", "option_type": "CE", "strike": 22400, "expiry_date": "2026-04-09", "quantity": 75, "entry_price": 100, "exit_price": 80, "gross_leg_pnl": 1500},
+            {"leg_index": 1, "side": "SELL", "option_type": "PE", "strike": 22400, "expiry_date": "2026-04-09", "quantity": 75, "entry_price": 100, "exit_price": 90, "gross_leg_pnl": 750},
+            {"leg_index": 2, "side": "BUY", "option_type": "CE", "strike": 22500, "expiry_date": "2026-04-09", "quantity": 75, "entry_price": 40, "exit_price": 30, "gross_leg_pnl": -750},
+            {"leg_index": 3, "side": "BUY", "option_type": "PE", "strike": 22300, "expiry_date": "2026-04-09", "quantity": 75, "entry_price": 40, "exit_price": 45, "gross_leg_pnl": 375},
+        ],
+        "events": [],
+        "mtm_series": [],
+        "shadow_mtm_series": [],
+        "leg_candles": {},
+        "spot_series_full": [],
+        "vix_series_full": [],
+    }
+    out = io.StringIO()
+    workbench._write_run_sections_to_csv(csv.writer(out), payload, SimpleNamespace(instrument="NIFTY"))
+    rows = list(csv.reader(io.StringIO(out.getvalue())))
+    section_rows = [row for row in rows if row and row[0].startswith("=== ")]
+    assert len(section_rows) == 9
+
+    contracts_idx = next(i for i, row in enumerate(rows) if row == ["=== CONTRACTS EXECUTED ==="])
+    mtm_idx = next(i for i, row in enumerate(rows) if row and row[0].startswith("=== MTM SERIES"))
+    contract_rows = rows[contracts_idx + 2:mtm_idx - 1]
+    assert len([row for row in contract_rows if row]) == 4

@@ -14,7 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.database import get_db
 from app.dependencies.auth import get_current_active_user
 from app.models.historical import OptionsCandle, SessionBatch, SpotCandle, TradingDay, VixCandle
-from app.services.charges_service import compute_entry_charges, compute_exit_charges_estimate
+from app.services.charges_service import compute_leg_entry_charges, compute_leg_exit_charges_estimate
 from app.models.paper_trade import (
     MinuteDecision,
     PaperCandleSeries,
@@ -624,8 +624,9 @@ async def _compute_shadow_mtm(db: AsyncSession, run_row, legs) -> list:
         (l.side, l.option_type, l.strike, l.expiry_date, float(l.entry_price))
         for l in legs if l.entry_price is not None
     ]
-    sell_entry_prices = [ep for side, _, _, _, ep in leg_info if side == "SELL"]
-    entry_charges = compute_entry_charges(approved_lots, lot_size, sell_entry_prices)
+    charge_legs = [(side, opt_type, strike) for side, opt_type, strike, _, _ in leg_info]
+    entry_prices = [ep for _, _, _, _, ep in leg_info]
+    entry_charges = compute_leg_entry_charges(approved_lots, lot_size, charge_legs, entry_prices)
 
     # Spot candles after exit
     spot_rows = (await db.execute(
@@ -688,8 +689,8 @@ async def _compute_shadow_mtm(db: AsyncSession, run_row, legs) -> list:
             for side, opt_type, strike, _, ep in leg_info
         )
         gross_mtm_total = gross_mtm_per_unit * lot_size * approved_lots
-        sell_cur = [cur[(strike, opt_type)] for side, opt_type, strike, _, _ in leg_info if side == "SELL"]
-        est_exit = compute_exit_charges_estimate(approved_lots, lot_size, sell_cur or [0.0])
+        cur_prices = [cur[(strike, opt_type)] for _, opt_type, strike, _, _ in leg_info]
+        est_exit = compute_leg_exit_charges_estimate(approved_lots, lot_size, charge_legs, cur_prices)
         net_mtm  = gross_mtm_total - entry_charges - est_exit
         shadow.append({"timestamp": ts.isoformat(), "net_mtm": round(net_mtm, 2)})
 
@@ -845,7 +846,7 @@ def _csv_inr(v) -> str:
 
 
 def _write_run_sections_to_csv(w, payload: dict, run_row) -> None:
-    """Write all 8 sections for one strategy run to an open csv.writer instance."""
+    """Write the 9 replay sections for one strategy run to an open csv.writer instance."""
     run    = payload["run"]
     legs   = payload["legs"]
     events = payload["events"]
@@ -925,21 +926,26 @@ def _write_run_sections_to_csv(w, payload: dict, run_row) -> None:
     for row in payload["shadow_mtm_series"]:
         w.writerow([row["timestamp"], _csv_f(row.get("net_mtm")), "", "", "", "", "", "shadow (hypothetical)"])
 
-    # Sections 5+: CE then PE premium candles
-    ce_legs = [l for l in legs if l["option_type"] == "CE"]
-    pe_legs = [l for l in legs if l["option_type"] == "PE"]
-
-    for leg in ce_legs:
-        sec(f"CE PREMIUM — {run_row.instrument}{leg['strike']}CE {leg.get('expiry_date', '')} (1-min candles, full day)")
-        w.writerow(["Timestamp", "Open", "High", "Low", "Close"])
-        for c in payload["leg_candles"].get(str(leg["leg_index"]), []):
-            w.writerow([c["timestamp"], _csv_f(c.get("open")), _csv_f(c.get("high")), _csv_f(c.get("low")), _csv_f(c.get("close"))])
-
-    for leg in pe_legs:
-        sec(f"PE PREMIUM — {run_row.instrument}{leg['strike']}PE {leg.get('expiry_date', '')} (1-min candles, full day)")
-        w.writerow(["Timestamp", "Open", "High", "Low", "Close"])
-        for c in payload["leg_candles"].get(str(leg["leg_index"]), []):
-            w.writerow([c["timestamp"], _csv_f(c.get("open")), _csv_f(c.get("high")), _csv_f(c.get("low")), _csv_f(c.get("close"))])
+    # Sections 5-6: CE then PE premium candles, with all matching contracts included.
+    for option_type in ("CE", "PE"):
+        option_legs = [leg for leg in legs if leg["option_type"] == option_type]
+        sec(f"{option_type} PREMIUM — Full Day 1-min candles")
+        w.writerow(["Leg", "Contract", "Timestamp", "Open", "High", "Low", "Close"])
+        for leg in option_legs:
+            contract = f"{leg.get('side', '')} {run_row.instrument}{leg['strike']}{option_type} {leg.get('expiry_date', '')}"
+            candles = payload["leg_candles"].get(str(leg["leg_index"]), [])
+            if not candles:
+                w.writerow([leg.get("leg_index", ""), contract, "", "", "", "", ""])
+            for c in candles:
+                w.writerow([
+                    leg.get("leg_index", ""),
+                    contract,
+                    c["timestamp"],
+                    _csv_f(c.get("open")),
+                    _csv_f(c.get("high")),
+                    _csv_f(c.get("low")),
+                    _csv_f(c.get("close")),
+                ])
 
     # NIFTY Spot OHLC
     sec(f"NIFTY SPOT OHLC — Full Day ({run.get('trade_date', '')})")

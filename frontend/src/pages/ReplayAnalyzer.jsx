@@ -599,10 +599,9 @@ function StrategyRunAnalyzer({ payload, kind, id, navigate }) {
   const hasCePe   = chartMtm.some(r => r.ce_mtm != null || r.pe_mtm != null)
 
   // ── Premium chart data per leg ────────────────────────────────────────────
-  const ceLeg = legs.find(l => l.option_type === 'CE')
-  const peLeg = legs.find(l => l.option_type === 'PE')
-  const ceCandles = legCandles[String(ceLeg?.leg_index)] || []
-  const peCandles = legCandles[String(peLeg?.leg_index)] || []
+  const premiumLegs = legs
+    .map(leg => ({ leg, candles: legCandles[String(leg.leg_index)] || [] }))
+    .filter(item => item.candles.length > 0)
 
   const tone = runStatusTone(run.status)
   const pnl  = run.realized_net_pnl
@@ -679,28 +678,19 @@ function StrategyRunAnalyzer({ payload, kind, id, navigate }) {
       </section>
 
       {/* ── Premium charts ── */}
-      {(ceCandles.length > 0 || peCandles.length > 0) && (
+      {premiumLegs.length > 0 && (
         <section className="wb-grid wb-grid-2 mt-6 print-section">
-          {ceCandles.length > 0 && ceLeg && (
+          {premiumLegs.map(({ leg, candles }) => (
             <PremiumChart
-              title={`CE Premium — ${run.instrument} ${ceLeg.strike} CE`}
-              data={ceCandles}
-              entryPrice={ceLeg.entry_price}
-              exitPrice={ceLeg.exit_price}
+              key={leg.leg_index}
+              title={`${leg.side} ${leg.option_type} Premium — ${run.instrument} ${leg.strike} ${leg.option_type}`}
+              data={candles}
+              entryPrice={leg.entry_price}
+              exitPrice={leg.exit_price}
               entryLabel={entryLabel}
               exitLabel={exitLabel}
             />
-          )}
-          {peCandles.length > 0 && peLeg && (
-            <PremiumChart
-              title={`PE Premium — ${run.instrument} ${peLeg.strike} PE`}
-              data={peCandles}
-              entryPrice={peLeg.entry_price}
-              exitPrice={peLeg.exit_price}
-              entryLabel={entryLabel}
-              exitLabel={exitLabel}
-            />
-          )}
+          ))}
         </section>
       )}
 

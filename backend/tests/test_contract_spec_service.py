@@ -69,6 +69,22 @@ def test_offset_steps_applied_correctly():
     assert pe_strike == 22_350   # ATM - 1 × 50
 
 
+def test_config_driven_wing_offsets():
+    template = [
+        {"side": "SELL", "option_type": "CE", "strike_offset_steps": 0},
+        {"side": "SELL", "option_type": "PE", "strike_offset_steps": 0},
+        {"side": "BUY", "option_type": "CE", "strike_offset_steps_from_config": "wing_width_steps", "strike_offset_sign": 1},
+        {"side": "BUY", "option_type": "PE", "strike_offset_steps_from_config": "wing_width_steps", "strike_offset_sign": -1},
+    ]
+    legs = resolve_leg_strikes(template, atm_strike=22_400, strike_step=50, config={"wing_width_steps": 3})
+    assert legs == [
+        ("SELL", "CE", 22_400),
+        ("SELL", "PE", 22_400),
+        ("BUY", "CE", 22_550),
+        ("BUY", "PE", 22_250),
+    ]
+
+
 def test_empty_template_returns_empty():
     assert resolve_leg_strikes([], 22_400, 50) == []
 

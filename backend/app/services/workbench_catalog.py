@@ -357,16 +357,102 @@ _STRATEGIES = [
         "id": "iron_butterfly",
         "name": "Iron Butterfly",
         "bias": "neutral",
-        "status": "research",
-        "executor": None,
-        "modes": ["historical_backtest"],
+        "status": "available",
+        "executor": "generic_v1",
+        "entry_rule_id": "timed_entry",
+        "leg_template": [
+            {"side": "SELL", "option_type": "CE", "strike_offset_steps": 0},
+            {"side": "SELL", "option_type": "PE", "strike_offset_steps": 0},
+            {
+                "side": "BUY",
+                "option_type": "CE",
+                "strike_offset_steps_from_config": "wing_width_steps",
+                "strike_offset_sign": 1,
+                "default_strike_offset_steps": 2,
+            },
+            {
+                "side": "BUY",
+                "option_type": "PE",
+                "strike_offset_steps_from_config": "wing_width_steps",
+                "strike_offset_sign": -1,
+                "default_strike_offset_steps": 2,
+            },
+        ],
+        "exit_rule": {
+            "target_pct":       0.30,
+            "stop_capital_pct": 0.015,
+            "time_exit":        "15:25",
+            "data_gap_exit":    True,
+            "trail_trigger":    0,
+            "trail_pct":        0,
+        },
+        "sizing": {
+            "model": "defined_risk_credit",
+            "wing_width_steps_key": "wing_width_steps",
+        },
+        "modes": ["single_session_backtest"],
         "family": "neutral",
         "playbook": "Defined-risk neutral premium selling around a tight center strike.",
-        "description": "Depends on a generic four-leg execution contract.",
-        "chips": ["Neutral", "Defined risk", "Research"],
-        "params_schema": [],
-        "defaults": {},
-        "notes": [],
+        "description": (
+            "Sells the ATM call and put, buys symmetric wings, and exits on "
+            "stop, target, time, or data-gap controls."
+        ),
+        "chips": ["Neutral", "Defined risk", "4 legs", "Executable"],
+        "params_schema": [
+            {"key": "instrument", "label": "Instrument", "type": "select", "required": True, "options": ["NIFTY", "BANKNIFTY"]},
+            {"key": "trade_date", "label": "Trade Date", "type": "date", "required": True},
+            {"key": "entry_time", "label": "Entry Time", "type": "time", "required": True, "default": "09:50"},
+            {"key": "capital", "label": "Capital", "type": "number", "required": True, "min": 100000, "max": 50000000},
+            {"key": "wing_width_steps", "label": "Wing Width Steps", "type": "number", "required": True, "default": 2, "min": 1, "max": 20},
+            {"key": "vix_guardrail_enabled", "label": "VIX Guardrail", "type": "boolean", "required": False, "default": True},
+            {"key": "vix_min", "label": "VIX Min", "type": "number", "required": False, "default": 14, "depends_on": "vix_guardrail_enabled"},
+            {"key": "vix_max", "label": "VIX Max", "type": "number", "required": False, "default": 22, "depends_on": "vix_guardrail_enabled"},
+            {"key": "stop_capital_pct", "label": "Stop % Capital", "type": "number", "required": False, "default": 0.015, "min": 0.001, "max": 1},
+            {"key": "target_pct", "label": "Target % Credit", "type": "number", "required": False, "default": 0.30, "min": 0.01, "max": 1},
+        ],
+        "defaults": {
+            "single_session_backtest": {
+                "instrument": "NIFTY",
+                "trade_date": None,
+                "entry_time": "09:50",
+                "capital": 2500000,
+                "wing_width_steps": 2,
+                "vix_guardrail_enabled": True,
+                "vix_min": 14,
+                "vix_max": 22,
+                "stop_capital_pct": 0.015,
+                "target_pct": 0.30,
+            },
+        },
+        "visual_hints": {
+            "badge": "Iron Butterfly",
+            "assumption": "Fills use candle close price for all four legs. Bid/ask and live margin are not available in the current warehouse replay.",
+            "summary_title": "Iron Butterfly",
+            "summary_copy": "Sell ATM CE + PE and buy symmetric wings. Profit when spot stays near the center strike, with capped loss beyond either wing.",
+            "shape": "tent",
+            "expiry_label": "Weekly (auto)",
+            "exit_rule": "Stop / Target / Time / Data gap",
+            "constraint_fields": [
+                {"label": "Target", "value": "30%", "hint": "of net credit"},
+                {"label": "Stop", "value": "1.5%", "hint": "of capital"},
+                {"label": "Wing steps", "value": "2", "hint": "ATM ± steps"},
+                {"label": "Time exit", "value": "15:25", "hint": ""},
+                {"label": "VIX Min", "value": "14", "hint": ""},
+                {"label": "VIX Max", "value": "22", "hint": ""},
+            ],
+            "legs": [
+                {"side": "SELL", "option_type": "CE", "strike": "ATM", "expiry": "Weekly", "premium": "auto"},
+                {"side": "SELL", "option_type": "PE", "strike": "ATM", "expiry": "Weekly", "premium": "auto"},
+                {"side": "BUY", "option_type": "CE", "strike": "ATM + N", "expiry": "Weekly", "premium": "auto"},
+                {"side": "BUY", "option_type": "PE", "strike": "ATM - N", "expiry": "Weekly", "premium": "auto"},
+            ],
+            "payoff_hint": "Defined-risk tent: max profit near ATM, max loss capped by wing width minus net credit.",
+            "metrics": {"max_profit_ratio": 0.008, "max_risk_ratio": 0.025, "margin_ratio": 0.08, "max_loss_text": "Defined risk"},
+        },
+        "notes": [
+            "Runs on the generic timed-entry executor.",
+            "Sizing estimates defined risk from wing width and entry net credit.",
+        ],
     },
     {
         "id": "iron_condor",
@@ -390,7 +476,7 @@ def _materialize_strategy(strategy: dict) -> dict:
     item = deepcopy(strategy)
     if item["id"] == "orb_intraday_spread":
         item["defaults"] = _current_replay_defaults()
-    elif item["id"] == "short_straddle":
+    elif item["id"] in {"short_straddle", "iron_butterfly"}:
         # Inject a live default trade_date (latest weekday)
         anchor = latest_weekday()
         defaults = deepcopy(item.get("defaults", {}))
