@@ -1,13 +1,19 @@
 """
-Short Straddle — Profit Lock executor  (straddle_adjustment_v1)
+Short Straddle — Adjustment executor  (straddle_adjustment_v1)
 
 Strategy:
   Enter as Short Straddle (SELL ATM CE + SELL ATM PE).
-  Once net_mtm crosses `lock_trigger`, buy OTM wings (ATM ± wing_width_steps)
-  to convert the position into an Iron Condor and cap further downside.
-  Trailing stop, stop-loss, and time exit are the same as Short Straddle.
+  Supports two mid-session lock triggers:
+    - Profit lock (`lock_trigger`): when net_mtm >= lock_trigger, buy OTM wings
+      to convert to Iron Condor and protect the gain.
+    - Loss lock (`loss_lock_trigger`): when net_mtm <= -loss_lock_trigger, buy OTM
+      wings to cap further downside — emergency defensive hedge.
+  Only one lock can fire per session (whichever threshold is crossed first).
+  Trailing stop, stop-loss, and time exit apply throughout.
 
-The mid-session wing addition is the key difference from generic_executor.
+Backward-compatible: if loss_lock_trigger is 0 or absent, behaviour is identical
+to the original profit-lock-only strategy.
+
 validate_run is reused from generic_executor (validates the 2 straddle legs).
 """
 from __future__ import annotations
@@ -76,14 +82,15 @@ async def execute_run(
     approved_lots = validation.approved_lots
     warnings: List[str] = list(validation.warnings)
 
-    exit_rule        = strategy.get("exit_rule", {})
-    stop_capital_pct = float(config.get("stop_capital_pct") or exit_rule.get("stop_capital_pct") or 0.015)
-    trail_trigger    = float(config.get("trail_trigger")    or exit_rule.get("trail_trigger") or 0)
-    trail_pct        = float(config.get("trail_pct")        or exit_rule.get("trail_pct")     or 0)
-    lock_trigger     = float(config.get("lock_trigger")     or exit_rule.get("lock_trigger") or 20_000)
-    wing_steps       = int(config.get("wing_width_steps")   or exit_rule.get("wing_width_steps") or 2)
-    sq_time          = _parse_time(exit_rule.get("time_exit", "15:25"), default=time(15, 25))
-    capital_amount   = float(config.get("capital", 0))
+    exit_rule         = strategy.get("exit_rule", {})
+    stop_capital_pct  = float(config.get("stop_capital_pct")   or exit_rule.get("stop_capital_pct")   or 0.015)
+    trail_trigger     = float(config.get("trail_trigger")       or exit_rule.get("trail_trigger")      or 0)
+    trail_pct         = float(config.get("trail_pct")           or exit_rule.get("trail_pct")          or 0)
+    lock_trigger      = float(config.get("lock_trigger")        or exit_rule.get("lock_trigger")       or 20_000)
+    loss_lock_trigger = float(config.get("loss_lock_trigger")   or exit_rule.get("loss_lock_trigger")  or 0)
+    wing_steps        = int(config.get("wing_width_steps")      or exit_rule.get("wing_width_steps")   or 2)
+    sq_time           = _parse_time(exit_rule.get("time_exit", "15:25"), default=time(15, 25))
+    capital_amount    = float(config.get("capital", 0))
 
     entry_rule = get_entry_rule(strategy.get("entry_rule_id", "timed_entry"))
 
@@ -124,8 +131,9 @@ async def execute_run(
     straddle_last_prices:  List[Optional[float]] = [None, None]
     straddle_stale:        List[int]             = [0, 0]
 
-    # Wing state (added mid-session on lock)
+    # Wing state (added mid-session on either lock)
     wings_locked         = False
+    lock_reason:          Optional[str]         = None   # "profit" | "loss"
     wing_entry_prices:    List[Optional[float]] = [None, None]
     wing_last_prices:     List[Optional[float]] = [None, None]
     wing_stale:           List[int]             = [0, 0]
@@ -240,27 +248,39 @@ async def execute_run(
 
         net_mtm = gross_mtm_total - entry_charges - wing_entry_charges - est_exit_charges
 
-        # ── Profit lock: buy wings when trigger crossed ───────────────────────
-        if not wings_locked and net_mtm >= lock_trigger:
-            if w_ce_price is not None and w_pe_price is not None:
-                wings_locked       = True
-                wing_entry_prices  = [w_ce_price, w_pe_price]
-                wing_lock_ts       = ts
-                wing_entry_charges = compute_leg_entry_charges(approved_lots, lot_size, wing_legs, wing_entry_prices)
-                # Re-compute net_mtm immediately including wing charges
-                net_mtm -= wing_entry_charges
-                event_rows.append({
-                    "run_id": run_id, "timestamp": ts,
-                    "event_type": "HOLD", "reason_code": "WINGS_LOCKED",
-                    "reason_text": f"Profit lock triggered at {ts.strftime('%H:%M')} — bought wings CE {wing_ce_strike} @ {w_ce_price}, PE {wing_pe_strike} @ {w_pe_price}",
-                    "payload_json": {
-                        "lock_trigger": lock_trigger, "net_mtm_at_lock": round(net_mtm, 2),
-                        "wing_ce": {"strike": wing_ce_strike, "price": w_ce_price},
-                        "wing_pe": {"strike": wing_pe_strike, "price": w_pe_price},
-                    },
-                })
-            else:
-                warnings.append(f"Lock trigger reached at {ts.strftime('%H:%M')} but wing prices unavailable — skipping lock")
+        # ── Lock check: profit lock (up) or loss lock (down) ─────────────────
+        if not wings_locked:
+            profit_lock_hit = lock_trigger > 0 and net_mtm >= lock_trigger
+            loss_lock_hit   = loss_lock_trigger > 0 and net_mtm <= -loss_lock_trigger
+            if profit_lock_hit or loss_lock_hit:
+                if w_ce_price is not None and w_pe_price is not None:
+                    wings_locked       = True
+                    lock_reason        = "profit" if profit_lock_hit else "loss"
+                    wing_entry_prices  = [w_ce_price, w_pe_price]
+                    wing_lock_ts       = ts
+                    wing_entry_charges = compute_leg_entry_charges(approved_lots, lot_size, wing_legs, wing_entry_prices)
+                    net_mtm           -= wing_entry_charges
+                    label = "Profit lock" if profit_lock_hit else "Loss lock (defensive hedge)"
+                    threshold = lock_trigger if profit_lock_hit else -loss_lock_trigger
+                    event_rows.append({
+                        "run_id": run_id, "timestamp": ts,
+                        "event_type": "HOLD", "reason_code": "WINGS_LOCKED",
+                        "reason_text": (
+                            f"{label} triggered at {ts.strftime('%H:%M')} "
+                            f"(net_mtm ₹{round(net_mtm+wing_entry_charges):,} crossed ₹{threshold:,.0f}) — "
+                            f"bought wings CE {wing_ce_strike} @ {w_ce_price}, PE {wing_pe_strike} @ {w_pe_price}"
+                        ),
+                        "payload_json": {
+                            "lock_reason": lock_reason,
+                            "threshold": threshold,
+                            "net_mtm_at_lock": round(net_mtm, 2),
+                            "wing_ce": {"strike": wing_ce_strike, "price": w_ce_price},
+                            "wing_pe": {"strike": wing_pe_strike, "price": w_pe_price},
+                        },
+                    })
+                else:
+                    label = "Profit lock" if profit_lock_hit else "Loss lock"
+                    warnings.append(f"{label} trigger reached at {ts.strftime('%H:%M')} but wing prices unavailable — skipping lock")
 
         # ── Exit conditions ───────────────────────────────────────────────────
         stop_threshold = -(capital_amount * stop_capital_pct) if stop_capital_pct > 0 else -(entry_credit_total * 1.5)
@@ -407,6 +427,7 @@ async def execute_run(
             "warnings": warnings,
             "exit_reason": exit_reason,
             "wings_locked": wings_locked,
+            "lock_reason": lock_reason,
             "wing_lock_ts": wing_lock_ts.isoformat() if wing_lock_ts else None,
         },
     ))

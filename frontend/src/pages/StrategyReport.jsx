@@ -71,6 +71,7 @@ function MonthBarTooltip({ active, payload, label }) {
 function DailyBarTooltip({ active, payload, label }) {
   if (!active || !payload?.length) return null
   const d = payload[0].payload
+  const isLocked = d.wings_locked
   return (
     <div style={{
       background: 'var(--surface-2)', border: '1px solid var(--border)',
@@ -81,6 +82,11 @@ function DailyBarTooltip({ active, payload, label }) {
         {fmtINR(d.pnl, { forceSign: true })}
       </div>
       <div style={{ color: 'var(--text-secondary)', fontSize: 11 }}>{d.exit_reason}</div>
+      {isLocked && (
+        <div style={{ color: d.lock_reason === 'loss' ? '#fb923c' : '#22d3ee', fontSize: 11, marginTop: 3 }}>
+          {d.lock_reason === 'loss' ? '🛡️ Loss lock' : '🔒 Profit lock'} @ {d.lock_time}
+        </div>
+      )}
     </div>
   )
 }
@@ -170,6 +176,75 @@ export default function StrategyReport() {
         <MetricCard label="Worst Day" value={fmtINR(s.worst_day?.pnl, { forceSign: true })} sub={s.worst_day?.date} color="#f87171" />
       </div>
 
+      {/* Profit Lock stats — only shown for straddle_profit_lock strategies */}
+      {s.lock_stats && (() => {
+        const ls = s.lock_stats
+        const lockWinRate = ls.count ? Math.round(ls.wins / ls.count * 100) : 0
+        return (
+          <>
+            <SectionTitle title="Profit Lock Stats" />
+            <div style={{
+              background: 'linear-gradient(135deg, rgba(34,211,238,0.08) 0%, rgba(8,145,178,0.04) 100%)',
+              border: '1px solid rgba(34,211,238,0.25)',
+              borderRadius: 10,
+              padding: '16px 20px',
+            }}>
+              <div style={{ fontSize: 12, color: '#22d3ee', fontWeight: 700, marginBottom: 12, letterSpacing: '0.05em', textTransform: 'uppercase' }}>
+                🔒 OTM Wings Added Mid-Session
+              </div>
+              <div style={{ display: 'flex', gap: 12, flexWrap: 'wrap' }}>
+                <MetricCard
+                  label="Lock Fired"
+                  value={`${ls.count} days`}
+                  sub={`${ls.pct}% of sessions`}
+                  color="#22d3ee"
+                />
+                <MetricCard
+                  label="Win Rate (Locked)"
+                  value={`${lockWinRate}%`}
+                  sub={`${ls.wins}W / ${ls.losses}L`}
+                  color={lockWinRate >= 50 ? '#4ade80' : '#f87171'}
+                />
+                <MetricCard
+                  label="Avg P&L (Locked)"
+                  value={fmtINR(ls.avg_pnl, { forceSign: true })}
+                  sub="when wings added"
+                  color={ls.avg_pnl >= 0 ? '#4ade80' : '#f87171'}
+                />
+                <MetricCard
+                  label="Avg P&L (No Lock)"
+                  value={fmtINR(ls.avg_pnl_no_lock, { forceSign: true })}
+                  sub="plain straddle days"
+                  color={ls.avg_pnl_no_lock >= 0 ? '#4ade80' : '#f87171'}
+                />
+              </div>
+              {(ls.profit_lock_count > 0 || ls.loss_lock_count > 0) && (
+                <div style={{ display: 'flex', gap: 24, marginTop: 14, paddingTop: 12, borderTop: '1px solid rgba(34,211,238,0.15)', fontSize: 12 }}>
+                  {ls.profit_lock_count > 0 && (
+                    <div>
+                      <span style={{ color: '#22d3ee', fontWeight: 700 }}>🔒 Profit Lock</span>
+                      <span style={{ color: 'var(--text-secondary)', marginLeft: 8 }}>
+                        {ls.profit_lock_count} days
+                        {ls.profit_lock_avg_pnl != null && ` · avg ${fmtINR(ls.profit_lock_avg_pnl, { forceSign: true })}`}
+                      </span>
+                    </div>
+                  )}
+                  {ls.loss_lock_count > 0 && (
+                    <div>
+                      <span style={{ color: '#fb923c', fontWeight: 700 }}>🛡️ Loss Lock</span>
+                      <span style={{ color: 'var(--text-secondary)', marginLeft: 8 }}>
+                        {ls.loss_lock_count} days
+                        {ls.loss_lock_avg_pnl != null && ` · avg ${fmtINR(ls.loss_lock_avg_pnl, { forceSign: true })}`}
+                      </span>
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
+          </>
+        )
+      })()}
+
       {/* Cumulative P&L */}
       <SectionTitle title="Cumulative P&L" />
       <div style={{
@@ -238,6 +313,16 @@ export default function StrategyReport() {
 
       {/* Daily P&L bars */}
       <SectionTitle title="Daily P&L" />
+      {s.lock_stats && (
+        <div style={{ display: 'flex', gap: 16, marginBottom: 10, fontSize: 11, color: 'var(--text-secondary)' }}>
+          <span><span style={{ display: 'inline-block', width: 10, height: 10, borderRadius: 2, background: '#4ade80', marginRight: 5 }} />Win</span>
+          <span><span style={{ display: 'inline-block', width: 10, height: 10, borderRadius: 2, background: '#f87171', marginRight: 5 }} />Loss</span>
+          <span><span style={{ display: 'inline-block', width: 10, height: 10, borderRadius: 2, background: '#22d3ee', marginRight: 5 }} />Win + Profit Lock 🔒</span>
+          <span><span style={{ display: 'inline-block', width: 10, height: 10, borderRadius: 2, background: '#0891b2', marginRight: 5 }} />Loss + Profit Lock 🔒</span>
+          <span><span style={{ display: 'inline-block', width: 10, height: 10, borderRadius: 2, background: '#fb923c', marginRight: 5 }} />Win + Loss Lock 🛡️</span>
+          <span><span style={{ display: 'inline-block', width: 10, height: 10, borderRadius: 2, background: '#c2410c', marginRight: 5 }} />Loss + Loss Lock 🛡️</span>
+        </div>
+      )}
       <div style={{
         background: 'var(--surface-2)', border: '1px solid var(--border)',
         borderRadius: 10, padding: '16px 8px',
@@ -255,9 +340,15 @@ export default function StrategyReport() {
             <Tooltip content={<DailyBarTooltip />} />
             <ReferenceLine y={0} stroke="var(--border)" />
             <Bar dataKey="pnl" radius={[2, 2, 0, 0]}>
-              {s.daily_pnl.map((entry, i) => (
-                <Cell key={i} fill={entry.pnl >= 0 ? '#4ade80' : '#f87171'} />
-              ))}
+              {s.daily_pnl.map((entry, i) => {
+                if (entry.wings_locked) {
+                  if (entry.lock_reason === 'loss') {
+                    return <Cell key={i} fill={entry.pnl >= 0 ? '#fb923c' : '#c2410c'} />
+                  }
+                  return <Cell key={i} fill={entry.pnl >= 0 ? '#22d3ee' : '#0891b2'} />
+                }
+                return <Cell key={i} fill={entry.pnl >= 0 ? '#4ade80' : '#f87171'} />
+              })}
             </Bar>
           </BarChart>
         </ResponsiveContainer>

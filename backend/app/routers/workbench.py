@@ -216,11 +216,19 @@ async def get_strategy_dashboard(
         for r in sruns:
             pnl = float(r.realized_net_pnl or 0)
             cum += pnl
+            result_json = r.result_json or {}
+            wings_locked = result_json.get("wings_locked", False)
+            lock_reason_val = result_json.get("lock_reason")   # "profit" | "loss" | None
+            lock_ts = result_json.get("wing_lock_ts")
+            lock_time = lock_ts[11:16] if lock_ts else None  # "HH:MM" from ISO string
             daily.append({
                 "date": r.trade_date.isoformat(),
                 "pnl": round(pnl, 2),
                 "cumulative_pnl": round(cum, 2),
                 "exit_reason": r.exit_reason or "TIME_EXIT",
+                "wings_locked": wings_locked,
+                "lock_reason": lock_reason_val,
+                "lock_time": lock_time,
             })
             if pnl > 0:
                 wins += 1
@@ -244,6 +252,24 @@ async def get_strategy_dashboard(
                 monthly[mkey]["losses"] += 1
 
         total = wins + losses
+        locked_days   = [d for d in daily if d.get("wings_locked")]
+        unlocked_days = [d for d in daily if not d.get("wings_locked")]
+        profit_locked = [d for d in locked_days if d.get("lock_reason") == "profit"]
+        loss_locked   = [d for d in locked_days if d.get("lock_reason") == "loss"]
+        lock_stats = None
+        if locked_days:
+            lock_stats = {
+                "count": len(locked_days),
+                "pct": round(len(locked_days) / len(daily) * 100, 1) if daily else 0,
+                "avg_pnl": round(sum(d["pnl"] for d in locked_days) / len(locked_days), 0),
+                "avg_pnl_no_lock": round(sum(d["pnl"] for d in unlocked_days) / len(unlocked_days), 0) if unlocked_days else 0,
+                "wins": sum(1 for d in locked_days if d["pnl"] > 0),
+                "losses": sum(1 for d in locked_days if d["pnl"] <= 0),
+                "profit_lock_count": len(profit_locked),
+                "loss_lock_count": len(loss_locked),
+                "profit_lock_avg_pnl": round(sum(d["pnl"] for d in profit_locked) / len(profit_locked), 0) if profit_locked else None,
+                "loss_lock_avg_pnl": round(sum(d["pnl"] for d in loss_locked) / len(loss_locked), 0) if loss_locked else None,
+            }
         results.append({
             "strategy_id": sid,
             "strategy_name": name,
@@ -256,6 +282,7 @@ async def get_strategy_dashboard(
             "avg_loss": round(loss_total / losses, 2) if losses else 0,
             "best_day": best,
             "worst_day": worst,
+            "lock_stats": lock_stats,
             "date_range": {
                 "from": sruns[0].trade_date.isoformat(),
                 "to": sruns[-1].trade_date.isoformat(),
