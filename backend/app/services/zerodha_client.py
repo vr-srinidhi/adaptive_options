@@ -227,6 +227,66 @@ def get_instruments_with_token(access_token: str, segment: str = "NFO") -> List[
     return instruments
 
 
+# ── Live quote helpers ────────────────────────────────────────────────────────
+
+# Well-known spot symbols for kite.quote()
+SPOT_SYMBOLS: Dict[str, str] = {
+    "NIFTY":     "NSE:NIFTY 50",
+    "BANKNIFTY": "NSE:NIFTY BANK",
+}
+
+
+def fetch_live_quote(symbols: List[str], access_token: str) -> Dict[str, float]:
+    """
+    Fetch current LTP for each Zerodha trading symbol.
+
+    symbols: e.g. ["NSE:NIFTY 50", "NFO:NIFTY25MAY24CE24300"]
+    Returns {symbol: last_price}.  Missing symbols are omitted from the result.
+    """
+    if not API_KEY:
+        raise RuntimeError("ZERODHA_API_KEY environment variable is not set.")
+    kite = KiteConnect(api_key=API_KEY)
+    kite.set_access_token(access_token)
+    try:
+        data = kite.quote(symbols)
+        return {sym: float(data[sym]["last_price"]) for sym in symbols if sym in data}
+    except Exception as exc:
+        log.warning("fetch_live_quote failed for %s: %s", symbols, exc)
+        raise
+
+
+def find_option_symbol(
+    instruments: List[Dict],
+    name: str,
+    expiry: "date",
+    option_type: str,
+    strike: int,
+) -> Optional[str]:
+    """
+    Return the NFO trading symbol string for a specific option contract, or None.
+
+    name:        "NIFTY" or "BANKNIFTY"
+    expiry:      datetime.date of the contract expiry
+    option_type: "CE" or "PE"
+    strike:      integer strike price
+
+    The returned symbol can be used directly with fetch_live_quote():
+        "NFO:NIFTY25MAY24CE24300"
+    """
+    for row in instruments:
+        row_expiry = row.get("expiry")
+        if hasattr(row_expiry, "date"):
+            row_expiry = row_expiry.date()
+        if (
+            row.get("name") == name
+            and row_expiry == expiry
+            and row.get("instrument_type") == option_type
+            and int(row.get("strike", -1)) == strike
+        ):
+            return f"NFO:{row['tradingsymbol']}"
+    return None
+
+
 # ── Custom exceptions ─────────────────────────────────────────────────────────
 
 class DataUnavailableError(Exception):

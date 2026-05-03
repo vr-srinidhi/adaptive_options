@@ -1,0 +1,843 @@
+"""
+Live Paper Trading Engine
+
+Runs entirely server-side as an asyncio background task (no UI involvement).
+Strategy: Short Straddle with Dual Lock (straddle_adjustment_v1 logic).
+
+Flow
+----
+09:14  Fetch Zerodha instruments master; create StrategyRun row (status in_progress);
+       update LivePaperSession status → waiting.
+09:14–09:49  Poll spot every minute; record to waiting_spot_json.
+09:49  Resolve ATM strike, expiry, option symbols.
+09:50+  Fetch live CE/PE prices each minute; execute dual-lock strategy logic;
+        write StrategyRunMtm + events incrementally; broadcast via SSE queue.
+Exit   Finalize StrategyRun; update LivePaperSession status → exited/no_trade/error.
+
+Recovery: if the process restarts mid-day, scheduler.py calls
+check_and_resume_sessions() on startup which re-launches interrupted sessions.
+"""
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import uuid
+from asyncio import Queue
+from datetime import date, datetime, time, timedelta
+from typing import Any, Dict, List, Optional
+from zoneinfo import ZoneInfo
+
+from sqlalchemy import select, update
+
+from app.database import AsyncSessionLocal
+from app.models.live_paper import LivePaperConfig, LivePaperSession
+from app.models.strategy_run import (
+    StrategyRun, StrategyRunEvent, StrategyRunLeg, StrategyRunMtm,
+)
+from app.services.charges_service import (
+    compute_leg_entry_charges,
+    compute_leg_exit_charges_estimate,
+    compute_leg_total_charges,
+)
+from app.services.contract_spec_service import get_contract_spec, resolve_atm_strike
+from app.services.token_store import get_broker_token
+from app.services.zerodha_client import (
+    SPOT_SYMBOLS, fetch_live_quote, find_option_symbol,
+    get_instruments_with_token,
+)
+
+log = logging.getLogger(__name__)
+
+IST = ZoneInfo("Asia/Kolkata")
+
+_SESSION_START = time(9, 14)
+_SESSION_END   = time(15, 30)
+_RESOLVE_TIME  = time(9, 49)    # resolve ATM strike from live spot at this minute
+_SQ_TIME       = time(15, 25)   # default time exit
+
+# ── SSE broadcast layer ───────────────────────────────────────────────────────
+# One asyncio.Queue per live session.  The SSE endpoint subscribes; the engine
+# publishes.  If no subscriber is connected, messages are silently discarded.
+
+_sse_queues: Dict[uuid.UUID, Queue] = {}
+_active_session_id: Optional[uuid.UUID] = None   # currently running session
+
+
+def get_or_create_sse_queue(session_id: uuid.UUID) -> Queue:
+    if session_id not in _sse_queues:
+        _sse_queues[session_id] = Queue(maxsize=200)
+    return _sse_queues[session_id]
+
+
+def get_active_session_id() -> Optional[uuid.UUID]:
+    return _active_session_id
+
+
+async def _broadcast(session_id: uuid.UUID, data: Dict) -> None:
+    q = _sse_queues.get(session_id)
+    if q:
+        try:
+            q.put_nowait(data)
+        except asyncio.QueueFull:
+            pass  # no listener or listener is slow — drop the message
+
+
+# ── Startup helpers ───────────────────────────────────────────────────────────
+
+async def get_active_config(db) -> Optional[LivePaperConfig]:
+    """Return the first enabled config, or None."""
+    row = (await db.execute(
+        select(LivePaperConfig).where(LivePaperConfig.enabled.is_(True)).limit(1)
+    )).scalar_one_or_none()
+    return row
+
+
+async def get_session_for_date(db, trade_date: date) -> Optional[LivePaperSession]:
+    row = (await db.execute(
+        select(LivePaperSession).where(LivePaperSession.trade_date == trade_date).limit(1)
+    )).scalar_one_or_none()
+    return row
+
+
+async def start_live_session(db) -> None:
+    """
+    Called by the scheduler at 09:14.
+    Creates a LivePaperSession and launches the background engine task.
+    No-op if:
+      - no enabled config found
+      - session already exists for today
+      - no valid Zerodha token
+    """
+    config = await get_active_config(db)
+    if not config:
+        log.info("Live paper: no enabled config, skipping today.")
+        return
+
+    today = date.today()
+    existing = await get_session_for_date(db, today)
+    if existing:
+        log.info("Live paper: session already exists for %s (status=%s).", today, existing.status)
+        return
+
+    # Validate token freshness (Zerodha tokens expire at 6 AM IST daily)
+    if config.user_id:
+        access_token = await get_broker_token(db, config.user_id)
+    else:
+        from app.services.zerodha_client import get_access_token
+        access_token = get_access_token()
+
+    if not access_token:
+        log.warning("Live paper: no Zerodha token — skipping session for %s.", today)
+        return
+
+    session = LivePaperSession(
+        config_id=config.id,
+        user_id=config.user_id,
+        trade_date=today,
+        status="scheduled",
+        waiting_spot_json=[],
+    )
+    db.add(session)
+    await db.commit()
+    await db.refresh(session)
+
+    log.info("Live paper session created: %s for %s", session.id, today)
+    asyncio.create_task(_run_session(session.id, config, access_token))
+
+
+async def check_and_resume_sessions() -> None:
+    """
+    Called at startup to resume any interrupted live sessions from today.
+    An interrupted session has status 'waiting' or 'entered' but no running task.
+    """
+    global _active_session_id
+    if _active_session_id is not None:
+        return  # already running
+
+    today = date.today()
+    async with AsyncSessionLocal() as db:
+        session = await get_session_for_date(db, today)
+        if not session or session.status not in ("waiting", "entered"):
+            return
+
+        config = (await db.execute(
+            select(LivePaperConfig).where(LivePaperConfig.id == session.config_id).limit(1)
+        )).scalar_one_or_none()
+        if not config:
+            return
+
+        if config.user_id:
+            access_token = await get_broker_token(db, config.user_id)
+        else:
+            from app.services.zerodha_client import get_access_token
+            access_token = get_access_token()
+
+        if not access_token:
+            return
+
+    log.info("Live paper: resuming interrupted session %s", session.id)
+    asyncio.create_task(_run_session(session.id, config, access_token, resume=True))
+
+
+# ── Timing helpers ────────────────────────────────────────────────────────────
+
+async def _sleep_until(target: time) -> None:
+    """Sleep until the next wall-clock occurrence of target time (IST)."""
+    now = datetime.now(IST)
+    target_dt = now.replace(
+        hour=target.hour, minute=target.minute, second=0, microsecond=0
+    )
+    if target_dt <= now:
+        return
+    delta = (target_dt - now).total_seconds()
+    await asyncio.sleep(delta)
+
+
+async def _sleep_until_next_minute() -> None:
+    """Sleep until the next :00 wall-clock minute boundary."""
+    now = datetime.now(IST)
+    next_min = (now + timedelta(minutes=1)).replace(second=0, microsecond=0)
+    await asyncio.sleep((next_min - now).total_seconds())
+
+
+# ── Session state helpers ─────────────────────────────────────────────────────
+
+async def _update_session(session_id: uuid.UUID, **fields) -> None:
+    async with AsyncSessionLocal() as db:
+        fields["updated_at"] = datetime.now(IST)
+        await db.execute(
+            update(LivePaperSession)
+            .where(LivePaperSession.id == session_id)
+            .values(**fields)
+        )
+        await db.commit()
+
+
+async def _append_waiting_spot(session_id: uuid.UUID, entry: Dict) -> None:
+    """Append one spot reading to waiting_spot_json."""
+    async with AsyncSessionLocal() as db:
+        session = (await db.execute(
+            select(LivePaperSession).where(LivePaperSession.id == session_id)
+        )).scalar_one_or_none()
+        if session:
+            current = list(session.waiting_spot_json or [])
+            current.append(entry)
+            await db.execute(
+                update(LivePaperSession)
+                .where(LivePaperSession.id == session_id)
+                .values(waiting_spot_json=current, updated_at=datetime.now(IST))
+            )
+            await db.commit()
+
+
+# ── Main engine task ──────────────────────────────────────────────────────────
+
+async def _run_session(
+    session_id: uuid.UUID,
+    config: LivePaperConfig,
+    access_token: str,
+    resume: bool = False,
+) -> None:
+    """
+    Self-driving asyncio task.  Runs from 09:14 to session exit.
+    All DB writes use fresh AsyncSessionLocal() sessions.
+    """
+    global _active_session_id
+    _active_session_id = session_id
+    get_or_create_sse_queue(session_id)
+
+    instrument   = config.instrument
+    capital      = float(config.capital)
+    entry_time   = _parse_time(config.entry_time, default=time(9, 50))
+    params       = dict(config.params_json or {})
+
+    stop_capital_pct  = float(params.get("stop_capital_pct", 0.015))
+    trail_trigger     = float(params.get("trail_trigger", 12_000))
+    trail_pct         = float(params.get("trail_pct", 0.50))
+    lock_trigger      = float(params.get("lock_trigger", 20_000))
+    loss_lock_trigger = float(params.get("loss_lock_trigger", 25_000))
+    wing_steps        = int(params.get("wing_width_steps", 2))
+    sq_time           = _parse_time(params.get("time_exit", "15:25"), default=_SQ_TIME)
+
+    trade_date = date.today()
+
+    try:
+        await _update_session(session_id, status="waiting")
+        await _broadcast(session_id, {"type": "STATUS", "status": "waiting"})
+
+        # Fetch instruments master once (heavy call, ~4k rows)
+        log.info("Live paper: fetching NFO instruments master...")
+        instruments = await asyncio.to_thread(get_instruments_with_token, access_token)
+        log.info("Live paper: loaded %d instruments.", len(instruments))
+
+        # Create StrategyRun row upfront so MTM rows have a valid FK
+        run_id = uuid.uuid4()
+        async with AsyncSessionLocal() as db:
+            db.add(StrategyRun(
+                id=run_id,
+                user_id=config.user_id,
+                strategy_id=config.strategy_id,
+                strategy_version="v1",
+                run_type="live_paper_session",
+                executor="straddle_adjustment_v1",
+                instrument=instrument,
+                trade_date=trade_date,
+                status="in_progress",
+                capital=capital,
+                config_json={**params, "strategy_id": config.strategy_id, "entry_time": config.entry_time},
+                result_json={"live": True},
+            ))
+            await db.commit()
+
+        await _update_session(session_id, strategy_run_id=run_id)
+
+        # ── Pre-entry loop ─────────────────────────────────────────────────────
+        spot_symbol = SPOT_SYMBOLS.get(instrument, "NSE:NIFTY 50")
+
+        # Contract spec (lot_size, strike_step, margin)
+        async with AsyncSessionLocal() as db:
+            spec = await get_contract_spec(db, instrument, trade_date)
+        lot_size   = spec.lot_size
+        strike_step = spec.strike_step
+        margin_per_lot = float(spec.estimated_margin_per_lot or 0) or (24000 * lot_size * 0.12)
+
+        # Engine state (mirrors straddle_adjustment_executor)
+        trade_open            = False
+        straddle_entry_prices: List[Optional[float]] = [None, None]
+        straddle_last_prices:  List[Optional[float]] = [None, None]
+        wings_locked          = False
+        lock_reason: Optional[str] = None
+        wing_entry_prices:    List[Optional[float]] = [None, None]
+        wing_last_prices:     List[Optional[float]] = [None, None]
+        wing_lock_ts: Optional[datetime] = None
+        wing_entry_charges    = 0.0
+        entry_credit_per_unit = 0.0
+        entry_credit_total    = 0.0
+        entry_charges         = 0.0
+        actual_entry_ts: Optional[datetime] = None
+        exit_reason: Optional[str] = None
+        exit_ts: Optional[datetime] = None
+        trail_active   = False
+        trail_peak     = 0.0
+        trail_stop_at_exit: Optional[float] = None
+        approved_lots  = 1
+
+        atm_strike: Optional[int]    = None
+        expiry_date: Optional[date]  = None
+        ce_symbol: Optional[str]     = None
+        pe_symbol: Optional[str]     = None
+        wing_ce_symbol: Optional[str] = None
+        wing_pe_symbol: Optional[str] = None
+        wing_ce_strike: Optional[int] = None
+        wing_pe_strike: Optional[int] = None
+
+        straddle_legs: List = []
+        wing_legs: List     = []
+        straddle_leg_ids    = [uuid.uuid4(), uuid.uuid4()]
+        wing_leg_ids        = [uuid.uuid4(), uuid.uuid4()]
+
+        # ── Main loop ──────────────────────────────────────────────────────────
+        while True:
+            await _sleep_until_next_minute()
+            now = datetime.now(IST)
+            t   = now.time().replace(second=0, microsecond=0)
+
+            if t < _SESSION_START or t >= _SESSION_END:
+                if t >= _SESSION_END:
+                    break
+                continue
+
+            # Fetch spot
+            try:
+                spot_quotes = await asyncio.to_thread(
+                    fetch_live_quote, [spot_symbol], access_token
+                )
+                spot = spot_quotes.get(spot_symbol)
+            except Exception as exc:
+                log.warning("Live paper: spot fetch failed at %s: %s", t, exc)
+                spot = None
+
+            # ── Resolve instruments at 09:49 ──────────────────────────────────
+            if t >= _RESOLVE_TIME and atm_strike is None and spot is not None:
+                atm_strike  = resolve_atm_strike(spot, strike_step)
+                wing_ce_strike = atm_strike + wing_steps * strike_step
+                wing_pe_strike = atm_strike - wing_steps * strike_step
+
+                # Find nearest expiry from instruments master
+                available = sorted(set(
+                    r["expiry"].date() if hasattr(r["expiry"], "date") else r["expiry"]
+                    for r in instruments
+                    if r.get("name") == instrument
+                    and r.get("instrument_type") == "CE"
+                    and (r["expiry"].date() if hasattr(r["expiry"], "date") else r["expiry"]) >= trade_date
+                ))
+                expiry_date = available[0] if available else None
+
+                if expiry_date:
+                    ce_symbol       = find_option_symbol(instruments, instrument, expiry_date, "CE", atm_strike)
+                    pe_symbol       = find_option_symbol(instruments, instrument, expiry_date, "PE", atm_strike)
+                    wing_ce_symbol  = find_option_symbol(instruments, instrument, expiry_date, "CE", wing_ce_strike)
+                    wing_pe_symbol  = find_option_symbol(instruments, instrument, expiry_date, "PE", wing_pe_strike)
+
+                    straddle_legs = [("SELL", "CE", atm_strike), ("SELL", "PE", atm_strike)]
+                    wing_legs     = [("BUY",  "CE", wing_ce_strike), ("BUY", "PE", wing_pe_strike)]
+
+                    approved_lots = max(1, int(capital / margin_per_lot))
+
+                    await _update_session(
+                        session_id,
+                        atm_strike=atm_strike,
+                        expiry_date=expiry_date,
+                        ce_symbol=ce_symbol,
+                        pe_symbol=pe_symbol,
+                        wing_ce_symbol=wing_ce_symbol,
+                        wing_pe_symbol=wing_pe_symbol,
+                        approved_lots=approved_lots,
+                    )
+                    await _broadcast(session_id, {
+                        "type": "RESOLVED",
+                        "timestamp": now.isoformat(),
+                        "atm_strike": atm_strike,
+                        "expiry_date": str(expiry_date),
+                        "approved_lots": approved_lots,
+                        "spot": spot,
+                    })
+                    log.info(
+                        "Live paper: ATM=%d expiry=%s lots=%d CE=%s PE=%s",
+                        atm_strike, expiry_date, approved_lots, ce_symbol, pe_symbol,
+                    )
+                else:
+                    log.error("Live paper: could not find any expiry for %s on %s", instrument, trade_date)
+
+            # Pre-entry: record spot and broadcast waiting update
+            if t < entry_time or atm_strike is None:
+                if spot is not None:
+                    await _append_waiting_spot(
+                        session_id, {"timestamp": now.isoformat(), "spot": spot}
+                    )
+                await _broadcast(session_id, {
+                    "type": "WAITING",
+                    "timestamp": now.isoformat(),
+                    "spot": spot,
+                })
+                continue
+
+            # ── Fetch option prices ────────────────────────────────────────────
+            option_syms = [s for s in [ce_symbol, pe_symbol, wing_ce_symbol, wing_pe_symbol] if s]
+            try:
+                opt_quotes = await asyncio.to_thread(
+                    fetch_live_quote, option_syms, access_token
+                )
+            except Exception as exc:
+                log.warning("Live paper: option fetch failed at %s: %s", t, exc)
+                opt_quotes = {}
+
+            s_ce_price = opt_quotes.get(ce_symbol)
+            s_pe_price = opt_quotes.get(pe_symbol)
+            w_ce_price = opt_quotes.get(wing_ce_symbol)
+            w_pe_price = opt_quotes.get(wing_pe_symbol)
+
+            if s_ce_price is not None: straddle_last_prices[0] = s_ce_price
+            if s_pe_price is not None: straddle_last_prices[1] = s_pe_price
+            if w_ce_price is not None: wing_last_prices[0] = w_ce_price
+            if w_pe_price is not None: wing_last_prices[1] = w_pe_price
+
+            straddle_cur = [s_ce_price, s_pe_price]
+
+            # ── Entry ──────────────────────────────────────────────────────────
+            if not trade_open:
+                if any(p is None for p in straddle_cur):
+                    await _write_event(run_id, now, "HOLD", "MISSING_LEG_PRICE")
+                    await _broadcast(session_id, {"type": "HOLD", "timestamp": now.isoformat(), "reason": "MISSING_LEG_PRICE", "spot": spot})
+                    continue
+
+                trade_open = True
+                actual_entry_ts = now
+                straddle_entry_prices = list(straddle_cur)
+                entry_credit_per_unit = (straddle_entry_prices[0] or 0) + (straddle_entry_prices[1] or 0)
+                entry_credit_total    = entry_credit_per_unit * lot_size * approved_lots
+                entry_charges         = compute_leg_entry_charges(approved_lots, lot_size, straddle_legs, straddle_entry_prices)
+
+                # Persist legs
+                async with AsyncSessionLocal() as db:
+                    for i, ((side, opt_type, strike), leg_id) in enumerate(zip(straddle_legs, straddle_leg_ids)):
+                        db.add(StrategyRunLeg(
+                            id=leg_id, run_id=run_id, leg_index=i,
+                            side=side, option_type=opt_type, strike=strike,
+                            expiry_date=expiry_date,
+                            quantity=lot_size * approved_lots,
+                            entry_price=straddle_entry_prices[i],
+                        ))
+                    await db.commit()
+
+                # Update run entry_time
+                async with AsyncSessionLocal() as db:
+                    await db.execute(
+                        update(StrategyRun)
+                        .where(StrategyRun.id == run_id)
+                        .values(
+                            entry_time=actual_entry_ts.strftime("%H:%M"),
+                            entry_credit_per_unit=round(entry_credit_per_unit, 2),
+                            entry_credit_total=round(entry_credit_total, 2),
+                            lot_size=lot_size,
+                            approved_lots=approved_lots,
+                        )
+                    )
+                    await db.commit()
+
+                await _update_session(session_id, status="entered")
+                await _write_event(run_id, now, "ENTRY", "ENTRY_SCHEDULED", payload={
+                    "spot": spot,
+                    "legs": [
+                        {"side": "SELL", "option_type": "CE", "strike": atm_strike, "price": straddle_entry_prices[0]},
+                        {"side": "SELL", "option_type": "PE", "strike": atm_strike, "price": straddle_entry_prices[1]},
+                    ],
+                })
+                await _broadcast(session_id, {
+                    "type": "ENTRY",
+                    "timestamp": now.isoformat(),
+                    "spot": spot,
+                    "ce_price": straddle_entry_prices[0],
+                    "pe_price": straddle_entry_prices[1],
+                    "entry_credit_total": round(entry_credit_total, 2),
+                    "atm_strike": atm_strike,
+                })
+                log.info("Live paper: ENTERED straddle at %s CE=%.2f PE=%.2f credit=%.0f",
+                         t, straddle_entry_prices[0], straddle_entry_prices[1], entry_credit_total)
+                continue
+
+            # ── Trade open: MTM calculation ────────────────────────────────────
+            straddle_gross = sum(
+                (ep - cp)
+                for ep, cp in zip(straddle_entry_prices, straddle_cur)
+                if ep is not None and cp is not None
+            ) * lot_size * approved_lots
+
+            wing_gross = 0.0
+            if wings_locked:
+                wing_cur = [w_ce_price, w_pe_price]
+                wing_gross = sum(
+                    (cp - ep)
+                    for ep, cp in zip(wing_entry_prices, wing_cur)
+                    if ep is not None and cp is not None
+                ) * lot_size * approved_lots
+
+            gross_mtm = straddle_gross + wing_gross
+
+            if wings_locked:
+                active_legs = straddle_legs + wing_legs
+                all_cur     = list(straddle_cur) + [w_ce_price, w_pe_price]
+                est_exit    = compute_leg_exit_charges_estimate(approved_lots, lot_size, active_legs, all_cur)
+            else:
+                est_exit = compute_leg_exit_charges_estimate(approved_lots, lot_size, straddle_legs, straddle_cur)
+
+            net_mtm = gross_mtm - entry_charges - wing_entry_charges - est_exit
+
+            # ── Lock check ─────────────────────────────────────────────────────
+            if not wings_locked:
+                profit_lock_hit = lock_trigger > 0 and net_mtm >= lock_trigger
+                loss_lock_hit   = loss_lock_trigger > 0 and net_mtm <= -loss_lock_trigger
+                if (profit_lock_hit or loss_lock_hit) and w_ce_price and w_pe_price:
+                    wings_locked      = True
+                    lock_reason       = "profit" if profit_lock_hit else "loss"
+                    wing_entry_prices = [w_ce_price, w_pe_price]
+                    wing_lock_ts      = now
+                    wing_entry_charges = compute_leg_entry_charges(
+                        approved_lots, lot_size, wing_legs, wing_entry_prices
+                    )
+                    net_mtm -= wing_entry_charges
+
+                    # Persist wing legs
+                    async with AsyncSessionLocal() as db:
+                        for i, ((side, opt_type, strike), leg_id) in enumerate(zip(wing_legs, wing_leg_ids)):
+                            db.add(StrategyRunLeg(
+                                id=leg_id, run_id=run_id, leg_index=i + 2,
+                                side=side, option_type=opt_type, strike=[wing_ce_strike, wing_pe_strike][i],
+                                expiry_date=expiry_date,
+                                quantity=lot_size * approved_lots,
+                                entry_price=wing_entry_prices[i],
+                            ))
+                        await db.commit()
+
+                    label = "Profit lock" if profit_lock_hit else "Loss lock"
+                    await _write_event(run_id, now, "HOLD", "WINGS_LOCKED", payload={
+                        "lock_reason": lock_reason,
+                        "net_mtm_at_lock": round(net_mtm, 2),
+                        "wing_ce": {"strike": wing_ce_strike, "price": w_ce_price},
+                        "wing_pe": {"strike": wing_pe_strike, "price": w_pe_price},
+                    })
+                    await _update_session(
+                        session_id,
+                        lock_status=f"{lock_reason}_locked",
+                    )
+                    await _broadcast(session_id, {
+                        "type": "LOCK",
+                        "timestamp": now.isoformat(),
+                        "lock_reason": lock_reason,
+                        "net_mtm": round(net_mtm, 2),
+                        "wing_ce_price": w_ce_price,
+                        "wing_pe_price": w_pe_price,
+                    })
+                    log.info("Live paper: %s fired at %s net_mtm=%.0f", label, t, net_mtm)
+
+            # ── Exit conditions ────────────────────────────────────────────────
+            stop_threshold = -(capital * stop_capital_pct)
+            trail_stop_level: Optional[float] = None
+            if trail_trigger > 0 and trail_pct > 0:
+                if not trail_active and net_mtm >= trail_trigger:
+                    trail_active = True
+                    trail_peak   = net_mtm
+                if trail_active:
+                    if net_mtm > trail_peak:
+                        trail_peak = net_mtm
+                    trail_stop_level = round(trail_peak * trail_pct, 2)
+
+            fired: Optional[str] = None
+            if net_mtm <= stop_threshold:
+                fired = "STOP_EXIT"
+            elif trail_active and trail_stop_level is not None and net_mtm <= trail_stop_level:
+                fired = "TRAIL_EXIT"
+            elif t >= sq_time:
+                fired = "TIME_EXIT"
+
+            # ── Persist MTM row ────────────────────────────────────────────────
+            active_leg_ids    = straddle_leg_ids + (wing_leg_ids if wings_locked else [])
+            active_cur_prices = [s_ce_price, s_pe_price] + ([w_ce_price, w_pe_price] if wings_locked else [])
+            active_entry_p    = straddle_entry_prices + (wing_entry_prices if wings_locked else [])
+            active_sides      = ["SELL", "SELL"] + (["BUY", "BUY"] if wings_locked else [])
+            await _write_mtm(run_id, now, spot, None, gross_mtm, est_exit, net_mtm,
+                             trail_stop_level, fired,
+                             active_leg_ids, active_cur_prices, active_entry_p, active_sides,
+                             lot_size, approved_lots)
+
+            await _update_session(
+                session_id,
+                net_mtm_latest=round(net_mtm, 2),
+                spot_latest=round(spot, 2) if spot else None,
+            )
+            await _broadcast(session_id, {
+                "type": "MTM",
+                "timestamp": now.isoformat(),
+                "spot": spot,
+                "ce_price": s_ce_price,
+                "pe_price": s_pe_price,
+                "net_mtm": round(net_mtm, 2),
+                "gross_mtm": round(gross_mtm, 2),
+                "trail_stop_level": trail_stop_level,
+                "wings_locked": wings_locked,
+                "lock_reason": lock_reason,
+            })
+
+            if fired:
+                exit_reason = fired
+                exit_ts     = now
+                if fired == "TRAIL_EXIT" and trail_stop_level is not None:
+                    trail_stop_at_exit = trail_stop_level
+                await _write_event(run_id, now, fired, fired, payload={
+                    "net_mtm": round(net_mtm, 2), "spot": spot, "wings_locked": wings_locked,
+                })
+                log.info("Live paper: EXIT %s at %s net_mtm=%.0f", fired, t, net_mtm)
+                break
+
+        # ── Finalize ───────────────────────────────────────────────────────────
+        realized_net_pnl: Optional[float] = None
+        gross_pnl:        Optional[float] = None
+        total_charges:    Optional[float] = None
+
+        if trade_open:
+            exit_s = list(straddle_last_prices)
+            straddle_gross_pnl = sum(
+                (ep - xp) * lot_size * approved_lots
+                for ep, xp in zip(straddle_entry_prices, exit_s) if ep and xp
+            )
+            wing_gross_pnl = 0.0
+            if wings_locked:
+                exit_w = list(wing_last_prices)
+                wing_gross_pnl = sum(
+                    (xp - ep) * lot_size * approved_lots
+                    for ep, xp in zip(wing_entry_prices, exit_w) if ep and xp
+                )
+            gross_pnl = straddle_gross_pnl + wing_gross_pnl
+
+            if wings_locked:
+                all_exit_legs   = straddle_legs + wing_legs
+                all_entry_p     = straddle_entry_prices + wing_entry_prices
+                all_exit_p      = list(straddle_last_prices) + list(wing_last_prices)
+            else:
+                all_exit_legs   = straddle_legs
+                all_entry_p     = straddle_entry_prices
+                all_exit_p      = list(straddle_last_prices)
+
+            total_charges = (
+                compute_leg_total_charges(approved_lots, lot_size, all_exit_legs, all_entry_p, all_exit_p)
+                + wing_entry_charges
+            )
+            realized_net_pnl = round(gross_pnl - total_charges, 2)
+
+            if exit_reason == "TRAIL_EXIT" and trail_stop_at_exit is not None:
+                realized_net_pnl = round(trail_stop_at_exit, 2)
+                gross_pnl        = round(trail_stop_at_exit + total_charges, 2)
+
+            # Update exit prices on legs
+            async with AsyncSessionLocal() as db:
+                for i, leg_id in enumerate(straddle_leg_ids):
+                    xp = straddle_last_prices[i]
+                    ep = straddle_entry_prices[i]
+                    await db.execute(
+                        update(StrategyRunLeg)
+                        .where(StrategyRunLeg.id == leg_id)
+                        .values(
+                            exit_price=xp,
+                            gross_leg_pnl=round((ep - xp) * lot_size * approved_lots, 2) if ep and xp else None,
+                        )
+                    )
+                if wings_locked:
+                    for i, leg_id in enumerate(wing_leg_ids):
+                        xp = wing_last_prices[i]
+                        ep = wing_entry_prices[i]
+                        await db.execute(
+                            update(StrategyRunLeg)
+                            .where(StrategyRunLeg.id == leg_id)
+                            .values(
+                                exit_price=xp,
+                                gross_leg_pnl=round((xp - ep) * lot_size * approved_lots, 2) if ep and xp else None,
+                            )
+                        )
+                await db.commit()
+
+        status = "no_trade" if not trade_open else "completed"
+        if not trade_open:
+            exit_reason = exit_reason or "NO_TRADE"
+            await _write_event(
+                run_id,
+                datetime.combine(trade_date, sq_time),
+                "NO_TRADE", exit_reason,
+            )
+
+        # Final update to StrategyRun
+        async with AsyncSessionLocal() as db:
+            await db.execute(
+                update(StrategyRun).where(StrategyRun.id == run_id).values(
+                    status=status,
+                    exit_reason=exit_reason,
+                    exit_time=exit_ts.strftime("%H:%M") if exit_ts else None,
+                    gross_pnl=round(gross_pnl, 2) if gross_pnl is not None else None,
+                    total_charges=round(total_charges, 2) if total_charges is not None else None,
+                    realized_net_pnl=realized_net_pnl,
+                    result_json={
+                        "live": True,
+                        "wings_locked": wings_locked,
+                        "lock_reason": lock_reason,
+                        "wing_lock_ts": wing_lock_ts.isoformat() if wing_lock_ts else None,
+                        "warnings": [],
+                        "exit_reason": exit_reason,
+                    },
+                )
+            )
+            await db.commit()
+
+        await _update_session(
+            session_id,
+            status="exited" if trade_open else "no_trade",
+            exit_reason=exit_reason,
+            realized_net_pnl=realized_net_pnl,
+        )
+        await _broadcast(session_id, {
+            "type": "DONE",
+            "status": "exited" if trade_open else "no_trade",
+            "exit_reason": exit_reason,
+            "realized_net_pnl": realized_net_pnl,
+            "strategy_run_id": str(run_id),
+        })
+        log.info(
+            "Live paper session %s done — status=%s pnl=%s",
+            session_id, status, realized_net_pnl,
+        )
+
+    except Exception as exc:
+        log.exception("Live paper session %s crashed: %s", session_id, exc)
+        await _update_session(session_id, status="error", error_message=str(exc))
+        await _broadcast(session_id, {"type": "ERROR", "message": str(exc)})
+    finally:
+        _active_session_id = None
+
+
+# ── DB write helpers ──────────────────────────────────────────────────────────
+
+async def _write_event(
+    run_id: uuid.UUID,
+    ts: datetime,
+    event_type: str,
+    reason_code: str,
+    payload: Optional[Dict] = None,
+) -> None:
+    async with AsyncSessionLocal() as db:
+        db.add(StrategyRunEvent(
+            run_id=run_id,
+            timestamp=ts,
+            event_type=event_type,
+            reason_code=reason_code,
+            payload_json=payload or {},
+        ))
+        await db.commit()
+
+
+async def _write_mtm(
+    run_id: uuid.UUID,
+    ts: datetime,
+    spot: Optional[float],
+    vix: Optional[float],
+    gross_mtm: float,
+    est_exit: float,
+    net_mtm: float,
+    trail_stop: Optional[float],
+    event_code: Optional[str],
+    # Per-leg data for strategy_leg_mtm rows
+    leg_ids: List[uuid.UUID],
+    leg_cur_prices: List[Optional[float]],
+    leg_entry_prices: List[Optional[float]],
+    leg_sides: List[str],
+    lot_size: int,
+    lots: int,
+) -> None:
+    """Write one StrategyRunMtm aggregate row + one StrategyLegMtm row per active leg."""
+    async with AsyncSessionLocal() as db:
+        db.add(StrategyRunMtm(
+            run_id=run_id,
+            timestamp=ts,
+            spot_close=spot,
+            vix_close=vix,
+            gross_mtm=round(gross_mtm, 2),
+            est_exit_charges=round(est_exit, 2),
+            net_mtm=round(net_mtm, 2),
+            trail_stop_level=trail_stop,
+            event_code=event_code,
+        ))
+        for leg_id, cur_p, ep, side in zip(leg_ids, leg_cur_prices, leg_entry_prices, leg_sides):
+            if ep is None:
+                continue
+            if side == "SELL":
+                leg_pnl = round((ep - (cur_p or ep)) * lot_size * lots, 2) if cur_p else None
+            else:
+                leg_pnl = round(((cur_p or ep) - ep) * lot_size * lots, 2) if cur_p else None
+            from app.models.strategy_run import StrategyLegMtm
+            db.add(StrategyLegMtm(
+                run_id=run_id,
+                leg_id=leg_id,
+                timestamp=ts,
+                price=cur_p,
+                gross_leg_pnl=leg_pnl,
+                stale_minutes=0,
+            ))
+        await db.commit()
+
+
+def _parse_time(s: Any, default: time = time(9, 50)) -> time:
+    if not s:
+        return default
+    try:
+        h, m = str(s).split(":")
+        return time(int(h), int(m))
+    except Exception:
+        return default
