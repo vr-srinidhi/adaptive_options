@@ -142,12 +142,26 @@ export default function WorkspaceHome() {
   return (
     <div style={{ padding: '32px 40px', maxWidth: 1100, margin: '0 auto' }}>
       <div style={{ marginBottom: 28 }}>
-        <h1 style={{ fontSize: 26, fontWeight: 800, color: 'var(--text-primary)', margin: 0 }}>
-          Strategy Dashboard
-        </h1>
-        <p style={{ fontSize: 13, color: 'var(--text-secondary)', marginTop: 4 }}>
-          Cumulative P&L across all backtest sessions. Click a card for the full report.
-        </p>
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start' }}>
+          <div>
+            <h1 style={{ fontSize: 26, fontWeight: 800, color: 'var(--text-primary)', margin: 0 }}>
+              Strategy Dashboard
+            </h1>
+            <p style={{ fontSize: 13, color: 'var(--text-secondary)', marginTop: 4 }}>
+              Cumulative P&L across all backtest sessions. Click a card for the full report.
+            </p>
+          </div>
+          <button
+            onClick={() => navigate('/workbench/compare')}
+            style={{
+              background: 'var(--surface-2)', border: '1px solid var(--border)',
+              color: 'var(--text-primary)', borderRadius: 8, padding: '8px 16px',
+              fontSize: 13, fontWeight: 600, cursor: 'pointer', whiteSpace: 'nowrap',
+            }}
+          >
+            ⚖ Day Compare
+          </button>
+        </div>
       </div>
 
       {!data ? (

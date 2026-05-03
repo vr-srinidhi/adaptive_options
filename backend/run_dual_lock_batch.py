@@ -21,7 +21,7 @@ CONFIG = {
     "entry_time":          "09:50",
     "capital":             2_500_000,
     "lock_trigger":        20_000,   # buy wings when profit reaches ₹20k
-    "loss_lock_trigger":   10_000,   # buy wings when loss reaches ₹10k (defensive)
+    "loss_lock_trigger":   30_000,   # buy wings when loss reaches ₹30k (defensive)
     "wing_width_steps":    2,
     "trail_trigger":       12_000,
     "trail_pct":           0.50,

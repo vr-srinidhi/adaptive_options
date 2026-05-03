@@ -295,6 +295,83 @@ async def get_strategy_dashboard(
     return {"strategies": results}
 
 
+@router.get("/workspace/day-compare")
+async def get_day_compare(
+    date: str = Query(..., description="Trade date YYYY-MM-DD"),
+    strategy_ids: Optional[str] = Query(None, description="Comma-separated strategy IDs to include"),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_active_user),
+):
+    from app.services.workbench_catalog import get_strategy as _cat_get
+    from datetime import date as date_cls
+
+    try:
+        trade_date = date_cls.fromisoformat(date)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid date format — use YYYY-MM-DD")
+
+    selected_ids = [s.strip() for s in strategy_ids.split(",")] if strategy_ids else None
+
+    q = select(StrategyRun).where(
+        StrategyRun.user_id == current_user.id,
+        StrategyRun.trade_date == trade_date,
+        StrategyRun.status == "completed",
+    )
+    if selected_ids:
+        q = q.where(StrategyRun.strategy_id.in_(selected_ids))
+    q = q.order_by(StrategyRun.strategy_id)
+
+    runs = (await db.execute(q)).scalars().all()
+
+    if not runs:
+        return {"date": date, "strategies": []}
+
+    strategies = []
+    for run in runs:
+        cat = _cat_get(run.strategy_id)
+        result_json = run.result_json or {}
+
+        mtm_rows = (await db.execute(
+            select(StrategyRunMtm)
+            .where(StrategyRunMtm.run_id == run.id)
+            .order_by(StrategyRunMtm.timestamp)
+        )).scalars().all()
+
+        mtm_series = [
+            {
+                "t": row.timestamp.strftime("%H:%M"),
+                "net_mtm": float(row.net_mtm) if row.net_mtm is not None else None,
+                "trail_stop": float(row.trail_stop_level) if row.trail_stop_level is not None else None,
+                "event": row.event_code,
+            }
+            for row in mtm_rows
+        ]
+
+        lock_ts = result_json.get("wing_lock_ts")
+        strategies.append({
+            "strategy_id":         run.strategy_id,
+            "strategy_name":       cat["name"] if cat else run.strategy_id,
+            "run_id":              str(run.id),
+            "pnl":                 float(run.realized_net_pnl) if run.realized_net_pnl is not None else None,
+            "gross_pnl":           float(run.gross_pnl) if run.gross_pnl is not None else None,
+            "total_charges":       float(run.total_charges) if run.total_charges is not None else None,
+            "exit_reason":         run.exit_reason,
+            "entry_time":          run.entry_time,
+            "exit_time":           run.exit_time,
+            "lots":                run.approved_lots,
+            "lot_size":            run.lot_size,
+            "capital":             float(run.capital) if run.capital else None,
+            "entry_credit_total":  float(run.entry_credit_total) if run.entry_credit_total else None,
+            "wings_locked":        result_json.get("wings_locked", False),
+            "lock_reason":         result_json.get("lock_reason"),
+            "lock_time":           lock_ts[11:16] if lock_ts else None,
+            "warnings":            result_json.get("warnings", []),
+            "mtm_series":          mtm_series,
+        })
+
+    return {"date": date, "strategies": strategies}
+
+
 @router.get("/strategies")
 async def get_strategies():
     # Catalog metadata is intentionally public so the workbench shell can render

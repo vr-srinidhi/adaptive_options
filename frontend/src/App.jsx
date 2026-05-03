@@ -22,6 +22,7 @@ import ReplayAnalyzer from './pages/ReplayAnalyzer'
 import RunsLibrary from './pages/RunsLibrary'
 import WorkbenchHistoryDetail from './pages/WorkbenchHistoryDetail'
 import StrategyReport from './pages/StrategyReport'
+import DayCompare from './pages/DayCompare'
 
 export default function App() {
   return (
@@ -48,6 +49,7 @@ export default function App() {
                     <Route path="/workbench/history" element={<RunsLibrary />} />
                     <Route path="/workbench/history/:kind/:id" element={<WorkbenchHistoryDetail />} />
                     <Route path="/workbench/report/:strategyId" element={<StrategyReport />} />
+                    <Route path="/workbench/compare" element={<DayCompare />} />
                     {/* Zerodha connect */}
                     <Route path="/zerodha-connect" element={<ZerodhaConnect />} />
                     {/* Backtest module */}
