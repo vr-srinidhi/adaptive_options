@@ -145,8 +145,38 @@ function ReplayLegsTable({ legs, instrument }) {
 
 // ── SpotVix Chart ─────────────────────────────────────────────────────────────
 
+// Reusable pill toggle used across all multi-series charts
+function LegendPill({ label, color, active, onToggle, dash = false }) {
+  return (
+    <button
+      onClick={onToggle}
+      style={{
+        display: 'flex', alignItems: 'center', gap: 5,
+        background: active ? `${color}18` : 'transparent',
+        border: `1px solid ${active ? color + '88' : '#334155'}`,
+        borderRadius: 20, padding: '3px 10px',
+        cursor: 'pointer', fontSize: 11, fontWeight: 600,
+        color: active ? color : '#4a5568',
+        transition: 'all 0.15s',
+        textDecoration: active ? 'none' : 'line-through',
+        opacity: active ? 1 : 0.5,
+      }}
+    >
+      <span style={{
+        display: 'inline-block', width: 16, height: 2, borderRadius: 1,
+        background: active ? (dash ? 'transparent' : color) : '#4a5568',
+        ...(dash && active ? {
+          backgroundImage: `repeating-linear-gradient(90deg, ${color} 0 4px, transparent 4px 7px)`,
+        } : {}),
+      }} />
+      {label}
+    </button>
+  )
+}
+
 function SpotVixChart({ spotData, vixData, entryLabel, exitLabel, exitReason }) {
-  const [showVix, setShowVix] = useState(true)
+  const [showSpot, setShowSpot] = useState(true)
+  const [showVix,  setShowVix]  = useState(true)
 
   const merged = useMemo(() => {
     if (!spotData?.length) return []
@@ -174,35 +204,26 @@ function SpotVixChart({ spotData, vixData, entryLabel, exitLabel, exitReason }) 
   const vixVals = merged.map(r => r.vix).filter(v => v != null)
   const vixLo = vixVals.length ? Math.floor(Math.min(...vixVals) - 2) : 0
   const vixHi = vixVals.length ? Math.ceil(Math.max(...vixVals)  + 2) : 50
+  const hasVix = vixVals.length > 0
 
   return (
     <div className="wb-card p-5">
-      <div className="flex items-center justify-between mb-1 flex-wrap gap-2">
+      <div className="flex items-center justify-between mb-3 flex-wrap gap-2">
         <div className="wb-kicker">NIFTY Spot + India VIX</div>
-        <div className="flex items-center gap-4 text-[10px]" style={{ color: 'var(--text-secondary)' }}>
-          <span className="flex items-center gap-1">
-            <span style={{ display: 'inline-block', width: 18, height: 2, background: '#38bdf8', borderRadius: 1 }} />NIFTY
-          </span>
-          {vixVals.length > 0 && (
-            <button
-              className="flex items-center gap-1 focus:outline-none"
-              onClick={() => setShowVix(v => !v)}
-              style={{ color: showVix ? '#fb923c' : 'var(--text-secondary)', cursor: 'pointer' }}
-            >
-              <span style={{ display: 'inline-block', width: 18, height: 2, background: '#fb923c', opacity: showVix ? 1 : 0.4, borderRadius: 1 }} />VIX {showVix ? '✓' : '○'}
-            </button>
-          )}
-          <span className="flex items-center gap-1">
-            <span style={{ display: 'inline-block', width: 2, height: 12, background: '#22c55e', borderRadius: 1 }} />Entry {entryLabel}
-          </span>
-          <span className="flex items-center gap-1">
-            <span style={{ display: 'inline-block', width: 2, height: 12, background: '#ef4444', borderRadius: 1 }} />Exit {exitLabel}
+        <div className="flex items-center gap-2 flex-wrap">
+          <LegendPill label="NIFTY" color="#38bdf8" active={showSpot} onToggle={() => setShowSpot(v => !v)} />
+          {hasVix && <LegendPill label="VIX" color="#fb923c" active={showVix} onToggle={() => setShowVix(v => !v)} />}
+          <span style={{ fontSize: 10, color: '#4a5568', marginLeft: 4 }}>
+            <span style={{ display: 'inline-block', width: 2, height: 10, background: '#22c55e', borderRadius: 1, verticalAlign: 'middle', marginRight: 3 }} />
+            {entryLabel}
+            <span style={{ display: 'inline-block', width: 2, height: 10, background: '#ef4444', borderRadius: 1, verticalAlign: 'middle', marginLeft: 8, marginRight: 3 }} />
+            {exitLabel}
           </span>
         </div>
       </div>
-      <div className="mt-3" style={{ height: 280 }}>
+      <div style={{ height: 280 }}>
         <ResponsiveContainer width="100%" height="100%">
-          <LineChart data={merged} margin={{ top: 8, right: 56, left: 8, bottom: 0 }}>
+          <LineChart data={merged} margin={{ top: 8, right: showVix && hasVix ? 56 : 16, left: 8, bottom: 0 }}>
             <CartesianGrid strokeDasharray="3 3" stroke="#213047" vertical={false} />
             <XAxis dataKey="label" tick={{ fill: '#8090aa', fontSize: 10 }} tickLine={false} axisLine={{ stroke: '#27364b' }} interval={29} />
             <YAxis
@@ -210,10 +231,9 @@ function SpotVixChart({ spotData, vixData, entryLabel, exitLabel, exitReason }) 
               tick={{ fill: '#8090aa', fontSize: 10 }} tickLine={false} axisLine={false}
               width={82} tickFormatter={v => fmtNumber(v, 0)} domain={[spotLo, spotHi]}
             />
-            {showVix && vixVals.length > 0 && (
+            {showVix && hasVix && (
               <YAxis
-                yAxisId="vix"
-                orientation="right"
+                yAxisId="vix" orientation="right"
                 tick={{ fill: '#fb923c', fontSize: 10 }} tickLine={false} axisLine={false}
                 width={44} tickFormatter={v => v?.toFixed(1)} domain={[vixLo, vixHi]}
               />
@@ -221,7 +241,7 @@ function SpotVixChart({ spotData, vixData, entryLabel, exitLabel, exitReason }) 
             <Tooltip
               formatter={(value, name) => {
                 if (name === 'spot') return [fmtNumber(value, 1), 'NIFTY']
-                if (name === 'vix') return [value?.toFixed(2), 'VIX']
+                if (name === 'vix')  return [value?.toFixed(2), 'VIX']
                 return [value, name]
               }}
               contentStyle={{ background: '#0f1726', border: '1px solid #27364b', borderRadius: 12, fontSize: 11 }}
@@ -237,10 +257,8 @@ function SpotVixChart({ spotData, vixData, entryLabel, exitLabel, exitReason }) 
                 <Label value="OUT" position="insideTopLeft" fill="#ef4444" fontSize={10} fontWeight={700} />
               </ReferenceLine>
             )}
-            <Line yAxisId="spot" type="monotone" dataKey="spot" stroke="#38bdf8" strokeWidth={1.5} dot={false} />
-            {showVix && vixVals.length > 0 && (
-              <Line yAxisId="vix" type="monotone" dataKey="vix" stroke="#fb923c" strokeWidth={1.5} dot={false} connectNulls />
-            )}
+            {showSpot && <Line yAxisId="spot" type="monotone" dataKey="spot" stroke="#38bdf8" strokeWidth={1.5} dot={false} />}
+            {showVix && hasVix && <Line yAxisId="vix" type="monotone" dataKey="vix" stroke="#fb923c" strokeWidth={1.5} dot={false} connectNulls />}
           </LineChart>
         </ResponsiveContainer>
       </div>
@@ -251,7 +269,23 @@ function SpotVixChart({ spotData, vixData, entryLabel, exitLabel, exitReason }) 
 // ── MTM By Leg Chart ──────────────────────────────────────────────────────────
 
 function MtmByLegChart({ data, showTrail, showShadow, showCePe, entryLabel, exitLabel }) {
-  const [showCePeLines, setShowCePeLines] = useState(showCePe)
+  // Individual visibility toggles — each series can be shown/hidden independently
+  const [vis, setVis] = useState({
+    net_mtm:    true,
+    ce_mtm:     showCePe,
+    pe_mtm:     showCePe,
+    trail_stop: showTrail,
+    shadow_mtm: showShadow,
+  })
+  const toggle = key => setVis(v => ({ ...v, [key]: !v[key] }))
+
+  const SERIES = [
+    { key: 'net_mtm',    label: 'Net MTM', color: '#36b37e', dash: null,    width: 2,   always: true },
+    { key: 'ce_mtm',     label: 'CE',      color: '#fbbf24', dash: null,    width: 1.5, always: false, need: showCePe },
+    { key: 'pe_mtm',     label: 'PE',      color: '#67e8f9', dash: null,    width: 1.5, always: false, need: showCePe },
+    { key: 'trail_stop', label: 'Trail',   color: '#f59e0b', dash: '5 3',   width: 1.5, always: false, need: showTrail },
+    { key: 'shadow_mtm', label: 'If held', color: '#a78bfa', dash: '6 3',   width: 1.5, always: false, need: showShadow },
+  ].filter(s => s.always || s.need)
 
   if (!data?.length) {
     return (
@@ -263,11 +297,7 @@ function MtmByLegChart({ data, showTrail, showShadow, showCePe, entryLabel, exit
   }
 
   const allVals = [
-    ...data.map(r => r.net_mtm).filter(v => v != null),
-    ...data.map(r => r.trail_stop).filter(v => v != null),
-    ...data.map(r => r.shadow_mtm).filter(v => v != null),
-    ...(showCePeLines ? data.map(r => r.ce_mtm).filter(v => v != null) : []),
-    ...(showCePeLines ? data.map(r => r.pe_mtm).filter(v => v != null) : []),
+    ...SERIES.flatMap(s => vis[s.key] ? data.map(r => r[s.key]).filter(v => v != null) : []),
     0,
   ]
   const lo = Math.floor(Math.min(...allVals) / 1000) * 1000
@@ -275,26 +305,16 @@ function MtmByLegChart({ data, showTrail, showShadow, showCePe, entryLabel, exit
 
   return (
     <div className="wb-card p-5">
-      <div className="flex items-center justify-between mb-1 flex-wrap gap-2">
+      <div className="flex items-center justify-between mb-3 flex-wrap gap-2">
         <div className="wb-kicker">MTM by leg</div>
-        <div className="flex items-center gap-3 text-[10px] flex-wrap" style={{ color: 'var(--text-secondary)' }}>
-          <span className="flex items-center gap-1"><span style={{ display: 'inline-block', width: 18, height: 2, background: '#36b37e', borderRadius: 1 }} />Net MTM</span>
-          {showCePe && (
-            <button
-              className="flex items-center gap-1 focus:outline-none"
-              onClick={() => setShowCePeLines(v => !v)}
-              style={{ color: showCePeLines ? 'var(--text-secondary)' : 'var(--text-secondary)', cursor: 'pointer' }}
-            >
-              <span style={{ display: 'inline-block', width: 18, height: 2, background: '#fbbf24', opacity: showCePeLines ? 1 : 0.4, borderRadius: 1 }} />CE
-              <span style={{ display: 'inline-block', width: 18, height: 2, background: '#67e8f9', opacity: showCePeLines ? 1 : 0.4, borderRadius: 1, marginLeft: 4 }} />PE
-              {showCePeLines ? ' ✓' : ' ○'}
-            </button>
-          )}
-          {showTrail  && <span className="flex items-center gap-1"><span style={{ display: 'inline-block', width: 18, height: 2, background: '#f59e0b', borderRadius: 1 }} />Trail</span>}
-          {showShadow && <span className="flex items-center gap-1"><span style={{ display: 'inline-block', width: 18, height: 2, background: '#a78bfa', borderRadius: 1 }} />If held</span>}
+        {/* Clickable legend pills */}
+        <div className="flex items-center gap-2 flex-wrap">
+          {SERIES.map(s => (
+            <LegendPill key={s.key} label={s.label} color={s.color} active={vis[s.key]} onToggle={() => toggle(s.key)} dash={!!s.dash} />
+          ))}
         </div>
       </div>
-      <div className="mt-3" style={{ height: 280 }}>
+      <div style={{ height: 280 }}>
         <ResponsiveContainer width="100%" height="100%">
           <LineChart data={data} margin={{ top: 8, right: 16, left: 8, bottom: 0 }}>
             <CartesianGrid strokeDasharray="3 3" stroke="#213047" vertical={false} />
@@ -303,7 +323,7 @@ function MtmByLegChart({ data, showTrail, showShadow, showCePe, entryLabel, exit
             <Tooltip
               formatter={(value, name) => {
                 if (value == null) return null
-                const labels = { net_mtm: 'Net MTM', trail_stop: 'Trail stop', shadow_mtm: 'If held', ce_mtm: 'CE MTM', pe_mtm: 'PE MTM' }
+                const labels = { net_mtm: 'Net MTM', trail_stop: 'Trail stop', shadow_mtm: 'If held', ce_mtm: 'CE', pe_mtm: 'PE' }
                 return [fmtINR(value), labels[name] || name]
               }}
               contentStyle={{ background: '#0f1726', border: '1px solid #27364b', borderRadius: 12, fontSize: 11 }}
@@ -320,19 +340,19 @@ function MtmByLegChart({ data, showTrail, showShadow, showCePe, entryLabel, exit
                 <Label value="OUT" position="insideTopLeft" fill="#ef4444" fontSize={10} fontWeight={700} />
               </ReferenceLine>
             )}
-            <Line type="monotone" dataKey="net_mtm" stroke="#36b37e" strokeWidth={2} dot={false} connectNulls={false} />
-            {showCePeLines && (
-              <Line type="monotone" dataKey="ce_mtm" stroke="#fbbf24" strokeWidth={1.5} dot={false} connectNulls={false} strokeOpacity={0.9} />
-            )}
-            {showCePeLines && (
-              <Line type="monotone" dataKey="pe_mtm" stroke="#67e8f9" strokeWidth={1.5} dot={false} connectNulls={false} strokeOpacity={0.9} />
-            )}
-            {showTrail && (
-              <Line type="monotone" dataKey="trail_stop" stroke="#f59e0b" strokeWidth={1.5} strokeDasharray="5 3" dot={false} connectNulls={false} />
-            )}
-            {showShadow && (
-              <Line type="monotone" dataKey="shadow_mtm" stroke="#a78bfa" strokeWidth={1.5} strokeDasharray="6 3" dot={false} connectNulls={false} strokeOpacity={0.8} />
-            )}
+            {SERIES.map(s => vis[s.key] && (
+              <Line
+                key={s.key}
+                type="monotone"
+                dataKey={s.key}
+                stroke={s.color}
+                strokeWidth={s.width}
+                strokeDasharray={s.dash || undefined}
+                dot={false}
+                connectNulls={false}
+                strokeOpacity={0.9}
+              />
+            ))}
           </LineChart>
         </ResponsiveContainer>
       </div>
@@ -599,10 +619,9 @@ function StrategyRunAnalyzer({ payload, kind, id, navigate }) {
   const hasCePe   = chartMtm.some(r => r.ce_mtm != null || r.pe_mtm != null)
 
   // ── Premium chart data per leg ────────────────────────────────────────────
-  const ceLeg = legs.find(l => l.option_type === 'CE')
-  const peLeg = legs.find(l => l.option_type === 'PE')
-  const ceCandles = legCandles[String(ceLeg?.leg_index)] || []
-  const peCandles = legCandles[String(peLeg?.leg_index)] || []
+  const premiumLegs = legs
+    .map(leg => ({ leg, candles: legCandles[String(leg.leg_index)] || [] }))
+    .filter(item => item.candles.length > 0)
 
   const tone = runStatusTone(run.status)
   const pnl  = run.realized_net_pnl
@@ -679,28 +698,19 @@ function StrategyRunAnalyzer({ payload, kind, id, navigate }) {
       </section>
 
       {/* ── Premium charts ── */}
-      {(ceCandles.length > 0 || peCandles.length > 0) && (
+      {premiumLegs.length > 0 && (
         <section className="wb-grid wb-grid-2 mt-6 print-section">
-          {ceCandles.length > 0 && ceLeg && (
+          {premiumLegs.map(({ leg, candles }) => (
             <PremiumChart
-              title={`CE Premium — ${run.instrument} ${ceLeg.strike} CE`}
-              data={ceCandles}
-              entryPrice={ceLeg.entry_price}
-              exitPrice={ceLeg.exit_price}
+              key={leg.leg_index}
+              title={`${leg.side} ${leg.option_type} Premium — ${run.instrument} ${leg.strike} ${leg.option_type}`}
+              data={candles}
+              entryPrice={leg.entry_price}
+              exitPrice={leg.exit_price}
               entryLabel={entryLabel}
               exitLabel={exitLabel}
             />
-          )}
-          {peCandles.length > 0 && peLeg && (
-            <PremiumChart
-              title={`PE Premium — ${run.instrument} ${peLeg.strike} PE`}
-              data={peCandles}
-              entryPrice={peLeg.entry_price}
-              exitPrice={peLeg.exit_price}
-              entryLabel={entryLabel}
-              exitLabel={exitLabel}
-            />
-          )}
+          ))}
         </section>
       )}
 

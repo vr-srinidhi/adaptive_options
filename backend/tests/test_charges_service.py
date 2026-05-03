@@ -6,6 +6,9 @@ All math is deterministic — no DB, no external dependencies.
 from app.services.charges_service import (
     compute_entry_charges,
     compute_exit_charges_estimate,
+    compute_leg_entry_charges,
+    compute_leg_exit_charges_estimate,
+    compute_leg_total_charges,
     compute_total_charges,
 )
 
@@ -72,3 +75,41 @@ def test_entry_charges_two_legs():
 def test_charges_rounded_to_two_decimals():
     c = compute_entry_charges(2, 75, [123.45])
     assert round(c, 2) == c
+
+
+def test_mixed_leg_entry_charges_include_buy_wings():
+    legs = [
+        ("SELL", "CE", 22400),
+        ("SELL", "PE", 22400),
+        ("BUY", "CE", 22500),
+        ("BUY", "PE", 22300),
+    ]
+    mixed = compute_leg_entry_charges(1, 75, legs, [100.0, 100.0, 40.0, 40.0])
+    short_only = compute_entry_charges(1, 75, [100.0, 100.0])
+    assert mixed > short_only
+
+
+def test_mixed_leg_exit_charges_treat_long_legs_as_sell_orders():
+    legs = [
+        ("SELL", "CE", 22400),
+        ("SELL", "PE", 22400),
+        ("BUY", "CE", 22500),
+        ("BUY", "PE", 22300),
+    ]
+    exit_est = compute_leg_exit_charges_estimate(1, 75, legs, [80.0, 90.0, 30.0, 45.0])
+    assert exit_est > 0
+
+
+def test_mixed_leg_total_charges_round_trip():
+    legs = [
+        ("SELL", "CE", 22400),
+        ("SELL", "PE", 22400),
+        ("BUY", "CE", 22500),
+        ("BUY", "PE", 22300),
+    ]
+    total = compute_leg_total_charges(
+        1, 75, legs,
+        [100.0, 100.0, 40.0, 40.0],
+        [80.0, 90.0, 30.0, 45.0],
+    )
+    assert total > compute_leg_entry_charges(1, 75, legs, [100.0, 100.0, 40.0, 40.0])

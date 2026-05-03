@@ -21,7 +21,18 @@ def test_strategy_catalog_contains_orb_executor():
 def test_supported_strategy_ids_only_exposes_available_entries():
     supported = supported_strategy_ids()
     assert "orb_intraday_spread" in supported
+    assert "iron_butterfly" in supported
     assert "buy_call" not in supported
+
+
+def test_iron_butterfly_catalog_is_executable_four_leg_strategy():
+    strategy = get_strategy("iron_butterfly")
+    assert strategy["status"] == "available"
+    assert strategy["executor"] == "generic_v1"
+    assert strategy["modes"] == ["single_session_backtest"]
+    assert len(strategy["leg_template"]) == 4
+    assert strategy["sizing"]["model"] == "defined_risk_credit"
+    assert strategy["sizing"]["margin_floor_per_lot"] == 100000
 
 
 def test_get_strategy_returns_copy_not_shared_reference():

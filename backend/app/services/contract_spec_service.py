@@ -230,17 +230,31 @@ def resolve_leg_strikes(
     leg_template: list,
     atm_strike: int,
     strike_step: int,
+    config: dict | None = None,
 ) -> List[Tuple[str, str, int]]:
     """
     Resolve concrete (side, option_type, strike) tuples from a leg template.
 
-    leg_template entry: {"side": "SELL", "option_type": "CE", "strike_offset_steps": 0}
+    leg_template entry:
+      {"side": "SELL", "option_type": "CE", "strike_offset_steps": 0}
+      {"side": "BUY", "option_type": "CE", "strike_offset_steps_from_config": "wing_width_steps"}
+
     strike_offset_steps=0  → ATM
     strike_offset_steps=-2 → ATM - 2 × strike_step
+    strike_offset_steps_from_config lets catalog strategies expose configurable wings.
     """
+    config = config or {}
     resolved = []
     for leg in leg_template:
-        offset = leg.get("strike_offset_steps", 0)
+        if leg.get("strike_offset_steps_from_config"):
+            raw_offset = config.get(leg["strike_offset_steps_from_config"], leg.get("default_strike_offset_steps", 0))
+            try:
+                offset = int(raw_offset)
+            except (TypeError, ValueError):
+                offset = int(leg.get("default_strike_offset_steps", 0))
+            offset *= int(leg.get("strike_offset_sign", 1))
+        else:
+            offset = int(leg.get("strike_offset_steps", 0))
         strike = atm_strike + offset * strike_step
         resolved.append((leg["side"], leg["option_type"], strike))
     return resolved

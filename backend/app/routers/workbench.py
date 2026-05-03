@@ -14,7 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.database import get_db
 from app.dependencies.auth import get_current_active_user
 from app.models.historical import OptionsCandle, SessionBatch, SpotCandle, TradingDay, VixCandle
-from app.services.charges_service import compute_entry_charges, compute_exit_charges_estimate
+from app.services.charges_service import compute_leg_entry_charges, compute_leg_exit_charges_estimate
 from app.models.paper_trade import (
     MinuteDecision,
     PaperCandleSeries,
@@ -34,6 +34,10 @@ from app.models.user import User
 from app.services import zerodha_client
 from app.services.audit import log_event
 from app.services.generic_executor import execute_run, validate_run
+from app.services.straddle_adjustment_executor import (
+    execute_run as sa_execute_run,
+    validate_run as sa_validate_run,
+)
 from app.services.paper_engine import run_paper_engine
 from app.services.strategy_config import (
     WORKBENCH_STRATEGY_ID,
@@ -173,6 +177,199 @@ async def get_workspace_summary(
     current_user: User = Depends(get_current_active_user),
 ):
     return await _build_workspace_summary(current_user, db)
+
+
+@router.get("/workspace/strategy-dashboard")
+async def get_strategy_dashboard(
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_active_user),
+):
+    from app.services.workbench_catalog import get_strategy as _cat_get
+
+    rows = (await db.execute(
+        select(StrategyRun)
+        .where(
+            StrategyRun.user_id == current_user.id,
+            StrategyRun.status == "completed",
+        )
+        .order_by(StrategyRun.trade_date)
+    )).scalars().all()
+
+    # Group by strategy_id
+    by_strategy: dict[str, list] = defaultdict(list)
+    for r in rows:
+        by_strategy[r.strategy_id].append(r)
+
+    results = []
+    for sid, sruns in by_strategy.items():
+        cat = _cat_get(sid)
+        name = cat["name"] if cat else sid
+
+        daily = []
+        cum = 0.0
+        wins = losses = 0
+        win_total = loss_total = 0.0
+        best = worst = None
+
+        monthly: dict[str, dict] = {}
+
+        for r in sruns:
+            pnl = float(r.realized_net_pnl or 0)
+            cum += pnl
+            result_json = r.result_json or {}
+            wings_locked = result_json.get("wings_locked", False)
+            lock_reason_val = result_json.get("lock_reason")   # "profit" | "loss" | None
+            lock_ts = result_json.get("wing_lock_ts")
+            lock_time = lock_ts[11:16] if lock_ts else None  # "HH:MM" from ISO string
+            daily.append({
+                "date": r.trade_date.isoformat(),
+                "pnl": round(pnl, 2),
+                "cumulative_pnl": round(cum, 2),
+                "exit_reason": r.exit_reason or "TIME_EXIT",
+                "wings_locked": wings_locked,
+                "lock_reason": lock_reason_val,
+                "lock_time": lock_time,
+            })
+            if pnl > 0:
+                wins += 1
+                win_total += pnl
+            else:
+                losses += 1
+                loss_total += pnl
+            if best is None or pnl > best["pnl"]:
+                best = {"date": r.trade_date.isoformat(), "pnl": round(pnl, 2)}
+            if worst is None or pnl < worst["pnl"]:
+                worst = {"date": r.trade_date.isoformat(), "pnl": round(pnl, 2)}
+
+            mkey = r.trade_date.strftime("%Y-%m")
+            if mkey not in monthly:
+                monthly[mkey] = {"month": mkey, "pnl": 0.0, "wins": 0, "losses": 0, "runs": 0}
+            monthly[mkey]["pnl"] = round(monthly[mkey]["pnl"] + pnl, 2)
+            monthly[mkey]["runs"] += 1
+            if pnl > 0:
+                monthly[mkey]["wins"] += 1
+            else:
+                monthly[mkey]["losses"] += 1
+
+        total = wins + losses
+        locked_days   = [d for d in daily if d.get("wings_locked")]
+        unlocked_days = [d for d in daily if not d.get("wings_locked")]
+        profit_locked = [d for d in locked_days if d.get("lock_reason") == "profit"]
+        loss_locked   = [d for d in locked_days if d.get("lock_reason") == "loss"]
+        lock_stats = None
+        if locked_days:
+            lock_stats = {
+                "count": len(locked_days),
+                "pct": round(len(locked_days) / len(daily) * 100, 1) if daily else 0,
+                "avg_pnl": round(sum(d["pnl"] for d in locked_days) / len(locked_days), 0),
+                "avg_pnl_no_lock": round(sum(d["pnl"] for d in unlocked_days) / len(unlocked_days), 0) if unlocked_days else 0,
+                "wins": sum(1 for d in locked_days if d["pnl"] > 0),
+                "losses": sum(1 for d in locked_days if d["pnl"] <= 0),
+                "profit_lock_count": len(profit_locked),
+                "loss_lock_count": len(loss_locked),
+                "profit_lock_avg_pnl": round(sum(d["pnl"] for d in profit_locked) / len(profit_locked), 0) if profit_locked else None,
+                "loss_lock_avg_pnl": round(sum(d["pnl"] for d in loss_locked) / len(loss_locked), 0) if loss_locked else None,
+            }
+        results.append({
+            "strategy_id": sid,
+            "strategy_name": name,
+            "total_runs": total,
+            "wins": wins,
+            "losses": losses,
+            "net_pnl": round(cum, 2),
+            "win_rate": round(wins / total * 100, 1) if total else 0,
+            "avg_win": round(win_total / wins, 2) if wins else 0,
+            "avg_loss": round(loss_total / losses, 2) if losses else 0,
+            "best_day": best,
+            "worst_day": worst,
+            "lock_stats": lock_stats,
+            "date_range": {
+                "from": sruns[0].trade_date.isoformat(),
+                "to": sruns[-1].trade_date.isoformat(),
+            },
+            "monthly_pnl": sorted(monthly.values(), key=lambda x: x["month"]),
+            "daily_pnl": daily,
+        })
+
+    results.sort(key=lambda x: x["total_runs"], reverse=True)
+    return {"strategies": results}
+
+
+@router.get("/workspace/day-compare")
+async def get_day_compare(
+    date: str = Query(..., description="Trade date YYYY-MM-DD"),
+    strategy_ids: Optional[str] = Query(None, description="Comma-separated strategy IDs to include"),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_active_user),
+):
+    from app.services.workbench_catalog import get_strategy as _cat_get
+    from datetime import date as date_cls
+
+    try:
+        trade_date = date_cls.fromisoformat(date)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid date format — use YYYY-MM-DD")
+
+    selected_ids = [s.strip() for s in strategy_ids.split(",")] if strategy_ids else None
+
+    q = select(StrategyRun).where(
+        StrategyRun.user_id == current_user.id,
+        StrategyRun.trade_date == trade_date,
+        StrategyRun.status == "completed",
+    )
+    if selected_ids:
+        q = q.where(StrategyRun.strategy_id.in_(selected_ids))
+    q = q.order_by(StrategyRun.strategy_id)
+
+    runs = (await db.execute(q)).scalars().all()
+
+    if not runs:
+        return {"date": date, "strategies": []}
+
+    strategies = []
+    for run in runs:
+        cat = _cat_get(run.strategy_id)
+        result_json = run.result_json or {}
+
+        mtm_rows = (await db.execute(
+            select(StrategyRunMtm)
+            .where(StrategyRunMtm.run_id == run.id)
+            .order_by(StrategyRunMtm.timestamp)
+        )).scalars().all()
+
+        mtm_series = [
+            {
+                "t": row.timestamp.strftime("%H:%M"),
+                "net_mtm": float(row.net_mtm) if row.net_mtm is not None else None,
+                "trail_stop": float(row.trail_stop_level) if row.trail_stop_level is not None else None,
+                "event": row.event_code,
+            }
+            for row in mtm_rows
+        ]
+
+        lock_ts = result_json.get("wing_lock_ts")
+        strategies.append({
+            "strategy_id":         run.strategy_id,
+            "strategy_name":       cat["name"] if cat else run.strategy_id,
+            "run_id":              str(run.id),
+            "pnl":                 float(run.realized_net_pnl) if run.realized_net_pnl is not None else None,
+            "gross_pnl":           float(run.gross_pnl) if run.gross_pnl is not None else None,
+            "total_charges":       float(run.total_charges) if run.total_charges is not None else None,
+            "exit_reason":         run.exit_reason,
+            "entry_time":          run.entry_time,
+            "exit_time":           run.exit_time,
+            "lots":                run.approved_lots,
+            "lot_size":            run.lot_size,
+            "capital":             float(run.capital) if run.capital else None,
+            "entry_credit_total":  float(run.entry_credit_total) if run.entry_credit_total else None,
+            "wings_locked":        result_json.get("wings_locked", False),
+            "lock_reason":         result_json.get("lock_reason"),
+            "lock_time":           lock_ts[11:16] if lock_ts else None,
+            "warnings":            result_json.get("warnings", []),
+            "mtm_series":          mtm_series,
+        })
+
+    return {"date": date, "strategies": strategies}
 
 
 @router.get("/strategies")
@@ -397,12 +594,18 @@ async def create_run(
         }
 
     if body.run_type == "single_session_backtest":
-        validation = await validate_run(db, strategy, config)
+        executor_type = strategy.get("executor", "generic_v1")
+        if executor_type == "straddle_adjustment_v1":
+            _validate_fn, _execute_fn = sa_validate_run, sa_execute_run
+        else:
+            _validate_fn, _execute_fn = validate_run, execute_run
+
+        validation = await _validate_fn(db, strategy, config)
         if validation.error:
             raise HTTPException(status_code=422, detail=validation.error)
 
         run_id = uuid.uuid4()
-        result = await execute_run(db, run_id, strategy, config, validation, current_user.id)
+        result = await _execute_fn(db, run_id, strategy, config, validation, current_user.id)
 
         if result.status == "ERROR":
             raise HTTPException(status_code=500, detail=result.exit_reason or "Execution failed.")
@@ -489,7 +692,8 @@ async def validate_run_endpoint(
     if body.strategy_id not in supported_strategy_ids():
         raise HTTPException(status_code=422, detail="Strategy is catalogued but not executable yet.")
 
-    validation = await validate_run(db, strategy, body.config or {})
+    _vfn = sa_validate_run if strategy.get("executor") == "straddle_adjustment_v1" else validate_run
+    validation = await _vfn(db, strategy, body.config or {})
     if validation.error:
         raise HTTPException(status_code=422, detail=validation.error)
 
@@ -624,8 +828,9 @@ async def _compute_shadow_mtm(db: AsyncSession, run_row, legs) -> list:
         (l.side, l.option_type, l.strike, l.expiry_date, float(l.entry_price))
         for l in legs if l.entry_price is not None
     ]
-    sell_entry_prices = [ep for side, _, _, _, ep in leg_info if side == "SELL"]
-    entry_charges = compute_entry_charges(approved_lots, lot_size, sell_entry_prices)
+    charge_legs = [(side, opt_type, strike) for side, opt_type, strike, _, _ in leg_info]
+    entry_prices = [ep for _, _, _, _, ep in leg_info]
+    entry_charges = compute_leg_entry_charges(approved_lots, lot_size, charge_legs, entry_prices)
 
     # Spot candles after exit
     spot_rows = (await db.execute(
@@ -688,8 +893,8 @@ async def _compute_shadow_mtm(db: AsyncSession, run_row, legs) -> list:
             for side, opt_type, strike, _, ep in leg_info
         )
         gross_mtm_total = gross_mtm_per_unit * lot_size * approved_lots
-        sell_cur = [cur[(strike, opt_type)] for side, opt_type, strike, _, _ in leg_info if side == "SELL"]
-        est_exit = compute_exit_charges_estimate(approved_lots, lot_size, sell_cur or [0.0])
+        cur_prices = [cur[(strike, opt_type)] for _, opt_type, strike, _, _ in leg_info]
+        est_exit = compute_leg_exit_charges_estimate(approved_lots, lot_size, charge_legs, cur_prices)
         net_mtm  = gross_mtm_total - entry_charges - est_exit
         shadow.append({"timestamp": ts.isoformat(), "net_mtm": round(net_mtm, 2)})
 
@@ -845,7 +1050,7 @@ def _csv_inr(v) -> str:
 
 
 def _write_run_sections_to_csv(w, payload: dict, run_row) -> None:
-    """Write all 8 sections for one strategy run to an open csv.writer instance."""
+    """Write the 9 replay sections for one strategy run to an open csv.writer instance."""
     run    = payload["run"]
     legs   = payload["legs"]
     events = payload["events"]
@@ -925,21 +1130,26 @@ def _write_run_sections_to_csv(w, payload: dict, run_row) -> None:
     for row in payload["shadow_mtm_series"]:
         w.writerow([row["timestamp"], _csv_f(row.get("net_mtm")), "", "", "", "", "", "shadow (hypothetical)"])
 
-    # Sections 5+: CE then PE premium candles
-    ce_legs = [l for l in legs if l["option_type"] == "CE"]
-    pe_legs = [l for l in legs if l["option_type"] == "PE"]
-
-    for leg in ce_legs:
-        sec(f"CE PREMIUM — {run_row.instrument}{leg['strike']}CE {leg.get('expiry_date', '')} (1-min candles, full day)")
-        w.writerow(["Timestamp", "Open", "High", "Low", "Close"])
-        for c in payload["leg_candles"].get(str(leg["leg_index"]), []):
-            w.writerow([c["timestamp"], _csv_f(c.get("open")), _csv_f(c.get("high")), _csv_f(c.get("low")), _csv_f(c.get("close"))])
-
-    for leg in pe_legs:
-        sec(f"PE PREMIUM — {run_row.instrument}{leg['strike']}PE {leg.get('expiry_date', '')} (1-min candles, full day)")
-        w.writerow(["Timestamp", "Open", "High", "Low", "Close"])
-        for c in payload["leg_candles"].get(str(leg["leg_index"]), []):
-            w.writerow([c["timestamp"], _csv_f(c.get("open")), _csv_f(c.get("high")), _csv_f(c.get("low")), _csv_f(c.get("close"))])
+    # Sections 5-6: CE then PE premium candles, with all matching contracts included.
+    for option_type in ("CE", "PE"):
+        option_legs = [leg for leg in legs if leg["option_type"] == option_type]
+        sec(f"{option_type} PREMIUM — Full Day 1-min candles")
+        w.writerow(["Leg", "Contract", "Timestamp", "Open", "High", "Low", "Close"])
+        for leg in option_legs:
+            contract = f"{leg.get('side', '')} {run_row.instrument}{leg['strike']}{option_type} {leg.get('expiry_date', '')}"
+            candles = payload["leg_candles"].get(str(leg["leg_index"]), [])
+            if not candles:
+                w.writerow([leg.get("leg_index", ""), contract, "", "", "", "", ""])
+            for c in candles:
+                w.writerow([
+                    leg.get("leg_index", ""),
+                    contract,
+                    c["timestamp"],
+                    _csv_f(c.get("open")),
+                    _csv_f(c.get("high")),
+                    _csv_f(c.get("low")),
+                    _csv_f(c.get("close")),
+                ])
 
     # NIFTY Spot OHLC
     sec(f"NIFTY SPOT OHLC — Full Day ({run.get('trade_date', '')})")

@@ -26,6 +26,7 @@ const PAYOFF_SHAPES = {
   adaptive: '4,88 30,88 44,40 58,40 72,88 96,88',
   spread: '4,88 30,88 48,56 66,24 88,24 96,24',
   tent: '4,88 30,88 46,28 62,28 78,88 96,88',
+  butterfly: '4,88 26,88 50,18 74,88 96,88',
   call: '4,88 42,88 58,66 74,24 96,24',
   put: '4,24 28,24 44,70 60,88 96,88',
 }
@@ -124,7 +125,7 @@ function buildPreview(strategy, runType, config, readyDays) {
   const capitalValid = Number.isFinite(capital) && capital > 0
   const visual = normalizeVisual(strategy)
   const readySet = new Set((readyDays || []).map(item => item.trade_date))
-  const selectedDate = config.date || config.start_date
+  const selectedDate = config.date || config.trade_date || config.start_date
   const exactDayReady = selectedDate ? readySet.has(selectedDate) : false
   const expectedRangeDays = runType === 'historical_backtest'
     ? countWeekdaysInRange(config.start_date, config.end_date)
@@ -134,6 +135,8 @@ function buildPreview(strategy, runType, config, readyDays) {
     : 0
   const historicalReady = expectedRangeDays > 0 && readyRangeDays >= expectedRangeDays
   const tone = strategyStatusTone(strategy?.status)
+  const vixMinField = visual.constraintFields.find(item => item.label.toLowerCase().includes('vix min'))
+  const vixMaxField = visual.constraintFields.find(item => item.label.toLowerCase().includes('vix max'))
 
   const readinessItems = [
     {
@@ -154,7 +157,7 @@ function buildPreview(strategy, runType, config, readyDays) {
     },
     {
       label: 'VIX data',
-      detail: `${visual.constraintFields[2]?.value || 'Auto'} to ${visual.constraintFields[3]?.value || 'Auto'} guardrail`,
+      detail: `${vixMinField?.value || 'Auto'} to ${vixMaxField?.value || 'Auto'} guardrail`,
       level: 'good',
     },
     {
@@ -199,7 +202,7 @@ function orderFields(fields, runType) {
   const order = runType === 'paper_replay'
     ? ['instrument', 'date', 'capital', 'request_token']
     : runType === 'single_session_backtest'
-      ? ['instrument', 'trade_date', 'entry_time', 'capital', 'vix_guardrail_enabled', 'vix_min', 'vix_max']
+      ? ['instrument', 'trade_date', 'entry_time', 'capital', 'wing_width_steps', 'target_amount', 'stop_loss_amount', 'target_pct', 'stop_capital_pct', 'vix_guardrail_enabled', 'vix_min', 'vix_max']
       : ['instrument', 'start_date', 'end_date', 'name', 'capital', 'execution_order', 'autorun']
 
   return [...fields].sort((a, b) => {
@@ -584,14 +587,20 @@ function buildPrimaryLayout(runType, fieldMap, preview) {
   }
 
   if (runType === 'single_session_backtest') {
-    return [
+    const base = [
       { key: 'instrument', label: 'Instrument', field: fieldMap.instrument },
       { key: 'trade_date', label: 'Trade Date', field: fieldMap.trade_date },
       { key: 'entry_time', label: 'Entry Time', field: fieldMap.entry_time },
       { key: 'capital', label: 'Capital (₹)', field: fieldMap.capital },
+    ]
+    if (fieldMap.wing_width_steps) base.push({ key: 'wing_width_steps', label: fieldMap.wing_width_steps.label, field: fieldMap.wing_width_steps })
+    if (fieldMap.target_pct) base.push({ key: 'target_pct', label: fieldMap.target_pct.label, field: fieldMap.target_pct })
+    if (fieldMap.stop_capital_pct) base.push({ key: 'stop_capital_pct', label: fieldMap.stop_capital_pct.label, field: fieldMap.stop_capital_pct })
+    base.push(
       { key: 'expiry', label: 'Expiry', displayValue: preview.visual.expiryLabel },
       { key: 'exit_rule', label: 'Exit Rule', displayValue: preview.visual.exitRule },
-    ]
+    )
+    return base
   }
 
   return [
@@ -633,8 +642,15 @@ export default function RunBuilder() {
     ])
       .then(([strategyRes, tradingDaysRes]) => {
         const list = strategyRes.data.strategies || []
+        const days = tradingDaysRes.data || []
         setStrategies(list)
-        setReadyDays(tradingDaysRes.data || [])
+        setReadyDays(days)
+
+        // Use latest warehouse-ready date so the form never auto-fills a date
+        // that has no candle data (latest_weekday() from the server may be today).
+        const latestReady = days.length
+          ? [...days].sort((a, b) => b.trade_date.localeCompare(a.trade_date))[0].trade_date
+          : null
 
         const requested = searchParams.get('strategy')
         const selected = list.find(item => item.id === requested) || list.find(item => item.id === 'orb_intraday_spread') || list[0]
@@ -642,7 +658,9 @@ export default function RunBuilder() {
           const nextRunType = defaultRunTypeFor(selected)
           setStrategyId(selected.id)
           setRunType(nextRunType)
-          setConfig(normalizeConfig(selected, nextRunType))
+          const cfg = normalizeConfig(selected, nextRunType)
+          if (latestReady && 'trade_date' in cfg) cfg.trade_date = latestReady
+          setConfig(cfg)
         }
       })
       .catch(err => setError(err.response?.data?.detail || err.message))
@@ -681,7 +699,7 @@ export default function RunBuilder() {
       }
     }, 600)
     return () => clearTimeout(validateTimer.current)
-  }, [runType, strategyId, config.trade_date, config.entry_time, config.capital, config.instrument, config.vix_guardrail_enabled, config.vix_min, config.vix_max])
+  }, [runType, strategyId, config.trade_date, config.entry_time, config.capital, config.instrument, config.wing_width_steps, config.target_amount, config.stop_loss_amount, config.target_pct, config.stop_capital_pct, config.vix_guardrail_enabled, config.vix_min, config.vix_max])
 
   const scopedFields = useMemo(() => {
     const schema = (strategy?.params_schema || []).filter(field => !field.modes || field.modes.includes(runType))
@@ -966,7 +984,7 @@ export default function RunBuilder() {
             {error ? <div className="wb-alert-error">{error}</div> : null}
             {!canSubmit ? (
               <div className="wb-alert-warning">
-                This strategy is catalogued in the workbench, but the backend executor is not live yet. The shell is accurate, submission stays disabled.
+                This strategy is in preview — the executor is scheduled for a future release. The shell is accurate; submission is disabled until it launches.
               </div>
             ) : null}
 

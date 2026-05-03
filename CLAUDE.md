@@ -11,8 +11,8 @@ This file gives Claude Code full context about the project so it can assist effe
 1. **Synthetic Backtest** — simulates Iron Condor, Bull Put Spread, and Bear Call Spread strategies using deterministic synthetic candle data with auto-regime detection (EMA/RSI/IV Rank).
 2. **Paper Trading ORB Replay** — replays a real historical trading day using **live Zerodha market data**. Evaluates the Opening Range Breakout (ORB) strategy through a G1–G7 gate stack, records every minute decision, and produces full audit logs + candle data.
 3. **Historical Backtest** — runs the ORB engine against a DB-backed warehouse of real 1-min candle data (spot + options). Batches span multiple trading days; results persist alongside paper trading sessions.
-4. **V2 Workbench** — strategy-agnostic shell (Strategy Catalog → Run Builder → Replay Analyzer → Runs Library) aligned to the product PRD. Two executors are live: `orb_v1` (ORB paper/historical) and `generic_v1` (single-session backtest). 11 further strategies are catalogued as `planned`/`research`.
-5. **Generic Strategy Engine** — declarative executor that powers any strategy defined in the catalog via `leg_template` + `entry_rule_id` + `exit_rule`. No new Python files needed to add a strategy. Short Straddle is the first live strategy on this engine.
+4. **V2 Workbench** — strategy-agnostic shell (Strategy Catalog → Run Builder → Replay Analyzer → Runs Library) aligned to the product PRD. Two executors are live: `orb_v1` (ORB paper/historical) and `generic_v1` (single-session backtest). 10 further strategies are catalogued as `planned`/`research`.
+5. **Generic Strategy Engine** — declarative executor that powers any strategy defined in the catalog via `leg_template` + `entry_rule_id` + `exit_rule`. No new Python files needed to add a strategy. Short Straddle and Iron Butterfly are live on this engine.
 
 Scope: **backtesting and paper trading only** — no live order placement.
 
@@ -244,7 +244,7 @@ The minimum is always 1 lot. Never remove this floor.
 - `id`, `name`, `bias`, `status` (`available` | `planned` | `research`)
 - `executor` — which backend engine handles it (`"orb_v1"` or `"generic_v1"`)
 - `modes` — `paper_replay`, `historical_backtest`, and/or `single_session_backtest`
-- `leg_template` — declarative list of `{side, option_type, strike_offset_steps}` (generic_v1 only)
+- `leg_template` — declarative list of `{side, option_type, strike_offset_steps}` (generic_v1 only). For strategies with config-driven wing widths, use `strike_offset_steps_from_config` + `strike_offset_sign` instead of a fixed integer — executor resolves the offset from `config[key] × sign` at runtime.
 - `entry_rule_id` — key into `entry_rule_registry.py` (`"timed_entry"` covers ~38/40 strategies)
 - `exit_rule` — `{target_pct, stop_capital_pct, stop_multiple, trail_trigger, trail_pct, time_exit, data_gap_exit}` (generic_v1 only)
 - `params_schema` — field definitions consumed by the Run Builder form
@@ -255,7 +255,24 @@ The minimum is always 1 lot. Never remove this floor.
 
 ### Generic Strategy Engine (generic_v1)
 
-**Adding a new strategy requires only a catalog entry** — no new Python files:
+**Adding a new strategy requires only a catalog entry** — no new Python files.
+
+### Acceptance Criteria for Every New generic_v1 Strategy
+
+Before marking a strategy as `"status": "available"`, every AC below must be met:
+
+1. **Catalog entry**: `id`, `name`, `bias`, `status`, `executor`, `entry_rule_id`, `leg_template`, `exit_rule`, `sizing`, `modes`, `params_schema`, `defaults`, `visual_hints`, `chips`, `description`, `playbook`, `notes` all populated.
+2. **Auto-fill defaults**: `defaults.<run_type>` block must pre-fill every editable field (instrument, trade_date, entry_time, capital, all strategy-specific params like wing_width_steps, target_pct, stop_capital_pct, vix_min, vix_max). For `single_session_backtest`, `trade_date` must be dynamically injected via `_materialize_strategy()` with `latest_weekday()`.
+3. **Correct payoff shape**: `visual_hints.shape` must match the strategy's actual payoff profile — use `butterfly` for IB-style 4-leg defined-risk, `tent` for Short Straddle-style unlimited, `spread` for directional spreads.
+4. **Params schema**: every `params_schema` field must have `key`, `label`, `type`, and `required`. Use `depends_on` for VIX sub-fields. Scope to run type via `modes` when the field only applies to one mode.
+5. **constraint_fields**: `visual_hints.constraint_fields` must show accurate hardcoded reference values (not live config) for target, stop, wing widths, VIX bounds, time exit.
+6. **Mixed-side MTM formula** (if BUY legs present): SELL → `entry − current`; BUY → `current − entry`. Verify sign is correct in `generic_executor.py` for the new leg combination.
+7. **Exit charges flipping**: closing a BUY leg = SELL order, closing a SELL leg = BUY order. Confirm `charges_service.py` receives the correct side for each leg at exit.
+8. **Margin sizing model**: specify `sizing.model`. Use `defined_risk_credit` for strategies with known max loss (e.g., IB, IC); omit or use `credit_selling` for unlimited-loss strategies.
+9. **Unit tests**: add focused tests for catalog entry shape, leg MTM signs, sizing, exit charges, and CSV export sections. Minimum 6 tests per strategy.
+10. **Replay screen**: verify CE/PE MTM series split correctly in `strategy_replay_serializer.py` — it groups by `option_type`, so SELL + BUY legs of the same option type automatically combine.
+
+
 
 ```python
 {
@@ -315,7 +332,7 @@ gross_mtm_total    = gross_mtm_per_unit × lot_size × approved_lots
 net_mtm            = gross_mtm_total − entry_charges − est_exit_charges
 ```
 
-### Short Straddle — First generic_v1 Strategy
+### Short Straddle — generic_v1 Strategy
 
 SELL ATM CE + SELL ATM PE at `entry_time`. Profits from premium decay when spot stays range-bound.
 
@@ -327,6 +344,23 @@ SELL ATM CE + SELL ATM PE at `entry_time`. Profits from premium decay when spot 
 | Trailing stop | Activates at ₹12,000 net MTM; exits if net_mtm drops to 50% of peak |
 | Time exit | 15:25 |
 | Lot sizes | 75 (NIFTY post-Nov 2024), 50 (NIFTY pre-Nov 2024) |
+
+### Iron Butterfly — generic_v1 Strategy
+
+SELL ATM CE + SELL ATM PE + BUY OTM CE (ATM + N×step) + BUY OTM PE (ATM − N×step). Defined-risk neutral strategy — profits from premium decay within the wings.
+
+| Parameter | Value |
+|-----------|-------|
+| Entry rule | `timed_entry` — enter at `entry_time`; retries up to 5 min if prices missing |
+| Wing width | `wing_width_steps` (user input) — resolved at runtime via `strike_offset_steps_from_config` |
+| Target exit | `target_pct` of entry credit (user-configurable, default 30%) |
+| Stop exit | `stop_capital_pct` of capital (user-configurable, default 1.5%) |
+| Trail | Disabled by default (`trail_trigger=0`) |
+| Time exit | 15:25 |
+| MTM formula | SELL legs: `entry − current`; BUY legs: `current − entry` |
+| Margin sizing | `_defined_risk_margin_per_lot()` — uses wing_width × strike_step × lot_size minus net credit as max loss cap |
+| Exit charges | BUY leg exit = SELL order; SELL leg exit = BUY order (`compute_leg_exit_charges_estimate()`) |
+| ce_mtm / pe_mtm | Sum of gross_leg_pnl for ALL CE legs (SELL + BUY CE); same for PE |
 
 ### ReplayAnalyzer — strategy_run chart payload
 
@@ -688,6 +722,24 @@ curl -s -X POST http://localhost:8000/api/v2/runs \
   -H "Authorization: Bearer <token>" \
   -H "Content-Type: application/json" \
   -d '{"run_type":"single_session_backtest","strategy_id":"short_straddle","config":{"instrument":"NIFTY","trade_date":"2026-04-07","entry_time":"09:50","capital":500000,"vix_guardrail_enabled":true,"vix_min":14,"vix_max":22}}' \
+  | python3 -m json.tool
+```
+
+### Validate an Iron Butterfly session (dry-run, no DB writes)
+```bash
+curl -s -X POST http://localhost:8000/api/v2/runs/validate \
+  -H "Authorization: Bearer <token>" \
+  -H "Content-Type: application/json" \
+  -d '{"run_type":"single_session_backtest","strategy_id":"iron_butterfly","config":{"instrument":"NIFTY","trade_date":"2026-04-07","entry_time":"09:50","capital":500000,"wing_width_steps":2}}' \
+  | python3 -m json.tool
+```
+
+### Run an Iron Butterfly single-session backtest
+```bash
+curl -s -X POST http://localhost:8000/api/v2/runs \
+  -H "Authorization: Bearer <token>" \
+  -H "Content-Type: application/json" \
+  -d '{"run_type":"single_session_backtest","strategy_id":"iron_butterfly","config":{"instrument":"NIFTY","trade_date":"2026-04-07","entry_time":"09:50","capital":500000,"wing_width_steps":2,"target_pct":0.30,"stop_capital_pct":0.015,"vix_guardrail_enabled":true,"vix_min":14,"vix_max":22}}' \
   | python3 -m json.tool
 ```
 

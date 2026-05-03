@@ -56,9 +56,9 @@ from app.models.strategy_run import (
     StrategyRunMtm,
 )
 from app.services.charges_service import (
-    compute_entry_charges,
-    compute_exit_charges_estimate,
-    compute_total_charges,
+    compute_leg_entry_charges,
+    compute_leg_exit_charges_estimate,
+    compute_leg_total_charges,
 )
 from app.services.contract_spec_service import (
     ContractSpec,
@@ -104,6 +104,64 @@ class ValidationResult:
     error: Optional[str] = None
 
 
+def _price_from_row(row: Any) -> Optional[float]:
+    for attr in ("close", "price"):
+        value = getattr(row, attr, None)
+        if value is not None:
+            return float(value)
+    return None
+
+
+def _net_credit_per_unit(legs: List[Tuple[str, str, int]], prices: List[Optional[float]]) -> Optional[float]:
+    if any(price is None for price in prices):
+        return None
+    return sum(
+        (price if side == "SELL" else -price)
+        for (side, _, _), price in zip(legs, prices)
+        if price is not None
+    )
+
+
+def _defined_risk_margin_per_lot(
+    strategy: Dict[str, Any],
+    config: Dict[str, Any],
+    resolved_legs: List[Tuple[str, str, int]],
+    entry_prices: List[Optional[float]],
+    lot_size: int,
+    strike_step: int,
+) -> Optional[float]:
+    sizing = strategy.get("sizing", {})
+    if sizing.get("model") != "defined_risk_credit":
+        return None
+
+    net_credit = _net_credit_per_unit(resolved_legs, entry_prices)
+    if net_credit is None:
+        return None
+
+    wing_width_points = sizing.get("wing_width_points")
+    if wing_width_points is None:
+        raw_steps = config.get(sizing.get("wing_width_steps_key", "wing_width_steps"), 0)
+        try:
+            wing_width_points = int(raw_steps) * strike_step
+        except (TypeError, ValueError):
+            wing_width_points = 0
+
+    if wing_width_points <= 0:
+        return None
+
+    max_loss_per_unit = max(float(wing_width_points) - net_credit, float(wing_width_points) * 0.05)
+    theoretical_margin = max_loss_per_unit * lot_size
+
+    margin_floor = sizing.get("margin_floor_per_lot")
+    if margin_floor is not None:
+        try:
+            theoretical_margin = max(theoretical_margin, float(margin_floor))
+        except (TypeError, ValueError):
+            pass
+
+    return theoretical_margin
+
+
 @dataclass
 class ExecutionResult:
     run_id: str
@@ -121,13 +179,6 @@ def _parse_time(hhmm: str, default: time = time(9, 50)) -> time:
         return time(h, m)
     except Exception:
         return default
-
-
-def _exit_time(config: Dict) -> time:
-    return _parse_time(
-        config.get("exit_rule", {}).get("time_exit", "15:25"),
-        default=time(15, 25),
-    )
 
 
 def _get_price(
@@ -213,7 +264,7 @@ async def validate_run(
         )
 
     # 5. VIX guardrail (optional)
-    if config.get("vix_guardrail_enabled"):
+    if config.get("vix_guardrail_enabled", config.get("vix_guardrail", False)):
         vix = await get_vix_at_entry(db, trade_date, entry_time_str)
         if vix is None:
             return ValidationResult(
@@ -232,7 +283,7 @@ async def validate_run(
 
     # 6. Resolve concrete leg strikes from template
     leg_template = strategy.get("leg_template", [])
-    resolved_legs = resolve_leg_strikes(leg_template, atm_strike, spec.strike_step)
+    resolved_legs = resolve_leg_strikes(leg_template, atm_strike, spec.strike_step, config)
 
     # 7. Confirm each resolved leg strike has a price within the entry grace window
     from datetime import timedelta as _td
@@ -240,6 +291,7 @@ async def validate_run(
     entry_dt = datetime.combine(trade_date, _parse_time(entry_time_str))
     grace_end_dt = entry_dt + _td(minutes=_GRACE)
     contracts = []
+    entry_prices: List[Optional[float]] = []
     exact_missing: List[str] = []
     fully_missing: List[str] = []
     for side, opt_type, strike in resolved_legs:
@@ -274,7 +326,15 @@ async def validate_run(
             )).scalar_one_or_none()
             if grace_row is None:
                 fully_missing.append(f"{opt_type} {strike}")
-        contracts.append({"side": side, "option_type": opt_type, "strike": strike})
+            price_row = grace_row
+        else:
+            price_row = exact_row
+        entry_price = _price_from_row(price_row) if price_row is not None else None
+        entry_prices.append(entry_price)
+        contract = {"side": side, "option_type": opt_type, "strike": strike}
+        if entry_price is not None:
+            contract["entry_price"] = round(entry_price, 2)
+        contracts.append(contract)
 
     if fully_missing:
         return ValidationResult(
@@ -300,14 +360,19 @@ async def validate_run(
             trade_date=trade_date_str, entry_time=entry_time_str,
             error="Capital must be positive.",
         )
-    approved_lots = max(0, int(capital // spec.estimated_margin_per_lot))
+    margin_per_lot = _defined_risk_margin_per_lot(
+        strategy, config, resolved_legs, entry_prices,
+        spec.lot_size, spec.strike_step,
+    ) or spec.estimated_margin_per_lot
+
+    approved_lots = max(0, int(capital // margin_per_lot))
     if approved_lots < 1:
         return ValidationResult(
             validated=False, instrument=instrument,
             trade_date=trade_date_str, entry_time=entry_time_str,
             error=(
                 f"CAPITAL_INSUFFICIENT: capital ₹{capital:,.0f} < "
-                f"est. margin ₹{spec.estimated_margin_per_lot:,.0f}/lot."
+                f"est. margin ₹{margin_per_lot:,.0f}/lot."
             ),
         )
 
@@ -322,7 +387,7 @@ async def validate_run(
         contracts=contracts,
         lot_size=spec.lot_size,
         approved_lots=approved_lots,
-        estimated_margin=round(approved_lots * spec.estimated_margin_per_lot, 2),
+        estimated_margin=round(approved_lots * margin_per_lot, 2),
         warnings=warnings,
     )
 
@@ -351,10 +416,15 @@ async def execute_run(
     warnings: List[str] = list(validation.warnings)
 
     exit_rule = strategy.get("exit_rule", {})
-    target_pct        = float(exit_rule.get("target_pct", 0.30))
+    target_pct        = float(config.get("target_pct") or exit_rule.get("target_pct", 0.30))
+    target_amount     = float(config.get("target_amount") or exit_rule.get("target_amount") or 0)
     stop_multiple     = float(exit_rule.get("stop_multiple", 1.5))
+    stop_loss_amount  = float(config.get("stop_loss_amount") or exit_rule.get("stop_loss_amount") or 0)
     stop_capital_pct  = float(config.get("stop_capital_pct") or exit_rule.get("stop_capital_pct") or 0)
-    sq_time           = _exit_time(config)
+    sq_time           = _parse_time(
+        config.get("exit_rule", {}).get("time_exit") or exit_rule.get("time_exit", "15:25"),
+        default=time(15, 25),
+    )
     # Trailing stop — activated once net_mtm crosses trail_trigger
     trail_trigger = float(config.get("trail_trigger") or exit_rule.get("trail_trigger") or 0)
     trail_pct     = float(config.get("trail_pct")     or exit_rule.get("trail_pct")     or 0)
@@ -365,7 +435,7 @@ async def execute_run(
     # Resolved legs: (side, option_type, strike, leg_uuid)
     leg_template = strategy.get("leg_template", [])
     spec = await get_contract_spec(db, instrument, trade_date)
-    resolved = resolve_leg_strikes(leg_template, atm_strike, spec.strike_step)
+    resolved = resolve_leg_strikes(leg_template, atm_strike, spec.strike_step, config)
     legs_to_fetch = {(strike, opt_type) for _, opt_type, strike in resolved}
     leg_ids = [uuid.uuid4() for _ in resolved]
 
@@ -443,19 +513,14 @@ async def execute_run(
                 actual_entry_ts = ts
                 entry_prices = list(cur_prices)
 
-                # Only SELL legs contribute to entry credit for short strategies
-                sell_prices = [
-                    p for p, (side, _, _) in zip(entry_prices, resolved)
-                    if side == "SELL"
-                ]
-                entry_credit_per_unit = sum(sell_prices)
+                entry_credit_per_unit = _net_credit_per_unit(resolved, entry_prices) or 0.0
                 entry_credit_total = entry_credit_per_unit * lot_size * approved_lots
-                entry_charges = compute_entry_charges(approved_lots, lot_size, sell_prices)
+                entry_charges = compute_leg_entry_charges(approved_lots, lot_size, resolved, entry_prices)
 
                 event_rows.append({
                     "run_id": run_id, "timestamp": ts,
                     "event_type": "ENTRY", "reason_code": "ENTRY_SCHEDULED",
-                    "reason_text": f"Entered short straddle at {ts.strftime('%H:%M')}",
+                    "reason_text": f"Entered {strategy.get('name', strategy['id'])} at {ts.strftime('%H:%M')}",
                     "payload_json": {
                         "spot": spot_close,
                         "legs": [
@@ -481,7 +546,7 @@ async def execute_run(
         if not valid_prices:
             data_gap = True
 
-        if data_gap and config.get("exit_rule", {}).get("data_gap_exit", True):
+        if data_gap and config.get("exit_rule", {}).get("data_gap_exit", exit_rule.get("data_gap_exit", True)):
             exit_reason = "DATA_GAP_EXIT"
             exit_ts = ts
             event_rows.append({
@@ -499,16 +564,14 @@ async def execute_run(
         )
         gross_mtm_total = gross_mtm_per_unit * lot_size * approved_lots
 
-        sell_current = [
-            p for p, (side, _, _) in zip(cur_prices, resolved)
-            if side == "SELL" and p is not None
-        ]
-        est_exit_charges = compute_exit_charges_estimate(approved_lots, lot_size, sell_current or [0.0])
+        est_exit_charges = compute_leg_exit_charges_estimate(approved_lots, lot_size, resolved, cur_prices)
         net_mtm = gross_mtm_total - entry_charges - est_exit_charges
 
         # Exit conditions
-        target_threshold = entry_credit_total * target_pct
-        if stop_capital_pct > 0 and capital_amount > 0:
+        target_threshold = target_amount if target_amount > 0 else entry_credit_total * target_pct
+        if stop_loss_amount > 0:
+            stop_threshold = -stop_loss_amount
+        elif stop_capital_pct > 0 and capital_amount > 0:
             stop_threshold = -(capital_amount * stop_capital_pct)
         else:
             stop_threshold = -(entry_credit_total * stop_multiple)
@@ -579,20 +642,12 @@ async def execute_run(
     if trade_open:
         # Find exit prices (last prices from MTM loop or final cur_prices)
         exit_prices = list(last_prices)
-        sell_entry  = [p for p, (s, _, _) in zip(entry_prices, resolved) if s == "SELL" and p is not None]
-        sell_exit   = [p for p, (s, _, _) in zip(exit_prices,  resolved) if s == "SELL" and p is not None]
-        buy_entry   = [p for p, (s, _, _) in zip(entry_prices, resolved) if s == "BUY"  and p is not None]
-        buy_exit    = [p for p, (s, _, _) in zip(exit_prices,  resolved) if s == "BUY"  and p is not None]
-
         gross_pnl = sum(
             (ep - xp if side == "SELL" else xp - ep) * lot_size * approved_lots
             for (side, _, _), ep, xp in zip(resolved, entry_prices, exit_prices)
             if ep is not None and xp is not None
         )
-        total_charges = compute_total_charges(
-            approved_lots, lot_size,
-            sell_entry, sell_exit if sell_exit else [0.0],
-        )
+        total_charges = compute_leg_total_charges(approved_lots, lot_size, resolved, entry_prices, exit_prices)
         realized_net_pnl = round(gross_pnl - total_charges, 2)
 
         # For TRAIL_EXIT the stop is a guaranteed floor — lock in at trail_stop_level.

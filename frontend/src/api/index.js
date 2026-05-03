@@ -118,6 +118,10 @@ export const zerodhaStatus = () => api.get('/auth/zerodha/status')
 
 // ── Workbench v2 ─────────────────────────────────────────────────────────────
 export const getWorkbenchSummary = () => api.get('/v2/workspace/summary')
+export const getStrategyDashboard = () => api.get('/v2/workspace/strategy-dashboard')
+export const getDayCompare = (date, strategyIds) => api.get('/v2/workspace/day-compare', {
+  params: { date, ...(strategyIds?.length ? { strategy_ids: strategyIds.join(',') } : {}) },
+})
 export const getWorkbenchStrategies = () => api.get('/v2/strategies')
 export const getWorkbenchStrategy = (strategyId) => api.get(`/v2/strategies/${strategyId}`)
 export const getWorkbenchRuns = (params) => api.get('/v2/runs', { params })
