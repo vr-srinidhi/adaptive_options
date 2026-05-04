@@ -259,6 +259,7 @@ async def _run_session(
     loss_lock_trigger = float(params.get("loss_lock_trigger", 25_000))
     wing_steps        = int(params.get("wing_width_steps", 2))
     sq_time           = _parse_time(params.get("time_exit", "15:25"), default=_SQ_TIME)
+    poll_interval     = max(3, int(params.get("poll_interval_seconds", 60)))
 
     trade_date = date.today()
 
@@ -337,11 +338,16 @@ async def _run_session(
         straddle_leg_ids    = [uuid.uuid4(), uuid.uuid4()]
         wing_leg_ids        = [uuid.uuid4(), uuid.uuid4()]
 
+        # Minute-level dedup: DB MTM rows and waiting_spot_json stay at 1-min
+        # granularity regardless of poll_interval. SSE broadcasts every tick.
+        _last_db_minute      = -1
+        _last_waiting_minute = -1
+
         # ── Main loop ──────────────────────────────────────────────────────────
         while True:
-            await _sleep_until_next_minute()
+            await asyncio.sleep(poll_interval)
             now = datetime.now(IST)
-            t   = now.time().replace(second=0, microsecond=0)
+            t   = now.time()
 
             if t < _SESSION_START or t >= _SESSION_END:
                 if t >= _SESSION_END:
@@ -412,10 +418,11 @@ async def _run_session(
 
             # Pre-entry: record spot and broadcast waiting update
             if t < entry_time or atm_strike is None:
-                if spot is not None:
+                if spot is not None and now.minute != _last_waiting_minute:
                     await _append_waiting_spot(
                         session_id, {"timestamp": now.isoformat(), "spot": spot}
                     )
+                    _last_waiting_minute = now.minute
                 await _broadcast(session_id, {
                     "type": "WAITING",
                     "timestamp": now.isoformat(),
@@ -601,15 +608,17 @@ async def _run_session(
             elif t >= sq_time:
                 fired = "TIME_EXIT"
 
-            # ── Persist MTM row ────────────────────────────────────────────────
+            # ── Persist MTM row (once per minute; SSE broadcasts every tick) ──
             active_leg_ids    = straddle_leg_ids + (wing_leg_ids if wings_locked else [])
             active_cur_prices = [s_ce_price, s_pe_price] + ([w_ce_price, w_pe_price] if wings_locked else [])
             active_entry_p    = straddle_entry_prices + (wing_entry_prices if wings_locked else [])
             active_sides      = ["SELL", "SELL"] + (["BUY", "BUY"] if wings_locked else [])
-            await _write_mtm(run_id, now, spot, None, gross_mtm, est_exit, net_mtm,
-                             trail_stop_level, fired,
-                             active_leg_ids, active_cur_prices, active_entry_p, active_sides,
-                             lot_size, approved_lots)
+            if now.minute != _last_db_minute or fired:
+                await _write_mtm(run_id, now, spot, None, gross_mtm, est_exit, net_mtm,
+                                 trail_stop_level, fired,
+                                 active_leg_ids, active_cur_prices, active_entry_p, active_sides,
+                                 lot_size, approved_lots)
+                _last_db_minute = now.minute
 
             await _update_session(
                 session_id,

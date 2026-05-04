@@ -47,13 +47,14 @@ IST = ZoneInfo("Asia/Kolkata")
 router = APIRouter(prefix="/api/v2/live-paper", tags=["live-paper"])
 
 _DEFAULT_PARAMS = {
-    "lock_trigger":       20_000,
-    "loss_lock_trigger":  25_000,
-    "wing_width_steps":   2,
-    "trail_trigger":      12_000,
-    "trail_pct":          0.50,
-    "stop_capital_pct":   0.015,
-    "time_exit":          "15:25",
+    "lock_trigger":          20_000,
+    "loss_lock_trigger":     25_000,
+    "wing_width_steps":      2,
+    "trail_trigger":         12_000,
+    "trail_pct":             0.50,
+    "stop_capital_pct":      0.015,
+    "time_exit":             "15:25",
+    "poll_interval_seconds": 60,     # 3 | 5 | 10 | 15 | 30 | 60
 }
 
 

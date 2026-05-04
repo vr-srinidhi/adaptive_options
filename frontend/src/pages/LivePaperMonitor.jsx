@@ -183,15 +183,16 @@ function ConfigPanel({ config, onSave }) {
 
   useEffect(() => {
     if (config) setForm({
-      capital:          config.capital,
-      entry_time:       config.entry_time,
-      enabled:          config.enabled,
-      execution_mode:   config.execution_mode,
-      lock_trigger:     config.params?.lock_trigger ?? 20000,
-      loss_lock_trigger:config.params?.loss_lock_trigger ?? 25000,
-      wing_width_steps: config.params?.wing_width_steps ?? 2,
-      trail_trigger:    config.params?.trail_trigger ?? 12000,
-      stop_capital_pct: config.params?.stop_capital_pct ?? 0.015,
+      capital:               config.capital,
+      entry_time:            config.entry_time,
+      enabled:               config.enabled,
+      execution_mode:        config.execution_mode,
+      lock_trigger:          config.params?.lock_trigger ?? 20000,
+      loss_lock_trigger:     config.params?.loss_lock_trigger ?? 25000,
+      wing_width_steps:      config.params?.wing_width_steps ?? 2,
+      trail_trigger:         config.params?.trail_trigger ?? 12000,
+      stop_capital_pct:      config.params?.stop_capital_pct ?? 0.015,
+      poll_interval_seconds: config.params?.poll_interval_seconds ?? 60,
     })
   }, [config])
 
@@ -222,13 +223,14 @@ function ConfigPanel({ config, onSave }) {
         enabled:        form.enabled,
         execution_mode: form.execution_mode,
         params: {
-          lock_trigger:        form.lock_trigger,
-          loss_lock_trigger:   form.loss_lock_trigger,
-          wing_width_steps:    form.wing_width_steps,
-          trail_trigger:       form.trail_trigger,
-          stop_capital_pct:    form.stop_capital_pct,
-          time_exit:           '15:25',
-          trail_pct:           0.50,
+          lock_trigger:          form.lock_trigger,
+          loss_lock_trigger:     form.loss_lock_trigger,
+          wing_width_steps:      form.wing_width_steps,
+          trail_trigger:         form.trail_trigger,
+          stop_capital_pct:      form.stop_capital_pct,
+          poll_interval_seconds: form.poll_interval_seconds,
+          time_exit:             '15:25',
+          trail_pct:             0.50,
         },
       })
     } finally {
@@ -249,6 +251,22 @@ function ConfigPanel({ config, onSave }) {
         {field('Loss Lock (₹)', 'loss_lock_trigger')}
         {field('Wing Width Steps', 'wing_width_steps')}
         {field('Trail Trigger (₹)', 'trail_trigger')}
+      </div>
+
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 3 }}>
+        <label style={{ fontSize: 11, color: 'var(--text-secondary)' }}>Refresh Interval</label>
+        <select
+          value={form.poll_interval_seconds}
+          onChange={e => setForm(f => ({ ...f, poll_interval_seconds: Number(e.target.value) }))}
+          style={{
+            background: 'var(--surface)', border: '1px solid var(--border)',
+            borderRadius: 6, padding: '5px 8px', color: 'var(--text-primary)', fontSize: 12,
+          }}
+        >
+          {[3, 5, 10, 15, 30, 60].map(s => (
+            <option key={s} value={s}>{s < 60 ? `${s} seconds` : '1 minute'}</option>
+          ))}
+        </select>
       </div>
 
       <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginTop: 4 }}>
@@ -310,6 +328,63 @@ function EventLog({ events }) {
           </span>
         </div>
       ))}
+    </div>
+  )
+}
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+function friendlyLeg(session, type) {
+  if (!session?.atm_strike) return type
+  const exp = session.expiry_date
+    ? new Date(session.expiry_date + 'T00:00:00').toLocaleDateString('en-IN', { day: '2-digit', month: 'short' })
+    : ''
+  return `NIFTY ${session.atm_strike} ${type}${exp ? ' · ' + exp : ''}`
+}
+
+// ── CE / PE Premium Charts ────────────────────────────────────────────────────
+
+function PremiumChart({ data, entryPrice, color, label }) {
+  const valid = data.filter(d => d.price != null)
+  if (!valid.length) return (
+    <div style={{
+      height: 140, display: 'flex', alignItems: 'center', justifyContent: 'center',
+      color: 'var(--text-secondary)', fontSize: 11, border: '1px dashed var(--border)', borderRadius: 8,
+    }}>
+      {label} — awaiting data
+    </div>
+  )
+  const prices = valid.map(d => d.price)
+  const yMin = Math.min(...prices) * 0.97
+  const yMax = Math.max(...prices) * 1.03
+
+  function Tip({ active, payload }) {
+    if (!active || !payload?.length) return null
+    const d = payload[0]?.payload
+    return (
+      <div style={{
+        background: 'var(--surface-2)', border: '1px solid var(--border)',
+        borderRadius: 6, padding: '5px 9px', fontSize: 11,
+      }}>
+        <div style={{ color: 'var(--text-secondary)' }}>{fmtTime(d?.timestamp)}</div>
+        <div style={{ color, fontWeight: 600 }}>{label}: ₹{d?.price?.toFixed(2)}</div>
+      </div>
+    )
+  }
+
+  return (
+    <div>
+      <div style={{ fontSize: 11, fontWeight: 600, color, marginBottom: 6 }}>{label}</div>
+      <ResponsiveContainer width="100%" height={140}>
+        <LineChart data={valid} margin={{ top: 2, right: 6, left: 0, bottom: 0 }}>
+          <CartesianGrid strokeDasharray="3 3" stroke="var(--border)" />
+          <XAxis dataKey="timestamp" tickFormatter={fmtTime} tick={{ fontSize: 9, fill: 'var(--text-secondary)' }} minTickGap={40} />
+          <YAxis domain={[yMin, yMax]} tickFormatter={v => `₹${v.toFixed(0)}`} tick={{ fontSize: 9, fill: 'var(--text-secondary)' }} width={44} />
+          <Tooltip content={<Tip />} />
+          {entryPrice && <ReferenceLine y={entryPrice} stroke={color} strokeDasharray="4 2" strokeOpacity={0.5} label={{ value: `Entry ₹${entryPrice}`, fill: color, fontSize: 9, position: 'insideTopLeft' }} />}
+          <Line type="monotone" dataKey="price" stroke={color} strokeWidth={1.5} dot={false} activeDot={{ r: 3 }} connectNulls={false} />
+        </LineChart>
+      </ResponsiveContainer>
     </div>
   )
 }
@@ -392,8 +467,11 @@ export default function LivePaperMonitor() {
   const [config, setConfig]       = useState(null)
   const [session, setSession]     = useState(null)
   const [mtmData, setMtmData]     = useState([])
+  const [ceData, setCeData]       = useState([])
+  const [peData, setPeData]       = useState([])
   const [events, setEvents]       = useState([])
   const [run, setRun]             = useState(null)
+  const [entryPrices, setEntryPrices] = useState({ ce: null, pe: null })
   const [tokenStatus, setTokenStatus] = useState(null)
   const [isLive, setIsLive]       = useState(false)
   const [history, setHistory]     = useState([])
@@ -470,6 +548,7 @@ export default function LivePaperMonitor() {
     if (data.type === 'ENTRY') {
       setSession(s => s ? { ...s, status: 'entered' } : s)
       setIsLive(true)
+      setEntryPrices({ ce: data.ce_price, pe: data.pe_price })
       setEvents(ev => [...ev, {
         timestamp: data.timestamp, event_type: 'ENTRY',
         reason_code: 'ENTRY', reason_text: `CE@${data.ce_price} PE@${data.pe_price}`,
@@ -493,6 +572,8 @@ export default function LivePaperMonitor() {
         trail_stop_level: data.trail_stop_level,
         spot: data.spot,
       }])
+      if (data.ce_price != null) setCeData(prev => [...prev, { timestamp: data.timestamp, price: data.ce_price }])
+      if (data.pe_price != null) setPeData(prev => [...prev, { timestamp: data.timestamp, price: data.pe_price }])
     }
   }
 
@@ -622,16 +703,35 @@ export default function LivePaperMonitor() {
             </div>
           )}
 
-          {/* Session meta */}
-          {session && (session.atm_strike || session.expiry_date) && (
-            <div style={{
-              display: 'flex', gap: 12, marginBottom: 16, flexWrap: 'wrap',
-              padding: '8px 12px', background: 'var(--surface)', borderRadius: 8, fontSize: 11,
-            }}>
-              {session.ce_symbol  && <span style={{ color: '#22d3ee' }}>CE: {session.ce_symbol.split(':')[1]}</span>}
-              {session.pe_symbol  && <span style={{ color: '#f472b6' }}>PE: {session.pe_symbol.split(':')[1]}</span>}
-              {session.expiry_date && <span style={{ color: 'var(--text-secondary)' }}>Expiry: {session.expiry_date}</span>}
-              {session.approved_lots && <span style={{ color: 'var(--text-secondary)' }}>{session.approved_lots} lots</span>}
+          {/* Session meta — contracts + position details */}
+          {session && session.atm_strike && (
+            <div style={{ marginBottom: 16 }}>
+              <div style={{
+                display: 'flex', gap: 12, flexWrap: 'wrap',
+                padding: '8px 12px', background: 'var(--surface)', borderRadius: 8, fontSize: 11, marginBottom: 6,
+              }}>
+                <span style={{ color: '#f59e0b', fontWeight: 600 }}>{friendlyLeg(session, 'CE')}</span>
+                <span style={{ color: '#22d3ee', fontWeight: 600 }}>{friendlyLeg(session, 'PE')}</span>
+                {session.wing_ce_symbol && <span style={{ color: '#94a3b8' }}>Wings: ±{config?.params?.wing_width_steps ?? 2} steps</span>}
+              </div>
+              {run && (
+                <div style={{
+                  display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 8,
+                  padding: '8px 12px', background: 'var(--surface)', borderRadius: 8,
+                }}>
+                  {[
+                    { label: 'Entry Credit', value: run.entry_credit_total != null ? fmtINR(run.entry_credit_total).replace('+','') : '—', color: '#4ade80' },
+                    { label: 'Lot Size',     value: run.lot_size ?? '—',     color: 'var(--text-primary)' },
+                    { label: 'Lots',         value: run.approved_lots ?? session.approved_lots ?? '—', color: 'var(--text-primary)' },
+                    { label: 'Quantity',     value: run.lot_size && run.approved_lots ? run.lot_size * run.approved_lots : '—', color: 'var(--text-primary)' },
+                  ].map(({ label, value, color }) => (
+                    <div key={label}>
+                      <div style={{ fontSize: 10, color: 'var(--text-secondary)', marginBottom: 2 }}>{label}</div>
+                      <div style={{ fontSize: 13, fontWeight: 700, color }}>{value}</div>
+                    </div>
+                  ))}
+                </div>
+              )}
             </div>
           )}
 
@@ -651,6 +751,24 @@ export default function LivePaperMonitor() {
               color: 'var(--text-secondary)', fontSize: 12, border: '1px dashed var(--border)', borderRadius: 8,
             }}>
               {session?.status === 'waiting' ? 'Waiting for entry at ' + config?.entry_time + '…' : 'Chart will appear once trade opens'}
+            </div>
+          )}
+
+          {/* CE / PE premium charts */}
+          {(ceData.length > 0 || peData.length > 0) && (
+            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 16, marginTop: 16 }}>
+              <PremiumChart
+                data={ceData}
+                entryPrice={entryPrices.ce}
+                color="#f59e0b"
+                label={friendlyLeg(session, 'CE')}
+              />
+              <PremiumChart
+                data={peData}
+                entryPrice={entryPrices.pe}
+                color="#22d3ee"
+                label={friendlyLeg(session, 'PE')}
+              />
             </div>
           )}
 
