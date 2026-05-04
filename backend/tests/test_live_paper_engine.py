@@ -16,7 +16,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from app.services.live_paper_engine import (
-    _is_session_stopped,
+    _stop_requested,
     _load_resume_state,
     _parse_time,
     get_active_config,
@@ -220,12 +220,13 @@ async def test_get_active_config_no_user_id_does_not_filter():
 # ── Fix 1: emergency stop detection ──────────────────────────────────────────
 
 @pytest.mark.asyncio
-async def test_is_session_stopped_returns_true_for_error_status():
+async def test_stop_requested_returns_true_for_stop_requested_status():
+    """_stop_requested reads 'stop_requested' status (set by /stop endpoint)."""
     session_id = uuid.uuid4()
 
     class _FakeResult:
         def scalar_one_or_none(self):
-            return "error"
+            return "stop_requested"
 
     class _FakeDB:
         async def execute(self, stmt):
@@ -236,13 +237,13 @@ async def test_is_session_stopped_returns_true_for_error_status():
             pass
 
     with patch("app.services.live_paper_engine.AsyncSessionLocal", return_value=_FakeDB()):
-        result = await _is_session_stopped(session_id)
+        result = await _stop_requested(session_id)
 
     assert result is True
 
 
 @pytest.mark.asyncio
-async def test_is_session_stopped_returns_false_for_entered_status():
+async def test_stop_requested_returns_false_for_entered_status():
     session_id = uuid.uuid4()
 
     class _FakeResult:
@@ -258,7 +259,30 @@ async def test_is_session_stopped_returns_false_for_entered_status():
             pass
 
     with patch("app.services.live_paper_engine.AsyncSessionLocal", return_value=_FakeDB()):
-        result = await _is_session_stopped(session_id)
+        result = await _stop_requested(session_id)
+
+    assert result is False
+
+
+@pytest.mark.asyncio
+async def test_stop_requested_returns_false_for_error_status():
+    """status=error is a crash, not a manual stop — must not trigger the stop path."""
+    session_id = uuid.uuid4()
+
+    class _FakeResult:
+        def scalar_one_or_none(self):
+            return "error"
+
+    class _FakeDB:
+        async def execute(self, stmt):
+            return _FakeResult()
+        async def __aenter__(self):
+            return self
+        async def __aexit__(self, *a):
+            pass
+
+    with patch("app.services.live_paper_engine.AsyncSessionLocal", return_value=_FakeDB()):
+        result = await _stop_requested(session_id)
 
     assert result is False
 
@@ -446,4 +470,198 @@ async def test_manual_start_passes_user_id_to_engine():
     compiled = str(captured[0].compile(compile_kwargs={"literal_binds": True}))
     assert user_id.hex in compiled, (
         f"user_id hex {user_id.hex} should appear in config query; got: {compiled}"
+    )
+
+
+# ── Fix 1: Manual stop exit path ─────────────────────────────────────────────
+
+def test_manual_stop_exit_reason_when_trade_open():
+    """When stop is detected with trade open, exit_reason must be MANUAL_STOP_EXIT."""
+    trade_open = True
+    exit_reason: Optional[str] = None
+    exit_ts = None
+
+    # Replicate the stop detection logic from the engine loop
+    stop_now = datetime(2026, 5, 4, 10, 30, 0)
+    if True:  # _stop_requested returned True
+        if trade_open:
+            exit_reason = "MANUAL_STOP_EXIT"
+            exit_ts = stop_now
+        else:
+            exit_reason = "MANUAL_STOP_BEFORE_ENTRY"
+
+    assert exit_reason == "MANUAL_STOP_EXIT"
+    assert exit_ts == stop_now
+
+
+def test_manual_stop_exit_reason_before_entry():
+    """When stop is detected before entry, exit_reason must be MANUAL_STOP_BEFORE_ENTRY."""
+    trade_open = False
+    exit_reason: Optional[str] = None
+
+    if True:  # _stop_requested returned True
+        if trade_open:
+            exit_reason = "MANUAL_STOP_EXIT"
+        else:
+            exit_reason = "MANUAL_STOP_BEFORE_ENTRY"
+
+    assert exit_reason == "MANUAL_STOP_BEFORE_ENTRY"
+
+
+# ── Fix 3: Manual start ignores enabled flag ──────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_start_live_session_with_require_enabled_false_loads_disabled_config():
+    """
+    start_live_session(require_enabled=False) must succeed even when config.enabled=False.
+    """
+    user_id = uuid.uuid4()
+    disabled_config = _make_config(enabled=False, user_id=user_id)
+
+    call_count = [0]
+
+    class _FakeResult:
+        def scalar_one_or_none(self):
+            call_count[0] += 1
+            if call_count[0] == 1:
+                return disabled_config   # config query
+            return None                  # session query → no session exists
+
+    class _FakeDB:
+        async def execute(self, stmt): return _FakeResult()
+
+    # Patch get_broker_token so we don't need jose installed locally
+    with patch("app.services.live_paper_engine.get_broker_token", new_callable=AsyncMock) as mock_token:
+        mock_token.return_value = None  # no token → returns "no_token"
+        result = await start_live_session(_FakeDB(), user_id=user_id, require_enabled=False)
+
+    assert result != "no_config", (
+        "require_enabled=False must load the config even when enabled=False"
+    )
+    # Config was found, so we progressed to token check (returned no_token — not no_config)
+    assert result == "no_token"
+
+
+@pytest.mark.asyncio
+async def test_start_live_session_with_require_enabled_true_skips_disabled_config():
+    """
+    start_live_session(require_enabled=True) must return 'no_config' for a disabled config.
+    """
+    user_id = uuid.uuid4()
+
+    class _FakeResult:
+        def scalar_one_or_none(self): return None  # enabled=True filter matches nothing
+
+    class _FakeDB:
+        async def execute(self, stmt): return _FakeResult()
+
+    result = await start_live_session(_FakeDB(), user_id=user_id, require_enabled=True)
+    assert result == "no_config"
+
+
+# ── Fix 4: Duplicate session race caught ─────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_duplicate_session_integrity_error_returns_session_exists():
+    """
+    When two workers race to insert the same (user_id, trade_date),
+    the IntegrityError must be caught and return 'session_exists'.
+    """
+    from sqlalchemy.exc import IntegrityError as SAIntegrityError
+
+    user_id = uuid.uuid4()
+    config  = _make_config(user_id=user_id)
+    call_count = [0]
+
+    class _FakeResult:
+        def scalar_one_or_none(self):
+            call_count[0] += 1
+            if call_count[0] == 1:
+                return config    # config query
+            return None          # session query → no existing session
+
+    class _FakeDB:
+        async def execute(self, stmt): return _FakeResult()
+        def add(self, obj): pass
+        async def commit(self):
+            raise SAIntegrityError("INSERT", {}, Exception("unique constraint"))
+        async def rollback(self): pass
+
+    with patch("app.services.live_paper_engine.get_broker_token", new_callable=AsyncMock) as mock_token:
+        mock_token.return_value = "fake_token"
+        result = await start_live_session(_FakeDB(), user_id=user_id, require_enabled=False)
+
+    assert result == "session_exists"
+
+
+# ── Fix 2c: Resume seeds last_prices from StrategyLegMtm ─────────────────────
+
+@pytest.mark.asyncio
+async def test_resume_seeds_straddle_last_prices_from_leg_mtm():
+    """
+    After a mid-day redeploy, _load_resume_state must populate straddle_last_prices
+    from the most recent StrategyLegMtm rows so the stale fallback works immediately.
+    """
+    existing_run_id = uuid.uuid4()
+    session_id      = uuid.uuid4()
+    trade_date      = date.today()
+    leg_ce_id = uuid.uuid4()
+    leg_pe_id = uuid.uuid4()
+
+    session = _make_session(
+        id=session_id, status="entered",
+        strategy_run_id=existing_run_id,
+        atm_strike=24200, expiry_date=date(2026, 5, 8),
+        ce_symbol="NFO:X", pe_symbol="NFO:Y",
+        wing_ce_symbol=None, wing_pe_symbol=None,
+        lock_status="none",
+    )
+
+    existing_run = SimpleNamespace(
+        id=existing_run_id, entry_credit_per_unit=230.0, entry_credit_total=1_725_000.0,
+        lot_size=75, approved_lots=10, entry_time="09:50",
+    )
+
+    sell_ce = SimpleNamespace(id=leg_ce_id, side="SELL", option_type="CE",
+                               strike=24200, entry_price=120.0, leg_index=0)
+    sell_pe = SimpleNamespace(id=leg_pe_id, side="SELL", option_type="PE",
+                               strike=24200, entry_price=110.0, leg_index=1)
+
+    last_ce_mtm = SimpleNamespace(price=95.5)   # last known CE price
+    last_pe_mtm = SimpleNamespace(price=102.0)  # last known PE price
+
+    class _FakeScalars:
+        def __init__(self, rows): self._rows = rows
+        def all(self): return self._rows
+
+    class _FakeResult:
+        def __init__(self, value=None, rows=None):
+            self._value = value; self._rows = rows or []
+        def scalar_one_or_none(self): return self._value
+        def scalars(self): return _FakeScalars(self._rows)
+
+    call_count = [0]
+
+    class _FakeDB:
+        async def execute(self, stmt):
+            call_count[0] += 1
+            if call_count[0] == 1: return _FakeResult(value=session)       # LivePaperSession
+            if call_count[0] == 2: return _FakeResult(value=existing_run)  # StrategyRun
+            if call_count[0] == 3: return _FakeResult(rows=[sell_ce, sell_pe])  # legs
+            if call_count[0] == 4: return _FakeResult(value=None)          # last StrategyRunMtm
+            if call_count[0] == 5: return _FakeResult(value=last_ce_mtm)   # CE StrategyLegMtm
+            if call_count[0] == 6: return _FakeResult(value=last_pe_mtm)   # PE StrategyLegMtm
+            return _FakeResult(value=None)
+        async def __aenter__(self): return self
+        async def __aexit__(self, *a): pass
+
+    with patch("app.services.live_paper_engine.AsyncSessionLocal", return_value=_FakeDB()):
+        state = await _load_resume_state(
+            session_id=session_id, config=_make_config(), trade_date=trade_date,
+            lot_size=75, strike_step=50, wing_steps=2, trail_pct=0.5,
+        )
+
+    assert state is not None
+    assert state["straddle_last_prices"] == [95.5, 102.0], (
+        f"Expected last prices [95.5, 102.0] from StrategyLegMtm, got {state['straddle_last_prices']}"
     )

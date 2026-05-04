@@ -286,7 +286,7 @@ function ConfigPanel({ config, onSave }) {
           }}
         >
           <option value="paper">Paper</option>
-          <option value="live">Live ⚠</option>
+          <option value="live" disabled style={{ color: 'var(--text-muted)' }}>Live — coming later</option>
         </select>
       </div>
 

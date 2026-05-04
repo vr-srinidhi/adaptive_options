@@ -29,6 +29,7 @@ from typing import Any, Dict, List, Optional
 from zoneinfo import ZoneInfo
 
 from sqlalchemy import select, update
+from sqlalchemy.exc import IntegrityError
 
 from app.database import AsyncSessionLocal
 from app.models.live_paper import LivePaperConfig, LivePaperSession
@@ -100,25 +101,45 @@ async def get_session_for_date(db, trade_date: date, user_id=None) -> Optional[L
     return (await db.execute(q.limit(1))).scalar_one_or_none()
 
 
-async def start_live_session(db, user_id=None) -> None:
+async def start_live_session(
+    db,
+    user_id=None,
+    require_enabled: bool = True,
+) -> Optional[str]:
     """
-    Called by the scheduler at 09:14 (or manually via /start endpoint).
-    Creates a LivePaperSession and launches the background engine task.
-    No-op if:
-      - no enabled config found for the user
-      - session already exists for today
-      - no valid Zerodha token
+    Create a LivePaperSession and launch the engine task.
+
+    Parameters
+    ----------
+    require_enabled : bool
+        True  — scheduler path: only starts if config.enabled=True.
+        False — manual-start path: ignores enabled flag.
+
+    Returns
+    -------
+    None on success, or one of these error codes:
+      "no_config"      — no config found
+      "no_token"       — no valid Zerodha token
+      "session_exists" — session already exists for today
     """
-    config = await get_active_config(db, user_id=user_id)
+    if require_enabled:
+        config = await get_active_config(db, user_id=user_id)
+    else:
+        # Manual start: load config regardless of enabled flag
+        q = select(LivePaperConfig)
+        if user_id is not None:
+            q = q.where(LivePaperConfig.user_id == user_id)
+        config = (await db.execute(q.limit(1))).scalar_one_or_none()
+
     if not config:
-        log.info("Live paper: no enabled config for user=%s, skipping today.", user_id)
-        return
+        log.info("Live paper: no config for user=%s.", user_id)
+        return "no_config"
 
     today = date.today()
     existing = await get_session_for_date(db, today, user_id=config.user_id)
     if existing:
         log.info("Live paper: session already exists for %s (status=%s).", today, existing.status)
-        return
+        return "session_exists"
 
     # Validate token freshness (Zerodha tokens expire at 6 AM IST daily)
     if config.user_id:
@@ -128,8 +149,8 @@ async def start_live_session(db, user_id=None) -> None:
         access_token = get_access_token()
 
     if not access_token:
-        log.warning("Live paper: no Zerodha token — skipping session for %s.", today)
-        return
+        log.warning("Live paper: no Zerodha token for user=%s.", user_id)
+        return "no_token"
 
     session = LivePaperSession(
         config_id=config.id,
@@ -138,12 +159,18 @@ async def start_live_session(db, user_id=None) -> None:
         status="scheduled",
         waiting_spot_json=[],
     )
-    db.add(session)
-    await db.commit()
-    await db.refresh(session)
+    try:
+        db.add(session)
+        await db.commit()
+        await db.refresh(session)
+    except IntegrityError:
+        await db.rollback()
+        log.info("Live paper: duplicate session race for user=%s date=%s — skipping.", config.user_id, today)
+        return "session_exists"
 
     log.info("Live paper session created: %s for %s", session.id, today)
     asyncio.create_task(_run_session(session.id, config, access_token))
+    return None
 
 
 async def check_and_resume_sessions() -> None:
@@ -232,13 +259,13 @@ async def _append_waiting_spot(session_id: uuid.UUID, entry: Dict) -> None:
             await db.commit()
 
 
-async def _is_session_stopped(session_id: uuid.UUID) -> bool:
-    """Return True if the session has been manually stopped (status=error)."""
+async def _stop_requested(session_id: uuid.UUID) -> bool:
+    """Return True if the operator set status='stop_requested' via the /stop endpoint."""
     async with AsyncSessionLocal() as db:
         status = (await db.execute(
             select(LivePaperSession.status).where(LivePaperSession.id == session_id)
         )).scalar_one_or_none()
-    return status == "error"
+    return status == "stop_requested"
 
 
 # ── Resume state loader ───────────────────────────────────────────────────────
@@ -346,6 +373,32 @@ async def _load_resume_state(
             # trail_peak = trail_stop_level / trail_pct (reverse the trail_peak * trail_pct formula)
             trail_peak = float(last_mtm.trail_stop_level) / trail_pct if trail_pct else float(last_mtm.trail_stop_level)
 
+        # Seed last known prices from most recent StrategyLegMtm per leg (fix 2c).
+        # Without this, a missing first post-resume quote would fall back to None
+        # rather than the last observed price before the restart.
+        straddle_last_prices: List[Optional[float]] = [None, None]
+        for i, leg_id in enumerate(straddle_leg_ids):
+            row = (await db.execute(
+                select(StrategyLegMtm)
+                .where(StrategyLegMtm.leg_id == leg_id)
+                .order_by(StrategyLegMtm.timestamp.desc())
+                .limit(1)
+            )).scalar_one_or_none()
+            if row and row.price is not None:
+                straddle_last_prices[i] = float(row.price)
+
+        wing_last_prices: List[Optional[float]] = [None, None]
+        if wings_locked:
+            for i, leg_id in enumerate(wing_leg_ids):
+                row = (await db.execute(
+                    select(StrategyLegMtm)
+                    .where(StrategyLegMtm.leg_id == leg_id)
+                    .order_by(StrategyLegMtm.timestamp.desc())
+                    .limit(1)
+                )).scalar_one_or_none()
+                if row and row.price is not None:
+                    wing_last_prices[i] = float(row.price)
+
         # Recover entry timestamp
         actual_entry_ts: Optional[datetime] = None
         if existing_run.entry_time:
@@ -362,9 +415,11 @@ async def _load_resume_state(
         "run_id":               run_id,
         "trade_open":           session.status == "entered",
         "straddle_entry_prices": straddle_entry_prices,
+        "straddle_last_prices": straddle_last_prices,
         "straddle_leg_ids":     straddle_leg_ids,
         "straddle_legs":        straddle_legs,
         "wing_entry_prices":    wing_entry_prices,
+        "wing_last_prices":     wing_last_prices,
         "wing_leg_ids":         wing_leg_ids,
         "wing_legs":            wing_legs,
         "wings_locked":         wings_locked,
@@ -422,10 +477,8 @@ async def _run_session(
     trade_date = date.today()
 
     try:
-        await _update_session(session_id, status="waiting")
-        await _broadcast(session_id, {"type": "STATUS", "status": "waiting"})
-
         # Fetch instruments master once (heavy call, ~4k rows)
+        # Do this before status update so we don't briefly flash "waiting" and then crash.
         log.info("Live paper: fetching NFO instruments master...")
         instruments = await asyncio.to_thread(get_instruments_with_token, access_token)
         log.info("Live paper: loaded %d instruments.", len(instruments))
@@ -483,18 +536,30 @@ async def _run_session(
         _last_db_minute      = -1
         _last_waiting_minute = -1
 
-        # ── Resume: load existing state instead of creating a new StrategyRun ─
+        # ── Resume: load existing state ────────────────────────────────────────
+        saved = None
         if resume:
+            # Peek at session status before loading to decide the recovery path
+            async with AsyncSessionLocal() as db:
+                s = (await db.execute(
+                    select(LivePaperSession).where(LivePaperSession.id == session_id)
+                )).scalar_one_or_none()
+                original_status = s.status if s else None
+
             saved = await _load_resume_state(
                 session_id, config, trade_date, lot_size, strike_step, wing_steps, trail_pct
             )
+
             if saved:
+                # Reuse existing StrategyRun — no new row needed
                 run_id                = saved["run_id"]
                 trade_open            = saved["trade_open"]
                 straddle_entry_prices = saved["straddle_entry_prices"]
+                straddle_last_prices  = saved["straddle_last_prices"]
                 straddle_leg_ids      = saved["straddle_leg_ids"]
                 straddle_legs         = saved["straddle_legs"]
                 wing_entry_prices     = saved["wing_entry_prices"]
+                wing_last_prices      = saved["wing_last_prices"]
                 wing_leg_ids          = saved["wing_leg_ids"]
                 wing_legs             = saved["wing_legs"]
                 wings_locked          = saved["wings_locked"]
@@ -518,28 +583,49 @@ async def _run_session(
                 log.info("Live paper: resumed session %s with existing run %s (trade_open=%s)",
                          session_id, run_id, trade_open)
 
-        if not resume or not trade_open:
-            # Create StrategyRun row upfront so MTM rows have a valid FK
-            # (skipped on resume when an existing run is reused)
-            if not resume:
-                async with AsyncSessionLocal() as db:
-                    db.add(StrategyRun(
-                        id=run_id,
-                        user_id=config.user_id,
-                        strategy_id=config.strategy_id,
-                        strategy_version="v1",
-                        run_type="live_paper_session",
-                        executor="straddle_adjustment_v1",
-                        instrument=instrument,
-                        trade_date=trade_date,
-                        status="in_progress",
-                        capital=capital,
-                        config_json={**params, "strategy_id": config.strategy_id, "entry_time": config.entry_time},
-                        result_json={"live": True},
-                    ))
-                    await db.commit()
+            elif original_status == "entered":
+                # Session was entered but has no strategy_run_id — cannot reconstruct
+                # entry state (prices, lot count) reliably; safest is to fail loudly.
+                await _update_session(
+                    session_id,
+                    status="error",
+                    error_message="Resume failed: entered session has no strategy_run_id. Manual reset required.",
+                )
+                await _broadcast(session_id, {
+                    "type": "ERROR",
+                    "message": "Resume failed: no strategy_run found for entered session.",
+                })
+                return
+            # else: session was 'waiting' with no run — fall through to create fresh StrategyRun
 
-                await _update_session(session_id, strategy_run_id=run_id)
+        # ── Set session status (don't downgrade an entered resume to waiting) ──
+        if resume and trade_open:
+            await _update_session(session_id, status="entered")
+        else:
+            await _update_session(session_id, status="waiting")
+            await _broadcast(session_id, {"type": "STATUS", "status": "waiting"})
+
+        # ── Create StrategyRun if this is a fresh start or waiting-resume ──────
+        # Skip when resuming an already-open trade (saved already holds run_id).
+        if not (resume and trade_open):
+            async with AsyncSessionLocal() as db:
+                db.add(StrategyRun(
+                    id=run_id,
+                    user_id=config.user_id,
+                    strategy_id=config.strategy_id,
+                    strategy_version="v1",
+                    run_type="live_paper_session",
+                    executor="straddle_adjustment_v1",
+                    instrument=instrument,
+                    trade_date=trade_date,
+                    status="in_progress",
+                    capital=capital,
+                    config_json={**params, "strategy_id": config.strategy_id, "entry_time": config.entry_time},
+                    result_json={"live": True},
+                ))
+                await db.commit()
+
+            await _update_session(session_id, strategy_run_id=run_id)
 
         spot_symbol = SPOT_SYMBOLS.get(instrument, "NSE:NIFTY 50")
 
@@ -550,10 +636,17 @@ async def _run_session(
             t   = now.time()
 
             # Check for manual stop signal (written by /stop endpoint)
-            if await _is_session_stopped(session_id):
-                log.info("Live paper: session %s manually stopped, exiting loop.", session_id)
-                await _broadcast(session_id, {"type": "DONE", "status": "error", "exit_reason": "MANUAL_STOP"})
-                return
+            if await _stop_requested(session_id):
+                log.info("Live paper: session %s stop_requested, finalizing.", session_id)
+                now_stop = datetime.now(IST)
+                if trade_open:
+                    exit_reason = "MANUAL_STOP_EXIT"
+                    exit_ts = now_stop
+                    await _write_event(run_id, now_stop, "EXIT", "MANUAL_STOP_EXIT",
+                                       payload={"stopped_by": "user"})
+                else:
+                    exit_reason = "MANUAL_STOP_BEFORE_ENTRY"
+                break  # fall through to finalization
 
             if t < _SESSION_START or t >= _SESSION_END:
                 if t >= _SESSION_END:

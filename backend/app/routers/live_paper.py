@@ -326,7 +326,13 @@ async def manual_start(
     """Manually trigger today's live paper session (bypasses 09:14 scheduler)."""
     if get_active_session_id() is not None:
         raise HTTPException(status_code=409, detail="A session is already running.")
-    await start_live_session(db, user_id=user.id)
+    error = await start_live_session(db, user_id=user.id, require_enabled=False)
+    if error == "no_config":
+        raise HTTPException(status_code=404, detail="No live paper config found. Please configure the strategy first.")
+    if error == "no_token":
+        raise HTTPException(status_code=409, detail="No valid Zerodha token. Please connect Zerodha first.")
+    if error == "session_exists":
+        raise HTTPException(status_code=409, detail="A session already exists for today.")
     return {"detail": "Session started."}
 
 
@@ -339,15 +345,15 @@ async def manual_stop(
     session = await _get_today_session(db, user)
     if not session:
         raise HTTPException(status_code=404, detail="No session found for today.")
-    if session.status in ("exited", "no_trade", "error"):
-        raise HTTPException(status_code=409, detail=f"Session already in terminal state: {session.status}.")
+    if session.status in ("exited", "no_trade", "error", "stop_requested"):
+        raise HTTPException(status_code=409, detail=f"Session already in terminal/stop-requested state: {session.status}.")
     await db.execute(
         update(LivePaperSession)
         .where(LivePaperSession.id == session.id)
-        .values(status="error", error_message="Manually stopped by user.")
+        .values(status="stop_requested")
     )
     await db.commit()
-    return {"detail": "Stop signal sent. Session will exit on next minute tick."}
+    return {"detail": "Stop signal sent. Session will finalize on the next poll tick."}
 
 
 # ── SSE stream ────────────────────────────────────────────────────────────────
