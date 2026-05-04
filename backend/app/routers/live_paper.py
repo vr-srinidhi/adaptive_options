@@ -226,6 +226,15 @@ async def update_config(
 ):
     cfg = await _get_or_create_config(db, user)
 
+    if body.execution_mode == "live":
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "execution_mode='live' is disabled — live order placement, "
+                "kill-switch, and position reconciliation are not yet implemented."
+            ),
+        )
+
     if body.strategy_id    is not None: cfg.strategy_id    = body.strategy_id
     if body.instrument     is not None: cfg.instrument     = body.instrument
     if body.capital        is not None: cfg.capital        = body.capital
@@ -317,7 +326,7 @@ async def manual_start(
     """Manually trigger today's live paper session (bypasses 09:14 scheduler)."""
     if get_active_session_id() is not None:
         raise HTTPException(status_code=409, detail="A session is already running.")
-    await start_live_session(db)
+    await start_live_session(db, user_id=user.id)
     return {"detail": "Session started."}
 
 

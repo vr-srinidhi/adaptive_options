@@ -10,7 +10,7 @@ import uuid
 
 from sqlalchemy import (
     BigInteger, Boolean, Column, Date, Integer, Numeric,
-    String, TIMESTAMP, Text, func,
+    String, TIMESTAMP, Text, UniqueConstraint, func,
 )
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 
@@ -54,6 +54,9 @@ class LivePaperSession(Base):
     phase (09:14–09:49) for charting the full-day context on the monitor.
     """
     __tablename__ = "live_paper_sessions"
+    __table_args__ = (
+        UniqueConstraint("user_id", "trade_date", name="uq_live_paper_session_user_date"),
+    )
 
     id              = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     config_id       = Column(UUID(as_uuid=True), nullable=True)       # soft FK to live_paper_configs

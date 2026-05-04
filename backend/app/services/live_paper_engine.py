@@ -33,7 +33,7 @@ from sqlalchemy import select, update
 from app.database import AsyncSessionLocal
 from app.models.live_paper import LivePaperConfig, LivePaperSession
 from app.models.strategy_run import (
-    StrategyRun, StrategyRunEvent, StrategyRunLeg, StrategyRunMtm,
+    StrategyLegMtm, StrategyRun, StrategyRunEvent, StrategyRunLeg, StrategyRunMtm,
 )
 from app.services.charges_service import (
     compute_leg_entry_charges,
@@ -85,37 +85,37 @@ async def _broadcast(session_id: uuid.UUID, data: Dict) -> None:
 
 # ── Startup helpers ───────────────────────────────────────────────────────────
 
-async def get_active_config(db) -> Optional[LivePaperConfig]:
-    """Return the first enabled config, or None."""
-    row = (await db.execute(
-        select(LivePaperConfig).where(LivePaperConfig.enabled.is_(True)).limit(1)
-    )).scalar_one_or_none()
-    return row
+async def get_active_config(db, user_id=None) -> Optional[LivePaperConfig]:
+    """Return the enabled config for the given user (or global first if no user_id)."""
+    q = select(LivePaperConfig).where(LivePaperConfig.enabled.is_(True))
+    if user_id is not None:
+        q = q.where(LivePaperConfig.user_id == user_id)
+    return (await db.execute(q.limit(1))).scalar_one_or_none()
 
 
-async def get_session_for_date(db, trade_date: date) -> Optional[LivePaperSession]:
-    row = (await db.execute(
-        select(LivePaperSession).where(LivePaperSession.trade_date == trade_date).limit(1)
-    )).scalar_one_or_none()
-    return row
+async def get_session_for_date(db, trade_date: date, user_id=None) -> Optional[LivePaperSession]:
+    q = select(LivePaperSession).where(LivePaperSession.trade_date == trade_date)
+    if user_id is not None:
+        q = q.where(LivePaperSession.user_id == user_id)
+    return (await db.execute(q.limit(1))).scalar_one_or_none()
 
 
-async def start_live_session(db) -> None:
+async def start_live_session(db, user_id=None) -> None:
     """
-    Called by the scheduler at 09:14.
+    Called by the scheduler at 09:14 (or manually via /start endpoint).
     Creates a LivePaperSession and launches the background engine task.
     No-op if:
-      - no enabled config found
+      - no enabled config found for the user
       - session already exists for today
       - no valid Zerodha token
     """
-    config = await get_active_config(db)
+    config = await get_active_config(db, user_id=user_id)
     if not config:
-        log.info("Live paper: no enabled config, skipping today.")
+        log.info("Live paper: no enabled config for user=%s, skipping today.", user_id)
         return
 
     today = date.today()
-    existing = await get_session_for_date(db, today)
+    existing = await get_session_for_date(db, today, user_id=config.user_id)
     if existing:
         log.info("Live paper: session already exists for %s (status=%s).", today, existing.status)
         return
@@ -167,6 +167,7 @@ async def check_and_resume_sessions() -> None:
         if not config:
             return
 
+        # Always re-fetch token from DB on resume — picks up tokens stored after a crash
         if config.user_id:
             access_token = await get_broker_token(db, config.user_id)
         else:
@@ -231,6 +232,162 @@ async def _append_waiting_spot(session_id: uuid.UUID, entry: Dict) -> None:
             await db.commit()
 
 
+async def _is_session_stopped(session_id: uuid.UUID) -> bool:
+    """Return True if the session has been manually stopped (status=error)."""
+    async with AsyncSessionLocal() as db:
+        status = (await db.execute(
+            select(LivePaperSession.status).where(LivePaperSession.id == session_id)
+        )).scalar_one_or_none()
+    return status == "error"
+
+
+# ── Resume state loader ───────────────────────────────────────────────────────
+
+async def _load_resume_state(
+    session_id: uuid.UUID,
+    config: LivePaperConfig,
+    trade_date: date,
+    lot_size: int,
+    strike_step: int,
+    wing_steps: int,
+    trail_pct: float,
+) -> Optional[Dict]:
+    """
+    Load existing session/run/leg/MTM state from DB for mid-day resume.
+    Returns a dict of recovered state variables, or None if no run exists yet.
+    """
+    async with AsyncSessionLocal() as db:
+        session = (await db.execute(
+            select(LivePaperSession).where(LivePaperSession.id == session_id)
+        )).scalar_one_or_none()
+        if not session or not session.strategy_run_id:
+            return None
+
+        run_id = session.strategy_run_id
+        existing_run = (await db.execute(
+            select(StrategyRun).where(StrategyRun.id == run_id)
+        )).scalar_one_or_none()
+        if not existing_run:
+            return None
+
+        legs = (await db.execute(
+            select(StrategyRunLeg)
+            .where(StrategyRunLeg.run_id == run_id)
+            .order_by(StrategyRunLeg.leg_index)
+        )).scalars().all()
+
+        sell_legs = [l for l in legs if l.side == "SELL"]
+        buy_legs  = [l for l in legs if l.side == "BUY"]
+
+        # Reconstruct entry prices
+        straddle_entry_prices: List[Optional[float]] = [None, None]
+        straddle_leg_ids      = [uuid.uuid4(), uuid.uuid4()]
+        if len(sell_legs) >= 2:
+            straddle_entry_prices = [
+                float(sell_legs[0].entry_price) if sell_legs[0].entry_price else None,
+                float(sell_legs[1].entry_price) if sell_legs[1].entry_price else None,
+            ]
+            straddle_leg_ids = [sell_legs[0].id, sell_legs[1].id]
+
+        wing_entry_prices: List[Optional[float]] = [None, None]
+        wing_leg_ids      = [uuid.uuid4(), uuid.uuid4()]
+        wings_locked      = False
+        lock_reason: Optional[str] = None
+        if len(buy_legs) >= 2:
+            wings_locked = True
+            wing_entry_prices = [
+                float(buy_legs[0].entry_price) if buy_legs[0].entry_price else None,
+                float(buy_legs[1].entry_price) if buy_legs[1].entry_price else None,
+            ]
+            wing_leg_ids = [buy_legs[0].id, buy_legs[1].id]
+            raw_lock = session.lock_status or "profit_locked"
+            lock_reason = raw_lock.replace("_locked", "")
+
+        # Reconstruct strike tuples from leg data
+        ce_sell = next((l for l in sell_legs if l.option_type == "CE"), None)
+        pe_sell = next((l for l in sell_legs if l.option_type == "PE"), None)
+        ce_buy  = next((l for l in buy_legs  if l.option_type == "CE"), None)
+        pe_buy  = next((l for l in buy_legs  if l.option_type == "PE"), None)
+
+        atm_strike     = session.atm_strike
+        expiry_date    = session.expiry_date
+        wing_ce_strike = ce_buy.strike if ce_buy else (atm_strike + wing_steps * strike_step if atm_strike else None)
+        wing_pe_strike = pe_buy.strike if pe_buy else (atm_strike - wing_steps * strike_step if atm_strike else None)
+
+        straddle_legs = [("SELL", "CE", ce_sell.strike if ce_sell else atm_strike),
+                         ("SELL", "PE", pe_sell.strike if pe_sell else atm_strike)]
+        wing_legs     = [("BUY",  "CE", wing_ce_strike),
+                         ("BUY",  "PE", wing_pe_strike)]
+
+        # Recompute charges from entry prices (same formula as original entry)
+        approved_lots = int(existing_run.approved_lots or 1)
+        entry_credit_per_unit = float(existing_run.entry_credit_per_unit or 0)
+        entry_credit_total    = float(existing_run.entry_credit_total or 0)
+        entry_charges = (
+            compute_leg_entry_charges(approved_lots, lot_size, straddle_legs, straddle_entry_prices)
+            if all(p is not None for p in straddle_entry_prices) else 0.0
+        )
+        wing_entry_charges = (
+            compute_leg_entry_charges(approved_lots, lot_size, wing_legs, wing_entry_prices)
+            if wings_locked and all(p is not None for p in wing_entry_prices) else 0.0
+        )
+
+        # Recover trail state from last MTM row
+        trail_active = False
+        trail_peak   = 0.0
+        last_mtm = (await db.execute(
+            select(StrategyRunMtm)
+            .where(StrategyRunMtm.run_id == run_id)
+            .order_by(StrategyRunMtm.timestamp.desc())
+            .limit(1)
+        )).scalar_one_or_none()
+        if last_mtm and last_mtm.trail_stop_level is not None:
+            trail_active = True
+            # trail_peak = trail_stop_level / trail_pct (reverse the trail_peak * trail_pct formula)
+            trail_peak = float(last_mtm.trail_stop_level) / trail_pct if trail_pct else float(last_mtm.trail_stop_level)
+
+        # Recover entry timestamp
+        actual_entry_ts: Optional[datetime] = None
+        if existing_run.entry_time:
+            try:
+                h, m = existing_run.entry_time.split(":")
+                actual_entry_ts = datetime(
+                    trade_date.year, trade_date.month, trade_date.day,
+                    int(h), int(m), tzinfo=IST,
+                )
+            except Exception:
+                pass
+
+    return {
+        "run_id":               run_id,
+        "trade_open":           session.status == "entered",
+        "straddle_entry_prices": straddle_entry_prices,
+        "straddle_leg_ids":     straddle_leg_ids,
+        "straddle_legs":        straddle_legs,
+        "wing_entry_prices":    wing_entry_prices,
+        "wing_leg_ids":         wing_leg_ids,
+        "wing_legs":            wing_legs,
+        "wings_locked":         wings_locked,
+        "lock_reason":          lock_reason,
+        "wing_ce_strike":       wing_ce_strike,
+        "wing_pe_strike":       wing_pe_strike,
+        "atm_strike":           atm_strike,
+        "expiry_date":          expiry_date,
+        "ce_symbol":            session.ce_symbol,
+        "pe_symbol":            session.pe_symbol,
+        "wing_ce_symbol":       session.wing_ce_symbol,
+        "wing_pe_symbol":       session.wing_pe_symbol,
+        "approved_lots":        approved_lots,
+        "entry_credit_per_unit": entry_credit_per_unit,
+        "entry_credit_total":   entry_credit_total,
+        "entry_charges":        entry_charges,
+        "wing_entry_charges":   wing_entry_charges,
+        "trail_active":         trail_active,
+        "trail_peak":           trail_peak,
+        "actual_entry_ts":      actual_entry_ts,
+    }
+
+
 # ── Main engine task ──────────────────────────────────────────────────────────
 
 async def _run_session(
@@ -260,6 +417,7 @@ async def _run_session(
     wing_steps        = int(params.get("wing_width_steps", 2))
     sq_time           = _parse_time(params.get("time_exit", "15:25"), default=_SQ_TIME)
     poll_interval     = max(3, int(params.get("poll_interval_seconds", 60)))
+    stop_threshold    = -(capital * stop_capital_pct)
 
     trade_date = date.today()
 
@@ -272,45 +430,26 @@ async def _run_session(
         instruments = await asyncio.to_thread(get_instruments_with_token, access_token)
         log.info("Live paper: loaded %d instruments.", len(instruments))
 
-        # Create StrategyRun row upfront so MTM rows have a valid FK
-        run_id = uuid.uuid4()
-        async with AsyncSessionLocal() as db:
-            db.add(StrategyRun(
-                id=run_id,
-                user_id=config.user_id,
-                strategy_id=config.strategy_id,
-                strategy_version="v1",
-                run_type="live_paper_session",
-                executor="straddle_adjustment_v1",
-                instrument=instrument,
-                trade_date=trade_date,
-                status="in_progress",
-                capital=capital,
-                config_json={**params, "strategy_id": config.strategy_id, "entry_time": config.entry_time},
-                result_json={"live": True},
-            ))
-            await db.commit()
-
-        await _update_session(session_id, strategy_run_id=run_id)
-
-        # ── Pre-entry loop ─────────────────────────────────────────────────────
-        spot_symbol = SPOT_SYMBOLS.get(instrument, "NSE:NIFTY 50")
-
-        # Contract spec (lot_size, strike_step, margin)
+        # Contract spec (lot_size, strike_step)
         async with AsyncSessionLocal() as db:
             spec = await get_contract_spec(db, instrument, trade_date)
-        lot_size   = spec.lot_size
+        lot_size    = spec.lot_size
         strike_step = spec.strike_step
         margin_per_lot = float(spec.estimated_margin_per_lot or 0) or (24000 * lot_size * 0.12)
 
-        # Engine state (mirrors straddle_adjustment_executor)
+        # ── Initialise engine state ────────────────────────────────────────────
+        run_id = uuid.uuid4()
         trade_open            = False
         straddle_entry_prices: List[Optional[float]] = [None, None]
         straddle_last_prices:  List[Optional[float]] = [None, None]
-        wings_locked          = False
-        lock_reason: Optional[str] = None
+        straddle_legs: List   = []
+        straddle_leg_ids      = [uuid.uuid4(), uuid.uuid4()]
         wing_entry_prices:    List[Optional[float]] = [None, None]
         wing_last_prices:     List[Optional[float]] = [None, None]
+        wing_legs: List       = []
+        wing_leg_ids          = [uuid.uuid4(), uuid.uuid4()]
+        wings_locked          = False
+        lock_reason: Optional[str] = None
         wing_lock_ts: Optional[datetime] = None
         wing_entry_charges    = 0.0
         entry_credit_per_unit = 0.0
@@ -324,30 +463,97 @@ async def _run_session(
         trail_stop_at_exit: Optional[float] = None
         approved_lots  = 1
 
-        atm_strike: Optional[int]    = None
-        expiry_date: Optional[date]  = None
-        ce_symbol: Optional[str]     = None
-        pe_symbol: Optional[str]     = None
+        atm_strike: Optional[int]     = None
+        expiry_date: Optional[date]   = None
+        ce_symbol: Optional[str]      = None
+        pe_symbol: Optional[str]      = None
         wing_ce_symbol: Optional[str] = None
         wing_pe_symbol: Optional[str] = None
         wing_ce_strike: Optional[int] = None
         wing_pe_strike: Optional[int] = None
 
-        straddle_legs: List = []
-        wing_legs: List     = []
-        straddle_leg_ids    = [uuid.uuid4(), uuid.uuid4()]
-        wing_leg_ids        = [uuid.uuid4(), uuid.uuid4()]
+        # Stale-minutes tracking per leg (for strategy_leg_mtm.stale_minutes)
+        ce_stale = 0
+        pe_stale = 0
+        wce_stale = 0
+        wpe_stale = 0
 
         # Minute-level dedup: DB MTM rows and waiting_spot_json stay at 1-min
         # granularity regardless of poll_interval. SSE broadcasts every tick.
         _last_db_minute      = -1
         _last_waiting_minute = -1
 
+        # ── Resume: load existing state instead of creating a new StrategyRun ─
+        if resume:
+            saved = await _load_resume_state(
+                session_id, config, trade_date, lot_size, strike_step, wing_steps, trail_pct
+            )
+            if saved:
+                run_id                = saved["run_id"]
+                trade_open            = saved["trade_open"]
+                straddle_entry_prices = saved["straddle_entry_prices"]
+                straddle_leg_ids      = saved["straddle_leg_ids"]
+                straddle_legs         = saved["straddle_legs"]
+                wing_entry_prices     = saved["wing_entry_prices"]
+                wing_leg_ids          = saved["wing_leg_ids"]
+                wing_legs             = saved["wing_legs"]
+                wings_locked          = saved["wings_locked"]
+                lock_reason           = saved["lock_reason"]
+                wing_ce_strike        = saved["wing_ce_strike"]
+                wing_pe_strike        = saved["wing_pe_strike"]
+                atm_strike            = saved["atm_strike"]
+                expiry_date           = saved["expiry_date"]
+                ce_symbol             = saved["ce_symbol"]
+                pe_symbol             = saved["pe_symbol"]
+                wing_ce_symbol        = saved["wing_ce_symbol"]
+                wing_pe_symbol        = saved["wing_pe_symbol"]
+                approved_lots         = saved["approved_lots"]
+                entry_credit_per_unit = saved["entry_credit_per_unit"]
+                entry_credit_total    = saved["entry_credit_total"]
+                entry_charges         = saved["entry_charges"]
+                wing_entry_charges    = saved["wing_entry_charges"]
+                trail_active          = saved["trail_active"]
+                trail_peak            = saved["trail_peak"]
+                actual_entry_ts       = saved["actual_entry_ts"]
+                log.info("Live paper: resumed session %s with existing run %s (trade_open=%s)",
+                         session_id, run_id, trade_open)
+
+        if not resume or not trade_open:
+            # Create StrategyRun row upfront so MTM rows have a valid FK
+            # (skipped on resume when an existing run is reused)
+            if not resume:
+                async with AsyncSessionLocal() as db:
+                    db.add(StrategyRun(
+                        id=run_id,
+                        user_id=config.user_id,
+                        strategy_id=config.strategy_id,
+                        strategy_version="v1",
+                        run_type="live_paper_session",
+                        executor="straddle_adjustment_v1",
+                        instrument=instrument,
+                        trade_date=trade_date,
+                        status="in_progress",
+                        capital=capital,
+                        config_json={**params, "strategy_id": config.strategy_id, "entry_time": config.entry_time},
+                        result_json={"live": True},
+                    ))
+                    await db.commit()
+
+                await _update_session(session_id, strategy_run_id=run_id)
+
+        spot_symbol = SPOT_SYMBOLS.get(instrument, "NSE:NIFTY 50")
+
         # ── Main loop ──────────────────────────────────────────────────────────
         while True:
             await asyncio.sleep(poll_interval)
             now = datetime.now(IST)
             t   = now.time()
+
+            # Check for manual stop signal (written by /stop endpoint)
+            if await _is_session_stopped(session_id):
+                log.info("Live paper: session %s manually stopped, exiting loop.", session_id)
+                await _broadcast(session_id, {"type": "DONE", "status": "error", "exit_reason": "MANUAL_STOP"})
+                return
 
             if t < _SESSION_START or t >= _SESSION_END:
                 if t >= _SESSION_END:
@@ -445,24 +651,42 @@ async def _run_session(
             w_ce_price = opt_quotes.get(wing_ce_symbol)
             w_pe_price = opt_quotes.get(wing_pe_symbol)
 
-            if s_ce_price is not None: straddle_last_prices[0] = s_ce_price
-            if s_pe_price is not None: straddle_last_prices[1] = s_pe_price
-            if w_ce_price is not None: wing_last_prices[0] = w_ce_price
-            if w_pe_price is not None: wing_last_prices[1] = w_pe_price
+            # Track last known prices (used as stale fallback for MTM)
+            if s_ce_price is not None:
+                straddle_last_prices[0] = s_ce_price
+                ce_stale = 0
+            else:
+                ce_stale += 1
 
-            straddle_cur = [s_ce_price, s_pe_price]
+            if s_pe_price is not None:
+                straddle_last_prices[1] = s_pe_price
+                pe_stale = 0
+            else:
+                pe_stale += 1
+
+            if w_ce_price is not None:
+                wing_last_prices[0] = w_ce_price
+                wce_stale = 0
+            else:
+                wce_stale += 1
+
+            if w_pe_price is not None:
+                wing_last_prices[1] = w_pe_price
+                wpe_stale = 0
+            else:
+                wpe_stale += 1
 
             # ── Entry ──────────────────────────────────────────────────────────
             if not trade_open:
-                if any(p is None for p in straddle_cur):
+                if s_ce_price is None or s_pe_price is None:
                     await _write_event(run_id, now, "HOLD", "MISSING_LEG_PRICE")
                     await _broadcast(session_id, {"type": "HOLD", "timestamp": now.isoformat(), "reason": "MISSING_LEG_PRICE", "spot": spot})
                     continue
 
                 trade_open = True
                 actual_entry_ts = now
-                straddle_entry_prices = list(straddle_cur)
-                entry_credit_per_unit = (straddle_entry_prices[0] or 0) + (straddle_entry_prices[1] or 0)
+                straddle_entry_prices = [s_ce_price, s_pe_price]
+                entry_credit_per_unit = s_ce_price + s_pe_price
                 entry_credit_total    = entry_credit_per_unit * lot_size * approved_lots
                 entry_charges         = compute_leg_entry_charges(approved_lots, lot_size, straddle_legs, straddle_entry_prices)
 
@@ -514,7 +738,13 @@ async def _run_session(
                          t, straddle_entry_prices[0], straddle_entry_prices[1], entry_credit_total)
                 continue
 
-            # ── Trade open: MTM calculation ────────────────────────────────────
+            # ── Trade open: MTM calculation using last-price fallback ──────────
+            # If the current quote is missing, fall back to the last known price
+            # so no leg is silently dropped from the MTM sum.
+            ce_for_mtm = s_ce_price if s_ce_price is not None else straddle_last_prices[0]
+            pe_for_mtm = s_pe_price if s_pe_price is not None else straddle_last_prices[1]
+            straddle_cur = [ce_for_mtm, pe_for_mtm]
+
             straddle_gross = sum(
                 (ep - cp)
                 for ep, cp in zip(straddle_entry_prices, straddle_cur)
@@ -523,26 +753,35 @@ async def _run_session(
 
             wing_gross = 0.0
             if wings_locked:
-                wing_cur = [w_ce_price, w_pe_price]
+                wce_for_mtm = w_ce_price if w_ce_price is not None else wing_last_prices[0]
+                wpe_for_mtm = w_pe_price if w_pe_price is not None else wing_last_prices[1]
+                wing_cur = [wce_for_mtm, wpe_for_mtm]
                 wing_gross = sum(
                     (cp - ep)
                     for ep, cp in zip(wing_entry_prices, wing_cur)
                     if ep is not None and cp is not None
                 ) * lot_size * approved_lots
+            else:
+                wing_cur = [w_ce_price, w_pe_price]
 
             gross_mtm = straddle_gross + wing_gross
 
             if wings_locked:
                 active_legs = straddle_legs + wing_legs
-                all_cur     = list(straddle_cur) + [w_ce_price, w_pe_price]
+                all_cur     = list(straddle_cur) + list(wing_cur)
                 est_exit    = compute_leg_exit_charges_estimate(approved_lots, lot_size, active_legs, all_cur)
             else:
                 est_exit = compute_leg_exit_charges_estimate(approved_lots, lot_size, straddle_legs, straddle_cur)
 
             net_mtm = gross_mtm - entry_charges - wing_entry_charges - est_exit
 
-            # ── Lock check ─────────────────────────────────────────────────────
-            if not wings_locked:
+            # ── Hard stop: evaluated BEFORE lock to prevent wing buy on deep loss ──
+            fired: Optional[str] = None
+            if net_mtm <= stop_threshold:
+                fired = "STOP_EXIT"
+
+            # ── Lock check (only if trade is still alive after stop check) ─────
+            if not wings_locked and fired is None:
                 profit_lock_hit = lock_trigger > 0 and net_mtm >= lock_trigger
                 loss_lock_hit   = loss_lock_trigger > 0 and net_mtm <= -loss_lock_trigger
                 if (profit_lock_hit or loss_lock_hit) and w_ce_price and w_pe_price:
@@ -588,8 +827,7 @@ async def _run_session(
                     })
                     log.info("Live paper: %s fired at %s net_mtm=%.0f", label, t, net_mtm)
 
-            # ── Exit conditions ────────────────────────────────────────────────
-            stop_threshold = -(capital * stop_capital_pct)
+            # ── Trail ─────────────────────────────────────────────────────────
             trail_stop_level: Optional[float] = None
             if trail_trigger > 0 and trail_pct > 0:
                 if not trail_active and net_mtm >= trail_trigger:
@@ -600,24 +838,24 @@ async def _run_session(
                         trail_peak = net_mtm
                     trail_stop_level = round(trail_peak * trail_pct, 2)
 
-            fired: Optional[str] = None
-            if net_mtm <= stop_threshold:
-                fired = "STOP_EXIT"
-            elif trail_active and trail_stop_level is not None and net_mtm <= trail_stop_level:
-                fired = "TRAIL_EXIT"
-            elif t >= sq_time:
-                fired = "TIME_EXIT"
+            # ── Remaining exit conditions ──────────────────────────────────────
+            if fired is None:
+                if trail_active and trail_stop_level is not None and net_mtm <= trail_stop_level:
+                    fired = "TRAIL_EXIT"
+                elif t >= sq_time:
+                    fired = "TIME_EXIT"
 
             # ── Persist MTM row (once per minute; SSE broadcasts every tick) ──
             active_leg_ids    = straddle_leg_ids + (wing_leg_ids if wings_locked else [])
-            active_cur_prices = [s_ce_price, s_pe_price] + ([w_ce_price, w_pe_price] if wings_locked else [])
+            active_cur_prices = list(straddle_cur) + (list(wing_cur) if wings_locked else [])
             active_entry_p    = straddle_entry_prices + (wing_entry_prices if wings_locked else [])
             active_sides      = ["SELL", "SELL"] + (["BUY", "BUY"] if wings_locked else [])
+            active_stale      = [ce_stale, pe_stale] + ([wce_stale, wpe_stale] if wings_locked else [])
             if now.minute != _last_db_minute or fired:
                 await _write_mtm(run_id, now, spot, None, gross_mtm, est_exit, net_mtm,
                                  trail_stop_level, fired,
                                  active_leg_ids, active_cur_prices, active_entry_p, active_sides,
-                                 lot_size, approved_lots)
+                                 active_stale, lot_size, approved_lots)
                 _last_db_minute = now.minute
 
             await _update_session(
@@ -807,6 +1045,7 @@ async def _write_mtm(
     leg_cur_prices: List[Optional[float]],
     leg_entry_prices: List[Optional[float]],
     leg_sides: List[str],
+    leg_stale_minutes: List[int],
     lot_size: int,
     lots: int,
 ) -> None:
@@ -823,21 +1062,22 @@ async def _write_mtm(
             trail_stop_level=trail_stop,
             event_code=event_code,
         ))
-        for leg_id, cur_p, ep, side in zip(leg_ids, leg_cur_prices, leg_entry_prices, leg_sides):
+        for leg_id, cur_p, ep, side, stale in zip(
+            leg_ids, leg_cur_prices, leg_entry_prices, leg_sides, leg_stale_minutes
+        ):
             if ep is None:
                 continue
             if side == "SELL":
                 leg_pnl = round((ep - (cur_p or ep)) * lot_size * lots, 2) if cur_p else None
             else:
                 leg_pnl = round(((cur_p or ep) - ep) * lot_size * lots, 2) if cur_p else None
-            from app.models.strategy_run import StrategyLegMtm
             db.add(StrategyLegMtm(
                 run_id=run_id,
                 leg_id=leg_id,
                 timestamp=ts.replace(tzinfo=None),  # column is timezone=False
                 price=cur_p,
                 gross_leg_pnl=leg_pnl,
-                stale_minutes=0,
+                stale_minutes=stale,
             ))
         await db.commit()
 
