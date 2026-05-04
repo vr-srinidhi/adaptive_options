@@ -775,7 +775,7 @@ async def _write_event(
     async with AsyncSessionLocal() as db:
         db.add(StrategyRunEvent(
             run_id=run_id,
-            timestamp=ts,
+            timestamp=ts.replace(tzinfo=None),  # columns are timezone=False
             event_type=event_type,
             reason_code=reason_code,
             payload_json=payload or {},
@@ -805,7 +805,7 @@ async def _write_mtm(
     async with AsyncSessionLocal() as db:
         db.add(StrategyRunMtm(
             run_id=run_id,
-            timestamp=ts,
+            timestamp=ts.replace(tzinfo=None),  # column is timezone=False
             spot_close=spot,
             vix_close=vix,
             gross_mtm=round(gross_mtm, 2),
@@ -825,7 +825,7 @@ async def _write_mtm(
             db.add(StrategyLegMtm(
                 run_id=run_id,
                 leg_id=leg_id,
-                timestamp=ts,
+                timestamp=ts.replace(tzinfo=None),  # column is timezone=False
                 price=cur_p,
                 gross_leg_pnl=leg_pnl,
                 stale_minutes=0,
