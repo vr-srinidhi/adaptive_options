@@ -9,6 +9,7 @@ import {
   getLivePaperConfig, updateLivePaperConfig,
   getLivePaperToday, getLivePaperHistory,
   startLivePaper, stopLivePaper,
+  zerodhaSetTokenDirect,
 } from '../api/index.js'
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -309,6 +310,75 @@ function EventLog({ events }) {
           </span>
         </div>
       ))}
+    </div>
+  )
+}
+
+// ── Token Section ─────────────────────────────────────────────────────────────
+
+function TokenSection({ tokenStatus, onTokenSaved }) {
+  const [token, setToken] = useState('')
+  const [saving, setSaving] = useState(false)
+  const [err, setErr]     = useState(null)
+
+  async function save() {
+    if (!token.trim()) return
+    setSaving(true)
+    setErr(null)
+    try {
+      await zerodhaSetTokenDirect(token.trim())
+      setToken('')
+      onTokenSaved()
+    } catch (e) {
+      setErr(e.response?.data?.detail || 'Failed to save token.')
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  return (
+    <div style={{ marginTop: 16, padding: '12px 0', borderTop: '0.5px solid var(--border)' }}>
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 6 }}>
+        <div style={{ fontSize: 11, color: 'var(--text-secondary)' }}>
+          Scheduler fires: <strong style={{ color: 'var(--text-primary)' }}>09:14 IST</strong> weekdays
+        </div>
+        <span style={{
+          fontSize: 11, fontWeight: 600,
+          color: tokenStatus === 'valid' ? '#4ade80' : '#fb923c',
+        }}>
+          {tokenStatus === 'valid' ? '✓ Token valid' : tokenStatus === 'expired' ? '⚠ Expired' : '⚠ Missing'}
+        </span>
+      </div>
+
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+        <label style={{ fontSize: 11, color: 'var(--text-secondary)' }}>
+          Paste Zerodha access_token
+        </label>
+        <input
+          type="password"
+          placeholder="access_token from Kite / Sensibull…"
+          value={token}
+          onChange={e => setToken(e.target.value)}
+          onKeyDown={e => e.key === 'Enter' && save()}
+          style={{
+            background: 'var(--surface)', border: '1px solid var(--border)',
+            borderRadius: 6, padding: '6px 8px', color: 'var(--text-primary)',
+            fontSize: 12, width: '100%',
+          }}
+        />
+        {err && <div style={{ fontSize: 11, color: '#f87171' }}>{err}</div>}
+        <button
+          onClick={save} disabled={saving || !token.trim()}
+          style={{
+            background: '#fb923c22', border: '1px solid #fb923c66',
+            borderRadius: 6, color: '#fb923c', fontSize: 12, fontWeight: 600,
+            padding: '5px 10px', cursor: saving || !token.trim() ? 'not-allowed' : 'pointer',
+            opacity: saving || !token.trim() ? 0.5 : 1,
+          }}
+        >
+          {saving ? 'Saving…' : 'Save Token'}
+        </button>
+      </div>
     </div>
   )
 }
@@ -622,28 +692,7 @@ export default function LivePaperMonitor() {
         }}>
           <ConfigPanel config={config} onSave={handleSaveConfig} />
 
-          <div style={{ marginTop: 16, padding: '8px 0', borderTop: '0.5px solid var(--border)' }}>
-            <div style={{ fontSize: 11, color: 'var(--text-secondary)' }}>
-              Scheduler fires: <strong style={{ color: 'var(--text-primary)' }}>09:14 IST</strong> weekdays
-            </div>
-            <div style={{ fontSize: 11, color: 'var(--text-secondary)', marginTop: 3 }}>
-              Token status: <strong style={{
-                color: tokenStatus === 'valid' ? '#4ade80' : '#f87171',
-              }}>{tokenStatus || '—'}</strong>
-            </div>
-            {tokenStatus !== 'valid' && (
-              <button
-                onClick={() => navigate('/zerodha-connect')}
-                style={{
-                  marginTop: 6, background: 'none', border: '1px solid #fb923c',
-                  borderRadius: 6, padding: '3px 8px', fontSize: 11, color: '#fb923c',
-                  cursor: 'pointer',
-                }}
-              >
-                Connect Zerodha →
-              </button>
-            )}
-          </div>
+          <TokenSection tokenStatus={tokenStatus} onTokenSaved={() => { setTokenStatus('valid'); setActionMsg('Token saved.'); setTimeout(() => setActionMsg(null), 3000) }} />
         </div>
       </div>
 

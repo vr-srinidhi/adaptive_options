@@ -115,6 +115,7 @@ export const getHistMarks = (id) => api.get(`/backtests/sessions/${id}/trade/mar
 export const zerodhaLoginUrl = () => api.get('/auth/zerodha/login-url')
 export const zerodhaSession = (payload) => api.post('/auth/zerodha/session', payload)
 export const zerodhaStatus = () => api.get('/auth/zerodha/status')
+export const zerodhaSetTokenDirect = (access_token) => api.post('/auth/zerodha/token', { access_token })
 
 // ── Workbench v2 ─────────────────────────────────────────────────────────────
 export const getWorkbenchSummary = () => api.get('/v2/workspace/summary')
