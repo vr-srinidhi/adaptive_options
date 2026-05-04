@@ -490,7 +490,13 @@ export default function LivePaperMonitor() {
       const d = todayRes.data
       setConfig(d.config)
       setSession(d.session)
-      setMtmData(d.mtm_series || [])
+      const series = d.mtm_series || []
+      setMtmData(series)
+      setCeData(series.filter(r => r.ce_price != null).map(r => ({ timestamp: r.timestamp, price: r.ce_price })))
+      setPeData(series.filter(r => r.pe_price != null).map(r => ({ timestamp: r.timestamp, price: r.pe_price })))
+      if (d.run?.ce_entry_price || d.run?.pe_entry_price) {
+        setEntryPrices({ ce: d.run.ce_entry_price ?? null, pe: d.run.pe_entry_price ?? null })
+      }
       setEvents(d.events || [])
       setRun(d.run)
       setTokenStatus(d.token_status)
@@ -759,13 +765,13 @@ export default function LivePaperMonitor() {
             <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 16, marginTop: 16 }}>
               <PremiumChart
                 data={ceData}
-                entryPrice={entryPrices.ce}
+                entryPrice={entryPrices.ce ?? run?.ce_entry_price ?? null}
                 color="#f59e0b"
                 label={friendlyLeg(session, 'CE')}
               />
               <PremiumChart
                 data={peData}
-                entryPrice={entryPrices.pe}
+                entryPrice={entryPrices.pe ?? run?.pe_entry_price ?? null}
                 color="#22d3ee"
                 label={friendlyLeg(session, 'PE')}
               />

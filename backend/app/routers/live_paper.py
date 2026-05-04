@@ -161,6 +161,19 @@ async def _get_mtm_series(db: AsyncSession, run_id: uuid.UUID):
         .where(StrategyRunMtm.run_id == run_id)
         .order_by(StrategyRunMtm.timestamp)
     )).scalars().all()
+
+    # Build per-timestamp CE/PE price lookup from strategy_leg_mtm (SELL legs only)
+    leg_rows = (await db.execute(
+        select(StrategyRunLeg.option_type, StrategyLegMtm.timestamp, StrategyLegMtm.price)
+        .join(StrategyLegMtm, StrategyLegMtm.leg_id == StrategyRunLeg.id)
+        .where(StrategyRunLeg.run_id == run_id, StrategyRunLeg.side == "SELL")
+    )).all()
+    leg_lookup: dict = {}
+    for opt_type, ts, price in leg_rows:
+        key = ts.isoformat()
+        if price is not None:
+            leg_lookup.setdefault(key, {})[opt_type] = float(price)
+
     return [
         {
             "timestamp":        r.timestamp.isoformat(),
@@ -169,6 +182,8 @@ async def _get_mtm_series(db: AsyncSession, run_id: uuid.UUID):
             "net_mtm":          float(r.net_mtm) if r.net_mtm is not None else None,
             "trail_stop_level": float(r.trail_stop_level) if r.trail_stop_level is not None else None,
             "event_code":       r.event_code,
+            "ce_price":         leg_lookup.get(r.timestamp.isoformat(), {}).get("CE"),
+            "pe_price":         leg_lookup.get(r.timestamp.isoformat(), {}).get("PE"),
         }
         for r in rows
     ]
@@ -242,12 +257,22 @@ async def get_today(
     events     = []
     run        = None
 
+    leg_entry_prices: dict = {}
     if session and session.strategy_run_id:
         run = (await db.execute(
             select(StrategyRun).where(StrategyRun.id == session.strategy_run_id)
         )).scalar_one_or_none()
         mtm_series = await _get_mtm_series(db, session.strategy_run_id)
         events     = await _get_events(db, session.strategy_run_id)
+
+        # Fetch entry prices for CE/PE SELL legs
+        legs = (await db.execute(
+            select(StrategyRunLeg)
+            .where(StrategyRunLeg.run_id == session.strategy_run_id, StrategyRunLeg.side == "SELL")
+        )).scalars().all()
+        for leg in legs:
+            if leg.entry_price:
+                leg_entry_prices[leg.option_type] = float(leg.entry_price)
 
     return {
         "config":        _serialize_config(cfg),
@@ -260,6 +285,8 @@ async def get_today(
             "entry_credit_total": float(run.entry_credit_total) if run and run.entry_credit_total else None,
             "lot_size":           run.lot_size if run else None,
             "approved_lots":      run.approved_lots if run else None,
+            "ce_entry_price":     leg_entry_prices.get("CE"),
+            "pe_entry_price":     leg_entry_prices.get("PE"),
         } if run else None,
     }
 
