@@ -36,6 +36,10 @@ class SessionRequest(BaseModel):
     request_token: str
 
 
+class DirectTokenRequest(BaseModel):
+    access_token: str
+
+
 @router.get("/login-url")
 def get_login_url(user: User = Depends(get_current_active_user)):
     """Return the Zerodha login URL. Requires app authentication."""
@@ -104,3 +108,19 @@ async def get_status(
         return {"authenticated": True, "profile": profile}
     except Exception:
         return {"authenticated": False, "profile": None}
+
+
+@router.post("/token")
+async def set_token_direct(
+    req: DirectTokenRequest,
+    user: User = Depends(get_current_active_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Store a Zerodha access_token directly without going through OAuth exchange.
+    Useful for local testing when the OAuth redirect cannot complete.
+    """
+    if not req.access_token.strip():
+        raise HTTPException(status_code=400, detail="access_token must not be empty.")
+    await store_broker_token(db, user.id, req.access_token.strip())
+    zerodha_client.invalidate_instruments_cache()
+    return {"status": "ok"}

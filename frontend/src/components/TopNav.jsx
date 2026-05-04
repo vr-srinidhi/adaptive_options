@@ -7,6 +7,7 @@ const PRIMARY_LINKS = [
   { to: '/workbench/strategies', label: 'Strategies', match: path => path.startsWith('/workbench/strategies') },
   { to: '/workbench/run', label: 'Run', match: path => path.startsWith('/workbench/run') },
   { to: '/workbench/replay', label: 'Replay', match: path => path.startsWith('/workbench/replay') },
+  { to: '/workbench/live', label: 'Live', match: path => path.startsWith('/workbench/live'), dot: true },
   { to: '/workbench/history', label: 'History', match: path => path.startsWith('/workbench/history') },
 ]
 
@@ -53,6 +54,13 @@ export default function TopNav() {
               className={primaryLinkClass(active)}
             >
               {link.label}
+              {link.dot && (
+                <span style={{
+                  display: 'inline-block', width: 6, height: 6, borderRadius: '50%',
+                  background: '#4ade80', marginLeft: 4, flexShrink: 0,
+                  opacity: 0.8,
+                }} />
+              )}
             </NavLink>
           )
         })}

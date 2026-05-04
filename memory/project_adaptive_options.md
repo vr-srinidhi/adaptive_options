@@ -1,6 +1,6 @@
 ---
 name: Adaptive Options Project — current state
-description: Full-stack NSE options backtesting + paper trading platform. Five modules, Railway-deployed, CI on GitHub Actions.
+description: Full-stack NSE options backtesting + paper trading platform. Six modules including Live Paper Trading, Railway-deployed, CI on GitHub Actions.
 type: project
 ---
 
@@ -13,7 +13,7 @@ Frontend: React 18 + Vite at localhost:3000. Backend: FastAPI at localhost:8000.
 
 ---
 
-## Five Modules
+## Six Modules
 
 1. **V2 Workbench** — primary UI (Strategy Catalog → Run Builder → Replay Analyzer → Runs Library). Two live executors: `orb_v1` (ORB paper/historical) and `generic_v1` (generic single-session backtest). Route: `/workbench/...`
 
@@ -24,6 +24,8 @@ Frontend: React 18 + Vite at localhost:3000. Backend: FastAPI at localhost:8000.
 4. **Paper Trading ORB Replay** — live Zerodha candle data, G1–G7 gate stack, Bull Call / Bear Put spreads. Zerodha tokens expire daily at 6 AM IST.
 
 5. **Synthetic Backtest** — deterministic RNG (seed = MD5(date+instrument)), Iron Condor / Bull Put / Bear Call via EMA/RSI/IV Rank regime detection. Legacy module.
+
+6. **Live Paper Trading** — self-driving intraday engine (`live_paper_engine.py`) for Short Straddle Dual Lock on live Zerodha data. APScheduler fires at 09:14 IST weekdays. UI at `/workbench/live` (`LivePaperMonitor.jsx`) is SSE-only viewer. Sessions write to `strategy_runs` (run_type=`live_paper_session`) so ReplayAnalyzer works unchanged. Two new tables: `live_paper_configs`, `live_paper_sessions`.
 
 ---
 
@@ -37,6 +39,18 @@ Upgraded `strategy_run` replay into a full trade diagnosis screen:
 - **Bundle export** (`POST /api/v2/runs/strategy_run/export-bundle`): multi-run. ≤20 → single stacked CSV; >20 → ZIP. Raises 404 if any IDs not found/owned. Filename: `{strategy}_{from}_to_{to}_bundle.{ext}`. ZIP entries unique via `_{id[:8]}`.
 - **Runs Library** (`RunsLibrary.jsx`): compare panel removed (user request). Checkbox multi-select on strategy_run rows only. Select-all with indeterminate state. Export button appears after selection; turns blue+ZIP for >20 runs. Status bar shows "N selected (M visible)" + Clear button.
 - **Single source of truth**: `_build_strategy_run_replay_payload()` in `workbench.py` is called by both JSON and CSV endpoints. `_write_run_sections_to_csv()` is called by both single-run and bundle endpoints — no drift.
+
+---
+
+## Live Paper Trading (PR #29, feat/live-paper-trading)
+
+- New files: `backend/app/models/live_paper.py`, `backend/app/services/live_paper_engine.py`, `backend/app/services/scheduler.py`, `backend/app/routers/live_paper.py`, `frontend/src/pages/LivePaperMonitor.jsx`
+- Token bypass: `POST /api/auth/zerodha/token` stores access_token directly (for dev when OAuth redirect can't complete)
+- Key bug fixed: all timestamps inserted into `strategy_run_events`/`strategy_run_mtm`/`strategy_leg_mtm` must use `.replace(tzinfo=None)` — those columns are `TIMESTAMP(timezone=False)`
+- Recovery: `check_and_resume_sessions()` re-launches interrupted sessions on startup but only for status `waiting`/`entered`; error sessions must be manually reset to `waiting` in DB
+
+**Why:** First live market data execution; positions this as the final step before flip to live orders.
+**How to apply:** When debugging live paper issues, always check (1) token validity, (2) session status in DB, (3) whether the running task holds a stale token (restart backend to reload fresh token).
 
 ---
 
@@ -65,6 +79,10 @@ Upgraded `strategy_run` replay into a full trade diagnosis screen:
 - Replay serializer: `backend/app/services/strategy_replay_serializer.py`
 - Workbench router (CSV, bundle, replay): `backend/app/routers/workbench.py`
 - Generic executor: `backend/app/services/generic_executor.py`
+- Live paper engine: `backend/app/services/live_paper_engine.py`
+- Live paper scheduler: `backend/app/services/scheduler.py`
+- Live paper router: `backend/app/routers/live_paper.py`
+- Live paper UI: `frontend/src/pages/LivePaperMonitor.jsx`
 - Replay UI: `frontend/src/pages/ReplayAnalyzer.jsx`
 - Runs Library: `frontend/src/pages/RunsLibrary.jsx`
 - API wrappers: `frontend/src/api/index.js`

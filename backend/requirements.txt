@@ -18,3 +18,4 @@ python-multipart==0.0.9
 slowapi==0.1.9
 cryptography==42.0.8
 alembic==1.13.1
+apscheduler==3.10.4

@@ -12,6 +12,7 @@ from app.middleware.security_headers import SecurityHeadersMiddleware
 from app.routers import backtest, auth, paper_trading, users
 from app.routers import historical, backtests
 from app.routers import workbench
+from app.routers import live_paper
 
 app = FastAPI(title="Adaptive Options API", version="1.0.0")
 
@@ -25,7 +26,7 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=_origins,
     allow_credentials=True,
-    allow_methods=["GET", "POST", "DELETE"],
+    allow_methods=["GET", "POST", "PUT", "DELETE"],
     allow_headers=["Authorization", "Content-Type"],
 )
 
@@ -43,6 +44,20 @@ async def startup():
             raise RuntimeError("BROKER_TOKEN_ENCRYPTION_KEY must be set in production.")
     await init_db()
 
+    # Start the live paper trading scheduler
+    from app.services.scheduler import init_scheduler
+    init_scheduler()
+
+    # Resume any session interrupted by a mid-day process restart
+    from app.services.live_paper_engine import check_and_resume_sessions
+    await check_and_resume_sessions()
+
+
+@app.on_event("shutdown")
+async def shutdown():
+    from app.services.scheduler import shutdown_scheduler
+    shutdown_scheduler()
+
 
 app.include_router(backtest.router, prefix="/api")
 app.include_router(auth.router, prefix="/api")
@@ -51,6 +66,7 @@ app.include_router(users.router, prefix="/api")
 app.include_router(historical.router, prefix="/api/historical", tags=["historical"])
 app.include_router(backtests.router, prefix="/api/backtests", tags=["backtests"])
 app.include_router(workbench.router)
+app.include_router(live_paper.router)
 
 
 @app.get("/health")

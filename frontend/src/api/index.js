@@ -115,6 +115,7 @@ export const getHistMarks = (id) => api.get(`/backtests/sessions/${id}/trade/mar
 export const zerodhaLoginUrl = () => api.get('/auth/zerodha/login-url')
 export const zerodhaSession = (payload) => api.post('/auth/zerodha/session', payload)
 export const zerodhaStatus = () => api.get('/auth/zerodha/status')
+export const zerodhaSetTokenDirect = (access_token) => api.post('/auth/zerodha/token', { access_token })
 
 // ── Workbench v2 ─────────────────────────────────────────────────────────────
 export const getWorkbenchSummary = () => api.get('/v2/workspace/summary')
@@ -131,6 +132,14 @@ export const getWorkbenchRun = (kind, id) => api.get(`/v2/runs/${kind}/${id}`)
 export const getWorkbenchReplay = (kind, id) => api.get(`/v2/runs/${kind}/${id}/replay`)
 export const compareWorkbenchRuns = (refs) => api.get('/v2/runs/compare', { params: { refs } })
 export const getStrategyRunReplayCsv = (id) => api.get(`/v2/runs/strategy_run/${id}/replay/csv`, { responseType: 'blob' })
+
+// ── Live Paper Trading ────────────────────────────────────────────────────────
+export const getLivePaperConfig    = ()           => api.get('/v2/live-paper/config')
+export const updateLivePaperConfig = (payload)    => api.put('/v2/live-paper/config', payload)
+export const getLivePaperToday     = ()           => api.get('/v2/live-paper/today')
+export const getLivePaperHistory   = (params)     => api.get('/v2/live-paper/history', { params })
+export const startLivePaper        = ()           => api.post('/v2/live-paper/start')
+export const stopLivePaper         = ()           => api.post('/v2/live-paper/stop')
 export const exportStrategyRunsBundle = (runIds) => api.post(
   '/v2/runs/strategy_run/export-bundle',
   { run_ids: runIds },

@@ -13,6 +13,7 @@ This file gives Claude Code full context about the project so it can assist effe
 3. **Historical Backtest** — runs the ORB engine against a DB-backed warehouse of real 1-min candle data (spot + options). Batches span multiple trading days; results persist alongside paper trading sessions.
 4. **V2 Workbench** — strategy-agnostic shell (Strategy Catalog → Run Builder → Replay Analyzer → Runs Library) aligned to the product PRD. Two executors are live: `orb_v1` (ORB paper/historical) and `generic_v1` (single-session backtest). 10 further strategies are catalogued as `planned`/`research`.
 5. **Generic Strategy Engine** — declarative executor that powers any strategy defined in the catalog via `leg_template` + `entry_rule_id` + `exit_rule`. No new Python files needed to add a strategy. Short Straddle and Iron Butterfly are live on this engine.
+6. **Live Paper Trading** — self-driving intraday engine that runs the Short Straddle Dual Lock strategy against live Zerodha market data every market day. APScheduler fires at 09:14 IST; UI (`/workbench/live`) is a read-only SSE viewer. Completed sessions write to the same `strategy_runs` tables so ReplayAnalyzer works unchanged. Flip to live execution via `execution_mode: live` config flag (currently paper only).
 
 Scope: **backtesting and paper trading only** — no live order placement.
 
@@ -98,6 +99,7 @@ Adaptive_options/
 │       ├── migrations/
 │       │   └── versions/        ← Alembic migration scripts
 │       ├── models/
+│       │   ├── live_paper.py    ← LivePaperConfig + LivePaperSession ORM models
 │       │   ├── session.py       ← BacktestSession SQLAlchemy model
 │       │   ├── paper_trade.py   ← 6 paper trading ORM models
 │       │   ├── historical.py    ← TradingDay, SpotCandle, VixCandle, FuturesCandle, OptionsCandle, SessionBatch
@@ -105,6 +107,7 @@ Adaptive_options/
 │       │   ├── broker_token.py  ← encrypted Zerodha token storage
 │       │   └── audit_log.py     ← security audit events
 │       ├── routers/
+│       │   ├── live_paper.py    ← /api/v2/live-paper/* endpoints + SSE stream
 │       │   ├── backtest.py      ← synthetic backtest endpoints
 │       │   ├── backtests.py     ← historical batch CRUD (/api/backtests/*)
 │       │   ├── paper_trading.py ← paper trading endpoints
@@ -136,7 +139,9 @@ Adaptive_options/
 │           ├── generic_executor.py       ← validate_run + execute_run for generic_v1 strategies
 │           ├── strategy_replay_serializer.py ← PRD §13 replay payload for strategy_run kind
 │           ├── token_store.py            ← broker token encrypt/decrypt
-│           └── audit.py                  ← audit log helpers
+│           ├── audit.py                  ← audit log helpers
+│           ├── live_paper_engine.py      ← self-driving intraday engine (SSE queues, _run_session loop)
+│           └── scheduler.py             ← APScheduler AsyncIOScheduler, CronTrigger 09:14 IST weekdays
 └── frontend/
     ├── Dockerfile
     ├── nginx.conf               ← SPA fallback + /api proxy
@@ -156,6 +161,7 @@ Adaptive_options/
             ├── RunBuilder.jsx        ← Configure + launch a run (guided + advanced mode)
             ├── ReplayDesk.jsx        ← Paper session list + replay entry point
             ├── ReplayAnalyzer.jsx    ← Per-session replay: charts, decision stream, legs
+            ├── LivePaperMonitor.jsx  ← Live session monitor: SSE chart, config panel, token paste, history
             ├── RunsLibrary.jsx       ← Saved runs list; checkbox multi-select → CSV/ZIP bundle export
             ├── WorkbenchHistoryDetail.jsx ← Batch or session history detail
             ├── Backtest.jsx          ← (legacy) Synthetic backtest form
@@ -475,12 +481,27 @@ All under `/api/v2`. Strategy catalog endpoints are intentionally public (no aut
 | POST | `/v2/runs/strategy_run/export-bundle` | Multi-run export: body `{run_ids:[...]}`. ≤20 runs → single stacked CSV; >20 → ZIP of individual CSVs. Filename: `{strategy}_{from}_to_{to}_bundle.{ext}`. Raises 404 if any ID not found/owned. |
 | GET | `/v2/runs/compare` | Compare up to 4 runs by comma-separated `refs` (`kind:uuid,...`); supports `paper_session`, `historical_batch`, `strategy_run` |
 
+### Live Paper Trading
+
+All under `/api/v2/live-paper`. Requires Bearer token except SSE stream (token via `?token=` query param).
+
+| Method | Path | Purpose |
+|--------|------|---------|
+| GET | `/v2/live-paper/config` | Get (or auto-create) user config |
+| PUT | `/v2/live-paper/config` | Update config fields (capital, entry_time, params, enabled, execution_mode) |
+| GET | `/v2/live-paper/today` | Full snapshot: config + session + mtm_series + events + token_status + is_live |
+| GET | `/v2/live-paper/history` | Past sessions, newest first (`limit`, `offset`) |
+| POST | `/v2/live-paper/start` | Manually trigger today's session (bypasses 09:14 scheduler) |
+| POST | `/v2/live-paper/stop` | Emergency stop — marks session as error, engine exits on next tick |
+| GET | `/v2/live-paper/today/stream` | SSE stream — `?token=<access_token>`; events: SNAPSHOT, WAITING, RESOLVED, ENTRY, LOCK, MTM, DONE, ERROR |
+
 ### Zerodha Auth
 
 | Method | Path | Purpose |
 |--------|------|---------|
 | GET | `/auth/zerodha/login-url` | Returns Zerodha OAuth URL |
-| POST | `/auth/zerodha/session` | Exchanges request_token → access_token |
+| POST | `/auth/zerodha/session` | Exchanges request_token → access_token (full OAuth flow) |
+| POST | `/auth/zerodha/token` | Stores access_token directly — bypasses OAuth (dev/testing) |
 
 ### User Auth
 
@@ -531,11 +552,18 @@ JSONB columns: `legs` (option leg objects), `min_data` (`{time, spot, pnl}` per 
 | Table | Description |
 |-------|-------------|
 | `instrument_contract_specs` | Lot size + strike step history per instrument (date-range aware; seeded at startup) |
-| `strategy_runs` | One row per `single_session_backtest` run — header, capital, P&L, status |
+| `strategy_runs` | One row per `single_session_backtest` or `live_paper_session` run — header, capital, P&L, status |
 | `strategy_run_legs` | One row per option leg — entry/exit prices, gross P&L |
-| `strategy_run_mtm` | One row per minute while trade is open — spot, VIX, gross/net MTM |
-| `strategy_leg_mtm` | One row per leg per minute — individual leg price + stale_minutes |
-| `strategy_run_events` | ENTRY, EXIT, HOLD, NO_TRADE events with payload JSON |
+| `strategy_run_mtm` | One row per minute while trade is open — spot, VIX, gross/net MTM (`timezone=False` columns) |
+| `strategy_leg_mtm` | One row per leg per minute — individual leg price + stale_minutes (`timezone=False` columns) |
+| `strategy_run_events` | ENTRY, EXIT, HOLD, NO_TRADE events with payload JSON (`timezone=False` columns) |
+
+### Live Paper Trading (2 tables)
+
+| Table | Description |
+|-------|-------------|
+| `live_paper_configs` | One row per user — strategy_id, instrument, capital, entry_time, params_json (JSONB), enabled, execution_mode |
+| `live_paper_sessions` | One row per trading day — status flow: `scheduled→waiting→entered→exited/no_trade/error`; holds ATM, symbols, lots, lock_status, strategy_run_id FK |
 
 ---
 
@@ -553,6 +581,7 @@ JSONB columns: `legs` (option leg objects), `min_data` (`{time, spot, pnl}` per 
 | `/workbench/replay/:kind/:id` | `ReplayAnalyzer.jsx` | Per-session: full-day spot + MTM charts with IN/OUT markers, shadow MTM, decisions, legs |
 | `/workbench/history` | `RunsLibrary.jsx` | All saved runs, sorted date desc, infinite scroll (20/page); checkbox multi-select on `strategy_run` rows → export ≤20 as single CSV, >20 as ZIP |
 | `/workbench/history/:kind/:id` | `WorkbenchHistoryDetail.jsx` | Batch or session detail |
+| `/workbench/live` | `LivePaperMonitor.jsx` | Live Paper Trading monitor: inline token paste, config panel, SSE MTM chart, event log, session history |
 
 ### Historical Backtest
 
@@ -629,6 +658,32 @@ The runtime `create_all` + idempotent `ALTER TABLE IF NOT EXISTS` in `init_db()`
 
 ---
 
+### Live Paper Trading Engine
+
+Self-driving intraday engine. Architecture decisions:
+
+**Scheduler** (`services/scheduler.py`): `AsyncIOScheduler` (APScheduler) with `CronTrigger` at 09:14 IST on weekdays. Registered in `startup()` via `init_scheduler()`; shut down in `shutdown()`. `misfire_grace_time=300` so a slow startup doesn't skip the day.
+
+**Engine task** (`services/live_paper_engine.py`): Single `asyncio.create_task(_run_session(...))` per day. No UI dependency — if the browser is closed, the loop continues. The token and config are read once at session start (passed as parameters). Changing config mid-session has no effect until the next day.
+
+**Loop phases**:
+- 09:14–09:49: poll spot every minute, record to `waiting_spot_json`, broadcast `WAITING` via SSE
+- 09:49: resolve ATM strike from live spot; find nearest expiry + 4 option symbols from instruments master
+- 09:50+ (configurable `entry_time`): fetch CE/PE/wing prices, run dual-lock + trail + stop logic, write MTM/event rows, broadcast `MTM`
+- On exit: finalise `StrategyRun`, update `LivePaperSession`
+
+**Recovery** (`check_and_resume_sessions`): called at startup. Finds today sessions with `status='waiting'` or `'entered'`, re-fetches the **current** token from DB (fresh), re-launches task. Does NOT resume `error` sessions — must be manually reset to `waiting`.
+
+**SSE**: one `asyncio.Queue` per session in `_sse_queues`. Token passed as `?token=` query param (EventSource doesn't support custom headers). Keepalive `: ping` every 25s.
+
+**DB writes**: all timestamps going into `strategy_run_mtm`, `strategy_leg_mtm`, `strategy_run_events` must be **timezone-naive** (`ts.replace(tzinfo=None)`) — those columns are `TIMESTAMP(timezone=False)`. `live_paper_configs` and `live_paper_sessions` use `TIMESTAMP(timezone=True)` so aware datetimes are fine there.
+
+**Completed sessions**: stored as `run_type='live_paper_session'` in `strategy_runs` — fully compatible with `ReplayAnalyzer` at `/workbench/replay/strategy_run/{id}`.
+
+**Token bypass** (`POST /api/auth/zerodha/token`): stores an access_token directly without OAuth exchange. For local dev when the OAuth redirect URL cannot complete. Token is encrypted + stored identically to the OAuth flow.
+
+---
+
 ## What NOT to Change Without Care
 
 - `_seed()` in `simulator.py` — changing breaks determinism guarantee
@@ -648,6 +703,9 @@ The runtime `create_all` + idempotent `ALTER TABLE IF NOT EXISTS` in `init_db()`
 - `stop_capital_pct` vs `stop_multiple` in exit_rule — `stop_capital_pct` takes precedence when present; `stop_multiple` is the fallback for backward-compat with old catalog entries. Do not remove the fallback.
 - Exit check order in `generic_executor.py` — STOP → TRAIL → TARGET → TIME → DATA_GAP. TARGET is intentionally checked *after* TRAIL and is suppressed when `trail_trigger > 0`. Do not reorder.
 - `trail_stop_at_exit` lock in `generic_executor.py` — TRAIL_EXIT P&L is locked at `trail_stop_level`, not the candle close. Removing this causes gap-through slippage to inflate reported losses.
+- `_RESOLVE_TIME = time(9, 49)` in `live_paper_engine.py` — instruments master is fetched once and ATM is resolved at this minute. Moving it earlier risks stale spot prices; later cuts into the entry window.
+- `check_and_resume_sessions()` token re-fetch — must always read the token **fresh from DB** (not from in-memory state) so a token stored between crash and restart is picked up.
+- `ts.replace(tzinfo=None)` in `_write_event` / `_write_mtm` — `strategy_run_events`, `strategy_run_mtm`, `strategy_leg_mtm` timestamps are `timezone=False`; inserting aware datetimes raises a `DataError` from asyncpg.
 
 ---
 
