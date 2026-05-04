@@ -9,7 +9,7 @@ import {
   getLivePaperConfig, updateLivePaperConfig,
   getLivePaperToday, getLivePaperHistory,
   startLivePaper, stopLivePaper,
-  zerodhaSetTokenDirect,
+  zerodhaSession,
 } from '../api/index.js'
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -392,20 +392,37 @@ function PremiumChart({ data, entryPrice, color, label }) {
 // ── Token Section ─────────────────────────────────────────────────────────────
 
 function TokenSection({ tokenStatus, onTokenSaved }) {
-  const [token, setToken] = useState('')
-  const [saving, setSaving] = useState(false)
-  const [err, setErr]     = useState(null)
+  const [token, setToken]     = useState('')
+  const [saving, setSaving]   = useState(false)
+  const [err, setErr]         = useState(null)
+  const [userName, setUserName] = useState(null)
+
+  // Derive display state
+  const isValid = tokenStatus === 'valid' || userName !== null
 
   async function save() {
     if (!token.trim()) return
     setSaving(true)
     setErr(null)
+    setUserName(null)
     try {
-      await zerodhaSetTokenDirect(token.trim())
+      const res = await zerodhaSession({ request_token: token.trim() })
       setToken('')
+      const name = res.data?.user_name || null
+      setUserName(name)
       onTokenSaved()
     } catch (e) {
-      setErr(e.response?.data?.detail || 'Failed to save token.')
+      const detail = e.response?.data?.detail || ''
+      // Surface a clear message — Zerodha returns specific reasons
+      if (detail.toLowerCase().includes('invalid') || detail.toLowerCase().includes('incorrect')) {
+        setErr('Invalid request_token — get a fresh one from the Zerodha login URL.')
+      } else if (detail.toLowerCase().includes('expired')) {
+        setErr('Request token expired — it is valid for ~2 minutes only. Please get a new one.')
+      } else if (detail) {
+        setErr(detail)
+      } else {
+        setErr('Exchange failed — please try again with a fresh request_token.')
+      }
     } finally {
       setSaving(false)
     }
@@ -413,35 +430,48 @@ function TokenSection({ tokenStatus, onTokenSaved }) {
 
   return (
     <div style={{ marginTop: 16, padding: '12px 0', borderTop: '0.5px solid var(--border)' }}>
-      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 6 }}>
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 }}>
         <div style={{ fontSize: 11, color: 'var(--text-secondary)' }}>
           Scheduler fires: <strong style={{ color: 'var(--text-primary)' }}>09:14 IST</strong> weekdays
         </div>
         <span style={{
-          fontSize: 11, fontWeight: 600,
-          color: tokenStatus === 'valid' ? '#4ade80' : '#fb923c',
+          fontSize: 11, fontWeight: 700, padding: '2px 8px', borderRadius: 10,
+          ...(isValid
+            ? { color: '#4ade80', background: '#4ade8011', border: '1px solid #4ade8033' }
+            : { color: '#fb923c', background: '#fb923c11', border: '1px solid #fb923c33' }
+          ),
         }}>
-          {tokenStatus === 'valid' ? '✓ Token valid' : tokenStatus === 'expired' ? '⚠ Expired' : '⚠ Missing'}
+          {isValid
+            ? `✓ Token valid${userName ? ` · ${userName}` : ''}`
+            : tokenStatus === 'expired' ? '⚠ Expired' : '⚠ Token missing'}
         </span>
       </div>
 
       <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
         <label style={{ fontSize: 11, color: 'var(--text-secondary)' }}>
-          Paste Zerodha access_token
+          Paste Zerodha <strong>request_token</strong>
+          <span style={{ fontWeight: 400, marginLeft: 4 }}>(from login redirect URL)</span>
         </label>
         <input
           type="password"
-          placeholder="access_token from Kite / Sensibull…"
+          placeholder="e.g. YisnVpUDwSJMrYnJ1QcSwwvJ64Xugfir"
           value={token}
-          onChange={e => setToken(e.target.value)}
+          onChange={e => { setToken(e.target.value); setErr(null); setUserName(null) }}
           onKeyDown={e => e.key === 'Enter' && save()}
           style={{
-            background: 'var(--surface)', border: '1px solid var(--border)',
+            background: 'var(--surface)', border: `1px solid ${err ? '#f87171' : 'var(--border)'}`,
             borderRadius: 6, padding: '6px 8px', color: 'var(--text-primary)',
             fontSize: 12, width: '100%',
           }}
         />
-        {err && <div style={{ fontSize: 11, color: '#f87171' }}>{err}</div>}
+        {err && (
+          <div style={{
+            fontSize: 11, color: '#f87171', padding: '5px 8px',
+            background: '#f8717111', borderRadius: 6, border: '1px solid #f8717133',
+          }}>
+            {err}
+          </div>
+        )}
         <button
           onClick={save} disabled={saving || !token.trim()}
           style={{
@@ -451,7 +481,7 @@ function TokenSection({ tokenStatus, onTokenSaved }) {
             opacity: saving || !token.trim() ? 0.5 : 1,
           }}
         >
-          {saving ? 'Saving…' : 'Save Token'}
+          {saving ? 'Exchanging…' : 'Connect Zerodha'}
         </button>
       </div>
     </div>
