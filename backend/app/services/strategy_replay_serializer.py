@@ -71,9 +71,10 @@ def strategy_run_replay_payload(
             "quantity":     leg.quantity,
             "lots":         run.approved_lots,
             "lot_size":     run.lot_size,
-            "entry_price":  float(leg.entry_price) if leg.entry_price is not None else None,
-            "exit_price":   float(leg.exit_price)  if leg.exit_price  is not None else None,
-            "gross_leg_pnl":float(leg.gross_leg_pnl) if leg.gross_leg_pnl is not None else None,
+            "entry_price":     float(leg.entry_price) if leg.entry_price is not None else None,
+            "exit_price":      float(leg.exit_price)  if leg.exit_price  is not None else None,
+            "gross_leg_pnl":   float(leg.gross_leg_pnl) if leg.gross_leg_pnl is not None else None,
+            "entry_timestamp": leg.entry_timestamp.isoformat() if leg.entry_timestamp is not None else None,
         }
         for leg in sorted_legs
     ]
