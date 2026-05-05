@@ -472,6 +472,7 @@ async def _run_session(
     wing_steps        = int(params.get("wing_width_steps", 2))
     sq_time           = _parse_time(params.get("time_exit", "15:25"), default=_SQ_TIME)
     poll_interval     = max(3, int(params.get("poll_interval_seconds", 60)))
+    expiry_offset     = max(0, int(params.get("expiry_offset", 0)))
     stop_threshold    = -(capital * stop_capital_pct)
 
     trade_date = date.today()
@@ -531,9 +532,8 @@ async def _run_session(
         wce_stale = 0
         wpe_stale = 0
 
-        # Minute-level dedup: DB MTM rows and waiting_spot_json stay at 1-min
-        # granularity regardless of poll_interval. SSE broadcasts every tick.
-        _last_db_minute      = -1
+        # DB writes at poll_interval resolution; SSE broadcasts every tick.
+        _last_db_ts:         Optional[datetime] = None
         _last_waiting_minute = -1
 
         # ── Resume: load existing state ────────────────────────────────────────
@@ -677,7 +677,7 @@ async def _run_session(
                     and r.get("instrument_type") == "CE"
                     and (r["expiry"].date() if hasattr(r["expiry"], "date") else r["expiry"]) >= trade_date
                 ))
-                expiry_date = available[0] if available else None
+                expiry_date = available[min(expiry_offset, len(available) - 1)] if available else None
 
                 if expiry_date:
                     ce_symbol       = find_option_symbol(instruments, instrument, expiry_date, "CE", atm_strike)
@@ -944,12 +944,17 @@ async def _run_session(
             active_entry_p    = straddle_entry_prices + (wing_entry_prices if wings_locked else [])
             active_sides      = ["SELL", "SELL"] + (["BUY", "BUY"] if wings_locked else [])
             active_stale      = [ce_stale, pe_stale] + ([wce_stale, wpe_stale] if wings_locked else [])
-            if now.minute != _last_db_minute or fired:
+            _due_for_db_write = (
+                _last_db_ts is None or
+                (now - _last_db_ts).total_seconds() >= poll_interval or
+                fired
+            )
+            if _due_for_db_write:
                 await _write_mtm(run_id, now, spot, None, gross_mtm, est_exit, net_mtm,
                                  trail_stop_level, fired,
                                  active_leg_ids, active_cur_prices, active_entry_p, active_sides,
                                  active_stale, lot_size, approved_lots)
-                _last_db_minute = now.minute
+                _last_db_ts = now
 
             await _update_session(
                 session_id,

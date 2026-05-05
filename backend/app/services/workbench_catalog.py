@@ -464,6 +464,8 @@ _STRATEGIES = [
             {"key": "vix_guardrail_enabled", "label": "VIX Guardrail",  "type": "boolean", "required": False, "default": False},
             {"key": "vix_min", "label": "VIX Min", "type": "number", "required": False, "default": 14, "depends_on": "vix_guardrail_enabled"},
             {"key": "vix_max", "label": "VIX Max", "type": "number", "required": False, "default": 30, "depends_on": "vix_guardrail_enabled"},
+            {"key": "expiry_offset",      "label": "Expiry (0=current, 1=next week)", "type": "number", "required": False, "default": 0, "min": 0, "max": 3},
+            {"key": "poll_interval_seconds", "label": "Poll Interval (seconds)",      "type": "number", "required": False, "default": 10, "min": 3, "max": 60},
         ],
         "defaults": {
             "single_session_backtest": {
@@ -478,6 +480,8 @@ _STRATEGIES = [
                 "trail_pct":          0.50,
                 "stop_capital_pct":   0.015,
                 "vix_guardrail_enabled": False,
+                "expiry_offset":      0,
+                "poll_interval_seconds": 10,
             },
         },
         "visual_hints": {
