@@ -113,6 +113,7 @@ class StrategyRunLeg(Base):
     entry_price = Column(Numeric(10, 2), nullable=True)
     exit_price = Column(Numeric(10, 2), nullable=True)
     gross_leg_pnl = Column(Numeric(12, 2), nullable=True)
+    entry_timestamp = Column(TIMESTAMP(timezone=False), nullable=True)  # when THIS leg was actually entered
 
     __table_args__ = (
         UniqueConstraint("run_id", "leg_index", name="uq_strategy_run_legs_run_idx"),

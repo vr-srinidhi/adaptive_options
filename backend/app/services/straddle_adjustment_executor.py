@@ -434,6 +434,7 @@ async def execute_run(
 
     if trade_open:
         # Persist straddle legs
+        straddle_ts = actual_entry_ts.replace(tzinfo=None) if actual_entry_ts else None
         for i, ((side, opt_type, strike), leg_id) in enumerate(zip(straddle_legs, straddle_leg_ids)):
             ep = straddle_entry_prices[i]
             xp = straddle_last_prices[i]
@@ -443,9 +444,11 @@ async def execute_run(
                 side=side, option_type=opt_type, strike=strike, expiry_date=expiry,
                 quantity=lot_size * approved_lots,
                 entry_price=ep, exit_price=xp, gross_leg_pnl=leg_gross,
+                entry_timestamp=straddle_ts,
             ))
         # Persist wing legs (if locked)
         if wings_locked:
+            wing_ts = wing_lock_ts.replace(tzinfo=None) if wing_lock_ts else None
             for i, ((side, opt_type, strike), leg_id) in enumerate(zip(wing_legs, wing_leg_ids)):
                 ep = wing_entry_prices[i]
                 xp = wing_last_prices[i]
@@ -455,6 +458,7 @@ async def execute_run(
                     side=side, option_type=opt_type, strike=strike, expiry_date=expiry,
                     quantity=lot_size * approved_lots,
                     entry_price=ep, exit_price=xp, gross_leg_pnl=leg_gross,
+                    entry_timestamp=wing_ts,
                 ))
 
     for row in mtm_rows:

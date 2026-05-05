@@ -59,6 +59,7 @@ def _leg(leg_index, side, option_type, strike, entry_price, exit_price, gross_le
         entry_price=Decimal(str(entry_price)),
         exit_price=Decimal(str(exit_price)),
         gross_leg_pnl=Decimal(str(gross_leg_pnl)),
+        entry_timestamp=None,
     )
 
 

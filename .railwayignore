@@ -1,0 +1,7 @@
+frontend/node_modules/
+frontend/dist/
+frontend/coverage/
+backend/.venv/
+backend/__pycache__/
+backend/.coverage
+backend/coverage/
