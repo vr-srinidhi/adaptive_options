@@ -177,9 +177,11 @@ async def test_get_active_config_filters_by_user_id():
     user_id = uuid.uuid4()
     captured_queries = []
 
+    class _FakeScalars:
+        def all(self): return []
+
     class _FakeResult:
-        def scalar_one_or_none(self):
-            return None
+        def scalars(self): return _FakeScalars()
 
     class _FakeDB:
         async def execute(self, stmt):
@@ -201,9 +203,11 @@ async def test_get_active_config_no_user_id_does_not_filter():
     """get_active_config without user_id must not filter on user_id in WHERE."""
     captured_queries = []
 
+    class _FakeScalars:
+        def all(self): return []
+
     class _FakeResult:
-        def scalar_one_or_none(self):
-            return None
+        def scalars(self): return _FakeScalars()
 
     class _FakeDB:
         async def execute(self, stmt):
@@ -322,13 +326,20 @@ def test_execution_mode_paper_passes_guard():
 # ── Fix 8: unique constraint present on model ─────────────────────────────────
 
 def test_live_paper_session_has_unique_constraint():
+    """
+    Migration 0007 replaced the single (user_id, trade_date) unique constraint
+    with a partial unique index (user_id, trade_date, config_id) WHERE config_id
+    IS NOT NULL, allowing multiple sessions per day (one per config slot).
+    The old named constraint must no longer exist on the ORM model.
+    """
     from app.models.live_paper import LivePaperSession
-    constraints = {
-        c.name
-        for c in LivePaperSession.__table__.constraints
-    }
-    assert "uq_live_paper_session_user_date" in constraints, (
-        "LivePaperSession must have uq_live_paper_session_user_date unique constraint"
+    constraints = {c.name for c in LivePaperSession.__table__.constraints}
+    assert "uq_live_paper_session_user_date" not in constraints, (
+        "uq_live_paper_session_user_date should be gone — replaced by partial index in 0007"
+    )
+    # The table args should be empty (partial index is in the migration, not the ORM)
+    assert LivePaperSession.__table_args__ == {}, (
+        "LivePaperSession.__table_args__ must be {} after multi-session migration"
     )
 
 
@@ -456,8 +467,11 @@ async def test_manual_start_passes_user_id_to_engine():
     user_id  = uuid.uuid4()
     captured = []
 
+    class _FakeScalars:
+        def all(self): return []   # no configs → "no_config"
+
     class _FakeResult:
-        def scalar_one_or_none(self): return None   # no config → no-op
+        def scalars(self): return _FakeScalars()
 
     class _FakeDB:
         async def execute(self, stmt):
@@ -520,15 +534,23 @@ async def test_start_live_session_with_require_enabled_false_loads_disabled_conf
 
     call_count = [0]
 
+    class _FakeScalars:
+        def __init__(self, rows): self._rows = rows
+        def all(self): return self._rows
+
     class _FakeResult:
-        def scalar_one_or_none(self):
-            call_count[0] += 1
-            if call_count[0] == 1:
-                return disabled_config   # config query
-            return None                  # session query → no session exists
+        def __init__(self, rows=None, value=None):
+            self._rows  = rows or []
+            self._value = value
+        def scalars(self): return _FakeScalars(self._rows)
+        def scalar_one_or_none(self): return self._value
 
     class _FakeDB:
-        async def execute(self, stmt): return _FakeResult()
+        async def execute(self, stmt):
+            call_count[0] += 1
+            if call_count[0] == 1:
+                return _FakeResult(rows=[disabled_config])  # config list query
+            return _FakeResult(value=None)                  # session existence check
 
     # Patch get_broker_token so we don't need jose installed locally
     with patch("app.services.live_paper_engine.get_broker_token", new_callable=AsyncMock) as mock_token:
@@ -549,8 +571,11 @@ async def test_start_live_session_with_require_enabled_true_skips_disabled_confi
     """
     user_id = uuid.uuid4()
 
+    class _FakeScalars:
+        def all(self): return []   # enabled=True filter matches nothing
+
     class _FakeResult:
-        def scalar_one_or_none(self): return None  # enabled=True filter matches nothing
+        def scalars(self): return _FakeScalars()
 
     class _FakeDB:
         async def execute(self, stmt): return _FakeResult()
@@ -564,7 +589,7 @@ async def test_start_live_session_with_require_enabled_true_skips_disabled_confi
 @pytest.mark.asyncio
 async def test_duplicate_session_integrity_error_returns_session_exists():
     """
-    When two workers race to insert the same (user_id, trade_date),
+    When two workers race to insert the same (user_id, trade_date, config_id),
     the IntegrityError must be caught and return 'session_exists'.
     """
     from sqlalchemy.exc import IntegrityError as SAIntegrityError
@@ -573,15 +598,23 @@ async def test_duplicate_session_integrity_error_returns_session_exists():
     config  = _make_config(user_id=user_id)
     call_count = [0]
 
+    class _FakeScalars:
+        def __init__(self, rows): self._rows = rows
+        def all(self): return self._rows
+
     class _FakeResult:
-        def scalar_one_or_none(self):
-            call_count[0] += 1
-            if call_count[0] == 1:
-                return config    # config query
-            return None          # session query → no existing session
+        def __init__(self, rows=None, value=None):
+            self._rows  = rows or []
+            self._value = value
+        def scalars(self): return _FakeScalars(self._rows)
+        def scalar_one_or_none(self): return self._value
 
     class _FakeDB:
-        async def execute(self, stmt): return _FakeResult()
+        async def execute(self, stmt):
+            call_count[0] += 1
+            if call_count[0] == 1:
+                return _FakeResult(rows=[config])   # config list query
+            return _FakeResult(value=None)           # session existence check
         def add(self, obj): pass
         async def commit(self):
             raise SAIntegrityError("INSERT", {}, Exception("unique constraint"))

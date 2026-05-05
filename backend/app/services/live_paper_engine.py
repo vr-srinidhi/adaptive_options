@@ -199,14 +199,21 @@ async def start_live_session(
         log.warning("Live paper: no Zerodha token for user=%s.", user_id)
         return "no_token"
 
-    errors = []
+    errors: list = []
+    already_running = 0
     for cfg in configs:
         err = await _start_one_session(db, cfg, access_token)
-        if err and err != "session_exists":
+        if err == "session_exists":
+            already_running += 1
+        elif err:
             errors.append(err)
 
-    if len(errors) == len(configs):
+    # All configs failed with real errors → surface first error
+    if errors and len(errors) + already_running == len(configs):
         return errors[0]
+    # All configs already had sessions → 409 from router
+    if already_running == len(configs):
+        return "session_exists"
     return None
 
 
