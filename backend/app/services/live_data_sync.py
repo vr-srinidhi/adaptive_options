@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import uuid
 from datetime import date as date_type, datetime
 from typing import Optional
 from zoneinfo import ZoneInfo
@@ -38,6 +39,8 @@ TOKEN_EXPIRED = "EXPIRED"
 TOKEN_DECRYPTION_FAILED = "DECRYPTION_FAILED"
 TOKEN_VALIDATION_FAILED = "VALIDATION_FAILED"
 
+_sync_start_lock = asyncio.Lock()
+
 
 def today_ist() -> date_type:
     return datetime.now(IST).date()
@@ -54,6 +57,44 @@ async def _latest_zerodha_token(db: AsyncSession) -> Optional[BrokerToken]:
         .order_by(desc(BrokerToken.token_date), desc(BrokerToken.updated_at))
         .limit(1)
     )).scalar_one_or_none()
+
+
+async def get_started_live_data_sync_run(
+    db: AsyncSession,
+    trade_date: Optional[date_type] = None,
+) -> Optional[LiveDataSyncRun]:
+    trade_date = trade_date or today_ist()
+    return (await db.execute(
+        select(LiveDataSyncRun)
+        .where(
+            LiveDataSyncRun.trade_date == trade_date,
+            LiveDataSyncRun.status == STATUS_STARTED,
+        )
+        .order_by(desc(LiveDataSyncRun.started_at))
+        .limit(1)
+    )).scalar_one_or_none()
+
+
+async def create_started_live_data_sync_run(
+    db: AsyncSession,
+    trade_date: Optional[date_type] = None,
+    triggered_by: str = "manual",
+) -> Optional[LiveDataSyncRun]:
+    trade_date = trade_date or today_ist()
+    async with _sync_start_lock:
+        if await get_started_live_data_sync_run(db, trade_date):
+            return None
+        run = LiveDataSyncRun(
+            trade_date=trade_date,
+            started_at=now_ist(),
+            triggered_by=triggered_by,
+            token_status=TOKEN_MISSING,
+            status=STATUS_STARTED,
+        )
+        db.add(run)
+        await db.commit()
+        await db.refresh(run)
+        return run
 
 
 async def current_system_token_status(db: AsyncSession, trade_date: Optional[date_type] = None) -> str:
@@ -123,20 +164,27 @@ async def run_daily_live_data_sync(
     trade_date: Optional[date_type] = None,
     triggered_by: str = "scheduler",
     force: bool = False,
+    run_id: Optional[uuid.UUID] = None,
 ) -> LiveDataSyncRun:
     """Validate the current-day token, run live ingestion, and audit the attempt."""
-    trade_date = trade_date or today_ist()
-    started_at = now_ist()
-
-    run = LiveDataSyncRun(
-        trade_date=trade_date,
-        started_at=started_at,
-        triggered_by=triggered_by,
-        token_status=TOKEN_MISSING,
-        status=STATUS_STARTED,
-    )
-    db.add(run)
-    await db.flush()
+    if run_id is not None:
+        run = (await db.execute(
+            select(LiveDataSyncRun).where(LiveDataSyncRun.id == run_id)
+        )).scalar_one_or_none()
+        if run is None:
+            raise RuntimeError(f"Live data sync run {run_id} was not found.")
+        trade_date = run.trade_date
+    else:
+        trade_date = trade_date or today_ist()
+        run = LiveDataSyncRun(
+            trade_date=trade_date,
+            started_at=now_ist(),
+            triggered_by=triggered_by,
+            token_status=TOKEN_MISSING,
+            status=STATUS_STARTED,
+        )
+        db.add(run)
+        await db.flush()
 
     token_row = await _latest_zerodha_token(db)
     if token_row is None:
@@ -201,9 +249,12 @@ async def run_daily_live_data_sync(
         run.token_status = TOKEN_VALID
         run.completed_at = now_ist()
         run.error_message = str(exc)
-        await db.merge(run)
-        await db.commit()
         log.exception("live data sync failed for %s: %s", trade_date, exc)
+        try:
+            await db.merge(run)
+            await db.commit()
+        except Exception:
+            log.exception("live data sync: failed to save audit row after failure")
         return run
 
 

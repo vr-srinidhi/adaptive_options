@@ -259,6 +259,7 @@ async def ingest_live_day(
     futures_expiry: Optional[date_type] = None
     expiries: List[date_type] = []
     contracts: List[Tuple[int, date_type, str, int]] = []
+    total_option_contracts = 0
     df_spot: Optional[pd.DataFrame] = None
 
     try:
@@ -482,6 +483,9 @@ async def ingest_live_day(
         )
 
         # ── Mark readiness ────────────────────────────────────────────────────
+        # Readiness reflects the warehouse state after this run, not only the
+        # symbols fetched during this run. This keeps fill-missing reruns with
+        # prior spot/options data backtest-ready even if VIX/futures still warn.
         td.backtest_ready = td.spot_available and td.options_available
         if not td.backtest_ready:
             td.ingestion_status = "failed"
@@ -506,7 +510,7 @@ async def ingest_live_day(
         "vix_rows":         vix_rows,
         "futures_rows":     futures_rows,
         "options_rows":     options_rows,
-        "option_contracts": total_option_contracts if "total_option_contracts" in dir() else len(contracts),
+        "option_contracts": total_option_contracts,
         "futures_expiry":   str(futures_expiry) if futures_expiry else None,
         "expiries":         [str(expiry) for expiry in expiries],
         "failed_items":     failed_items,

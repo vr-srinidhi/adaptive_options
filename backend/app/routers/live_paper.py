@@ -42,7 +42,7 @@ from app.services.live_paper_engine import (
     start_live_session,
     get_sessions_for_date,
 )
-from app.services.live_data_sync import get_live_data_sync_today
+from app.services.live_data_sync import create_started_live_data_sync_run, get_live_data_sync_today
 from app.services.live_data_sync import run_daily_live_data_sync
 
 log = logging.getLogger(__name__)
@@ -455,9 +455,9 @@ async def get_data_sync_today(
     return await get_live_data_sync_today(db)
 
 
-async def _run_manual_data_sync_background() -> None:
+async def _run_manual_data_sync_background(run_id: uuid.UUID) -> None:
     async with AsyncSessionLocal() as db:
-        await run_daily_live_data_sync(db, triggered_by="manual", force=False)
+        await run_daily_live_data_sync(db, triggered_by="manual", force=False, run_id=run_id)
 
 
 @router.post("/data-sync/today")
@@ -467,7 +467,10 @@ async def trigger_data_sync_today(
     user: User = Depends(get_current_active_user),
 ):
     """Start a manual fill-missing-only warehouse sync for today."""
-    background_tasks.add_task(_run_manual_data_sync_background)
+    run = await create_started_live_data_sync_run(db, triggered_by="manual")
+    if run is None:
+        raise HTTPException(status_code=409, detail="A sync is already in progress for today.")
+    background_tasks.add_task(_run_manual_data_sync_background, run.id)
     return {
         "detail": "Live data sync started.",
         "status": await get_live_data_sync_today(db),
