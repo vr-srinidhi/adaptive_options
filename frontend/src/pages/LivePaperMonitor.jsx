@@ -744,7 +744,7 @@ export default function LivePaperMonitor() {
   }
 
   async function handleDeleteSlot(configId) {
-    if (!confirm('Delete this config slot? Today\'s session (if any) is kept for history.')) return
+    if (!confirm('Delete this config slot? Cannot delete while today\'s session is active — stop it first.')) return
     try {
       await deleteLivePaperConfigSlot(configId)
       setActionMsg('Slot deleted.')

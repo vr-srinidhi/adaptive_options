@@ -42,7 +42,21 @@ async def startup():
             raise RuntimeError("SECRET_KEY must be set in production.")
         if not settings.BROKER_TOKEN_ENCRYPTION_KEY:
             raise RuntimeError("BROKER_TOKEN_ENCRYPTION_KEY must be set in production.")
+
+    # Bootstrap schema first (idempotent create_all + seed data).
+    # Alembic migrations run after so they only apply additive changes on top
+    # of an already-consistent schema, avoiding conflicts on fresh databases.
     await init_db()
+
+    # Apply pending Alembic migrations after init_db() has ensured all base
+    # tables exist.  Using run_sync so we stay on the same event loop.
+    import asyncio
+    from alembic.config import Config as AlembicConfig
+    from alembic import command as alembic_command
+    alembic_cfg = AlembicConfig("/app/alembic.ini")
+    await asyncio.get_event_loop().run_in_executor(
+        None, alembic_command.upgrade, alembic_cfg, "head"
+    )
 
     # Start the live paper trading scheduler
     from app.services.scheduler import init_scheduler

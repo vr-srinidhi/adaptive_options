@@ -368,6 +368,23 @@ async def delete_config_slot(
     if len(total) <= 1:
         raise HTTPException(status_code=409, detail="Cannot delete the last config slot.")
 
+    # Block deletion if this slot has a non-terminal session today — the engine
+    # task would keep running but the session would disappear from /today and
+    # check_and_resume_sessions would silently skip it on next restart.
+    _TERMINAL = {"exited", "no_trade", "error"}
+    active_session = (await db.execute(
+        select(LivePaperSession).where(
+            LivePaperSession.config_id == cfg.id,
+            LivePaperSession.trade_date == date.today(),
+            LivePaperSession.status.notin_(_TERMINAL),
+        )
+    )).scalar_one_or_none()
+    if active_session:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Cannot delete slot while today's session is {active_session.status}. Stop it first.",
+        )
+
     await db.delete(cfg)
     await db.commit()
     return {"detail": "Config deleted."}
@@ -437,8 +454,12 @@ async def manual_start(
 ):
     """Start one specific slot (body.config_id) or all enabled slots."""
     cid = uuid.UUID(body.config_id) if body.config_id else None
+    # A specific config_id is always started regardless of its enabled flag
+    # (manual override). No config_id → start only auto-enabled slots.
     error = await start_live_session(
-        db, user_id=user.id, require_enabled=False, config_id=cid
+        db, user_id=user.id,
+        require_enabled=(cid is None),
+        config_id=cid,
     )
     if error == "no_config":
         raise HTTPException(status_code=404, detail="No live paper config found.")

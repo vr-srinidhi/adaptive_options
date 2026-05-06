@@ -187,32 +187,44 @@ async def start_live_session(
     if not configs:
         return "no_config"
 
-    # Fetch token once per user
-    uid = configs[0].user_id
-    if uid:
-        access_token = await get_broker_token(db, uid)
-    else:
-        from app.services.zerodha_client import get_access_token
-        access_token = get_access_token()
-
-    if not access_token:
-        log.warning("Live paper: no Zerodha token for user=%s.", user_id)
-        return "no_token"
+    # Group configs by user_id and fetch one broker token per user.
+    # This prevents the scheduler path (no user_id filter) from using one
+    # user's Zerodha token for another user's sessions.
+    from collections import defaultdict
+    configs_by_user: dict = defaultdict(list)
+    for cfg in configs:
+        configs_by_user[cfg.user_id].append(cfg)
 
     errors: list = []
     already_running = 0
-    for cfg in configs:
-        err = await _start_one_session(db, cfg, access_token)
-        if err == "session_exists":
-            already_running += 1
-        elif err:
-            errors.append(err)
+    total = 0
+
+    for uid, user_configs in configs_by_user.items():
+        if uid:
+            access_token = await get_broker_token(db, uid)
+        else:
+            from app.services.zerodha_client import get_access_token
+            access_token = get_access_token()
+
+        if not access_token:
+            log.warning("Live paper: no Zerodha token for user=%s.", uid)
+            errors.extend(["no_token"] * len(user_configs))
+            total += len(user_configs)
+            continue
+
+        for cfg in user_configs:
+            total += 1
+            err = await _start_one_session(db, cfg, access_token)
+            if err == "session_exists":
+                already_running += 1
+            elif err:
+                errors.append(err)
 
     # All configs failed with real errors → surface first error
-    if errors and len(errors) + already_running == len(configs):
+    if errors and len(errors) + already_running == total:
         return errors[0]
     # All configs already had sessions → 409 from router
-    if already_running == len(configs):
+    if already_running == total:
         return "session_exists"
     return None
 
