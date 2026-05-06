@@ -7,7 +7,7 @@ import {
 import { useAuth } from '../contexts/AuthContext'
 import {
   createLivePaperConfig, updateLivePaperConfigSlot, deleteLivePaperConfigSlot,
-  getLivePaperToday, getLivePaperHistory,
+  getLivePaperToday, getLivePaperHistory, getLiveDataSyncToday,
   startLivePaper, stopLivePaper,
   zerodhaSession,
 } from '../api/index.js'
@@ -443,6 +443,83 @@ function TokenSection({ tokenStatus, onTokenSaved }) {
   )
 }
 
+function DataSyncSection({ sync }) {
+  const statusMap = {
+    SUCCESS:                  { color: '#4ade80', label: 'Success' },
+    PARTIAL_SUCCESS:          { color: '#facc15', label: 'Partial' },
+    FAILED:                   { color: '#f87171', label: 'Failed' },
+    SKIPPED_TOKEN_MISSING:    { color: '#fb923c', label: 'Token missing' },
+    SKIPPED_TOKEN_EXPIRED:    { color: '#fb923c', label: 'Token expired' },
+    FAILED_TOKEN_DECRYPTION:  { color: '#f87171', label: 'Token error' },
+    FAILED_TOKEN_VALIDATION:  { color: '#f87171', label: 'Token invalid' },
+    NOT_RUN:                  { color: '#94a3b8', label: 'Not run' },
+    STARTED:                  { color: '#60a5fa', label: 'Running' },
+  }
+  const tokenMap = {
+    VALID: 'Valid',
+    MISSING: 'Missing',
+    EXPIRED: 'Expired',
+    DECRYPTION_FAILED: 'Decrypt failed',
+    VALIDATION_FAILED: 'Validation failed',
+  }
+  const status = statusMap[sync?.status] || { color: '#94a3b8', label: sync?.status || 'Unknown' }
+  const rows = sync?.rows || {}
+  const expiries = sync?.expiries?.length ? sync.expiries.join(', ') : '—'
+  const message = sync?.error_message || sync?.notes
+
+  return (
+    <div data-testid="data-sync-section" style={{ padding: '12px 0', borderTop: '0.5px solid var(--border)' }}>
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 10 }}>
+        <div>
+          <div style={{ fontSize: 12, fontWeight: 700, color: 'var(--text-primary)' }}>
+            Data Warehouse Sync
+          </div>
+          <div style={{ fontSize: 11, color: 'var(--text-secondary)', marginTop: 2 }}>
+            Scheduled: <strong style={{ color: 'var(--text-primary)' }}>{sync?.scheduled_time || '16:00 IST'}</strong>
+          </div>
+        </div>
+        <span style={{
+          fontSize: 11, fontWeight: 700, padding: '2px 8px', borderRadius: 10,
+          color: status.color, background: `${status.color}11`, border: `1px solid ${status.color}44`,
+        }}>
+          {status.label}
+        </span>
+      </div>
+
+      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '8px 12px', fontSize: 11 }}>
+        <div style={{ color: 'var(--text-secondary)' }}>Last attempt</div>
+        <div style={{ color: 'var(--text-primary)', textAlign: 'right' }}>{fmtTime(sync?.last_attempt_at)}</div>
+        <div style={{ color: 'var(--text-secondary)' }}>Token</div>
+        <div style={{ color: 'var(--text-primary)', textAlign: 'right' }}>{tokenMap[sync?.token_status] || sync?.token_status || '—'}</div>
+        <div style={{ color: 'var(--text-secondary)' }}>Backtest ready</div>
+        <div style={{ color: sync?.backtest_ready ? '#4ade80' : '#94a3b8', textAlign: 'right', fontWeight: 700 }}>
+          {sync?.backtest_ready ? 'Yes' : 'No'}
+        </div>
+        <div style={{ color: 'var(--text-secondary)' }}>Rows</div>
+        <div style={{ color: 'var(--text-primary)', textAlign: 'right' }}>
+          S {rows.spot ?? 0} · V {rows.vix ?? 0} · F {rows.futures ?? 0} · O {rows.options ?? 0}
+        </div>
+        <div style={{ color: 'var(--text-secondary)' }}>Contracts</div>
+        <div style={{ color: 'var(--text-primary)', textAlign: 'right' }}>{sync?.option_contracts ?? 0}</div>
+      </div>
+
+      <div style={{ marginTop: 8, fontSize: 11, color: 'var(--text-secondary)', overflowWrap: 'anywhere' }}>
+        Expiries: <span style={{ color: 'var(--text-primary)' }}>{expiries}</span>
+      </div>
+      {message && (
+        <div style={{
+          marginTop: 8, fontSize: 11, color: sync?.error_message ? '#f87171' : '#facc15',
+          background: sync?.error_message ? '#f8717111' : '#facc1511',
+          border: `1px solid ${sync?.error_message ? '#f8717133' : '#facc1533'}`,
+          borderRadius: 6, padding: '6px 8px', overflowWrap: 'anywhere',
+        }}>
+          {message}
+        </div>
+      )}
+    </div>
+  )
+}
+
 // ── Slot Detail ───────────────────────────────────────────────────────────────
 
 function SlotDetail({ slot, liveSlotData, navigate }) {
@@ -591,6 +668,7 @@ export default function LivePaperMonitor() {
 
   const [slots, setSlots]               = useState([])
   const [tokenStatus, setTokenStatus]   = useState(null)
+  const [dataSync, setDataSync]         = useState(null)
   const [history, setHistory]           = useState([])
   const [loading, setLoading]           = useState(true)
   const [error, setError]               = useState(null)
@@ -607,13 +685,15 @@ export default function LivePaperMonitor() {
 
   const loadToday = useCallback(async () => {
     try {
-      const [todayRes, histRes] = await Promise.all([
+      const [todayRes, histRes, syncRes] = await Promise.all([
         getLivePaperToday(),
         getLivePaperHistory({ limit: 20 }),
+        getLiveDataSyncToday(),
       ])
       const { slots: slotsData, token_status } = todayRes.data
       setSlots(slotsData)
       setTokenStatus(token_status)
+      setDataSync(syncRes.data)
       setHistory(histRes.data)
 
       // Seed liveData from DB state
@@ -978,8 +1058,11 @@ export default function LivePaperMonitor() {
                 setTokenStatus('valid')
                 setActionMsg('Token saved.')
                 setTimeout(() => setActionMsg(null), 3000)
+                loadToday()
               }}
             />
+
+            <DataSyncSection sync={dataSync} />
           </div>
         </div>
       )}

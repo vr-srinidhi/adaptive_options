@@ -25,6 +25,7 @@ from app.models import paper_trade  # noqa: F401
 from app.models import user  # noqa: F401
 from app.models import broker_token  # noqa: F401
 from app.models import audit_log  # noqa: F401
+from app.models import live_data_sync  # noqa: F401
 
 target_metadata = Base.metadata
 

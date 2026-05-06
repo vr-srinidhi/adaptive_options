@@ -36,6 +36,7 @@ async def init_db():
     from app.models import historical as _hist  # noqa
     from app.models import strategy_run as _sr  # noqa
     from app.models import live_paper as _lp  # noqa
+    from app.models import live_data_sync as _lds  # noqa
 
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
@@ -198,4 +199,3 @@ async def init_db():
                 "wed":    row[5],
                 "margin": row[6],
             })
-

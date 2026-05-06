@@ -42,6 +42,7 @@ from app.services.live_paper_engine import (
     start_live_session,
     get_sessions_for_date,
 )
+from app.services.live_data_sync import get_live_data_sync_today
 
 log = logging.getLogger(__name__)
 IST = ZoneInfo("Asia/Kolkata")
@@ -442,6 +443,15 @@ async def get_history(
         .offset(offset)
     )).scalars().all()
     return [_serialize_session(r) for r in rows]
+
+
+@router.get("/data-sync/today")
+async def get_data_sync_today(
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_active_user),
+):
+    """Latest read-only warehouse sync status for today's 4 PM live data job."""
+    return await get_live_data_sync_today(db)
 
 
 # ── Start / Stop ──────────────────────────────────────────────────────────────
