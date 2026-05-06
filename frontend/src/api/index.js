@@ -134,12 +134,16 @@ export const compareWorkbenchRuns = (refs) => api.get('/v2/runs/compare', { para
 export const getStrategyRunReplayCsv = (id) => api.get(`/v2/runs/strategy_run/${id}/replay/csv`, { responseType: 'blob' })
 
 // ── Live Paper Trading ────────────────────────────────────────────────────────
-export const getLivePaperConfig    = ()           => api.get('/v2/live-paper/config')
-export const updateLivePaperConfig = (payload)    => api.put('/v2/live-paper/config', payload)
-export const getLivePaperToday     = ()           => api.get('/v2/live-paper/today')
-export const getLivePaperHistory   = (params)     => api.get('/v2/live-paper/history', { params })
-export const startLivePaper        = ()           => api.post('/v2/live-paper/start')
-export const stopLivePaper         = ()           => api.post('/v2/live-paper/stop')
+export const getLivePaperConfig         = ()              => api.get('/v2/live-paper/config')
+export const updateLivePaperConfig      = (payload)       => api.put('/v2/live-paper/config', payload)
+export const getLivePaperConfigs        = ()              => api.get('/v2/live-paper/configs')
+export const createLivePaperConfig      = (payload)       => api.post('/v2/live-paper/configs', payload)
+export const updateLivePaperConfigSlot  = (id, payload)   => api.put(`/v2/live-paper/configs/${id}`, payload)
+export const deleteLivePaperConfigSlot  = (id)            => api.delete(`/v2/live-paper/configs/${id}`)
+export const getLivePaperToday          = ()              => api.get('/v2/live-paper/today')
+export const getLivePaperHistory        = (params)        => api.get('/v2/live-paper/history', { params })
+export const startLivePaper             = (body = {})     => api.post('/v2/live-paper/start', body)
+export const stopLivePaper              = (body = {})     => api.post('/v2/live-paper/stop', body)
 export const exportStrategyRunsBundle = (runIds) => api.post(
   '/v2/runs/strategy_run/export-bundle',
   { run_ids: runIds },

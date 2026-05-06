@@ -62,7 +62,7 @@ _SQ_TIME       = time(15, 25)   # default time exit
 # publishes.  If no subscriber is connected, messages are silently discarded.
 
 _sse_queues: Dict[uuid.UUID, Queue] = {}
-_active_session_id: Optional[uuid.UUID] = None   # currently running session
+_active_session_ids: set = set()   # all currently running session IDs
 
 
 def get_or_create_sse_queue(session_id: uuid.UUID) -> Queue:
@@ -72,7 +72,12 @@ def get_or_create_sse_queue(session_id: uuid.UUID) -> Queue:
 
 
 def get_active_session_id() -> Optional[uuid.UUID]:
-    return _active_session_id
+    """Backward-compat: return any one active session id, or None."""
+    return next(iter(_active_session_ids), None)
+
+
+def is_session_active(session_id: uuid.UUID) -> bool:
+    return session_id in _active_session_ids
 
 
 async def _broadcast(session_id: uuid.UUID, data: Dict) -> None:
@@ -86,71 +91,46 @@ async def _broadcast(session_id: uuid.UUID, data: Dict) -> None:
 
 # ── Startup helpers ───────────────────────────────────────────────────────────
 
-async def get_active_config(db, user_id=None) -> Optional[LivePaperConfig]:
-    """Return the enabled config for the given user (or global first if no user_id)."""
+async def get_active_configs(db, user_id=None):
+    """Return all enabled configs for user (multi-slot support)."""
     q = select(LivePaperConfig).where(LivePaperConfig.enabled.is_(True))
     if user_id is not None:
         q = q.where(LivePaperConfig.user_id == user_id)
-    return (await db.execute(q.limit(1))).scalar_one_or_none()
+    return (await db.execute(q)).scalars().all()
 
 
-async def get_session_for_date(db, trade_date: date, user_id=None) -> Optional[LivePaperSession]:
+async def get_active_config(db, user_id=None) -> Optional[LivePaperConfig]:
+    """Backward-compat: return first enabled config."""
+    configs = await get_active_configs(db, user_id=user_id)
+    return configs[0] if configs else None
+
+
+async def get_sessions_for_date(db, trade_date: date, user_id=None):
+    """Return all sessions for a given date (one per config slot)."""
     q = select(LivePaperSession).where(LivePaperSession.trade_date == trade_date)
     if user_id is not None:
         q = q.where(LivePaperSession.user_id == user_id)
-    return (await db.execute(q.limit(1))).scalar_one_or_none()
+    return (await db.execute(q)).scalars().all()
 
 
-async def start_live_session(
-    db,
-    user_id=None,
-    require_enabled: bool = True,
-) -> Optional[str]:
-    """
-    Create a LivePaperSession and launch the engine task.
+async def get_session_for_date(db, trade_date: date, user_id=None) -> Optional[LivePaperSession]:
+    """Backward-compat: return first session for date."""
+    sessions = await get_sessions_for_date(db, trade_date, user_id=user_id)
+    return sessions[0] if sessions else None
 
-    Parameters
-    ----------
-    require_enabled : bool
-        True  — scheduler path: only starts if config.enabled=True.
-        False — manual-start path: ignores enabled flag.
 
-    Returns
-    -------
-    None on success, or one of these error codes:
-      "no_config"      — no config found
-      "no_token"       — no valid Zerodha token
-      "session_exists" — session already exists for today
-    """
-    if require_enabled:
-        config = await get_active_config(db, user_id=user_id)
-    else:
-        # Manual start: load config regardless of enabled flag
-        q = select(LivePaperConfig)
-        if user_id is not None:
-            q = q.where(LivePaperConfig.user_id == user_id)
-        config = (await db.execute(q.limit(1))).scalar_one_or_none()
-
-    if not config:
-        log.info("Live paper: no config for user=%s.", user_id)
-        return "no_config"
-
+async def _start_one_session(db, config: LivePaperConfig, access_token: str) -> Optional[str]:
+    """Create session + launch task for a single config. Returns error code or None."""
     today = date.today()
-    existing = await get_session_for_date(db, today, user_id=config.user_id)
+    existing = (await db.execute(
+        select(LivePaperSession).where(
+            LivePaperSession.trade_date == today,
+            LivePaperSession.config_id == config.id,
+        )
+    )).scalar_one_or_none()
     if existing:
-        log.info("Live paper: session already exists for %s (status=%s).", today, existing.status)
+        log.info("Live paper: session already exists for config=%s date=%s.", config.id, today)
         return "session_exists"
-
-    # Validate token freshness (Zerodha tokens expire at 6 AM IST daily)
-    if config.user_id:
-        access_token = await get_broker_token(db, config.user_id)
-    else:
-        from app.services.zerodha_client import get_access_token
-        access_token = get_access_token()
-
-    if not access_token:
-        log.warning("Live paper: no Zerodha token for user=%s.", user_id)
-        return "no_token"
 
     session = LivePaperSession(
         config_id=config.id,
@@ -165,47 +145,126 @@ async def start_live_session(
         await db.refresh(session)
     except IntegrityError:
         await db.rollback()
-        log.info("Live paper: duplicate session race for user=%s date=%s — skipping.", config.user_id, today)
         return "session_exists"
 
-    log.info("Live paper session created: %s for %s", session.id, today)
+    log.info("Live paper session created: %s (config=%s label=%s)", session.id, config.id, config.label)
     asyncio.create_task(_run_session(session.id, config, access_token))
     return None
 
 
-async def check_and_resume_sessions() -> None:
+async def start_live_session(
+    db,
+    user_id=None,
+    require_enabled: bool = True,
+    config_id=None,
+) -> Optional[str]:
     """
-    Called at startup to resume any interrupted live sessions from today.
-    An interrupted session has status 'waiting' or 'entered' but no running task.
+    Launch engine tasks for all enabled config slots (or a specific one).
+
+    Parameters
+    ----------
+    require_enabled : if True only enabled configs are started (scheduler path).
+    config_id       : if set, start only that specific config regardless of enabled.
+
+    Returns
+    -------
+    None on success, or error code if nothing could start:
+      "no_config" / "no_token" / "session_exists"
     """
-    global _active_session_id
-    if _active_session_id is not None:
-        return  # already running
+    if config_id is not None:
+        configs_q = select(LivePaperConfig).where(LivePaperConfig.id == config_id)
+        if user_id:
+            configs_q = configs_q.where(LivePaperConfig.user_id == user_id)
+        configs = (await db.execute(configs_q)).scalars().all()
+    elif require_enabled:
+        configs = await get_active_configs(db, user_id=user_id)
+    else:
+        q = select(LivePaperConfig)
+        if user_id is not None:
+            q = q.where(LivePaperConfig.user_id == user_id)
+        configs = (await db.execute(q)).scalars().all()
 
-    today = date.today()
-    async with AsyncSessionLocal() as db:
-        session = await get_session_for_date(db, today)
-        if not session or session.status not in ("waiting", "entered"):
-            return
+    if not configs:
+        return "no_config"
 
-        config = (await db.execute(
-            select(LivePaperConfig).where(LivePaperConfig.id == session.config_id).limit(1)
-        )).scalar_one_or_none()
-        if not config:
-            return
+    # Group configs by user_id and fetch one broker token per user.
+    # This prevents the scheduler path (no user_id filter) from using one
+    # user's Zerodha token for another user's sessions.
+    from collections import defaultdict
+    configs_by_user: dict = defaultdict(list)
+    for cfg in configs:
+        configs_by_user[cfg.user_id].append(cfg)
 
-        # Always re-fetch token from DB on resume — picks up tokens stored after a crash
-        if config.user_id:
-            access_token = await get_broker_token(db, config.user_id)
+    errors: list = []
+    already_running = 0
+    total = 0
+
+    for uid, user_configs in configs_by_user.items():
+        if uid:
+            access_token = await get_broker_token(db, uid)
         else:
             from app.services.zerodha_client import get_access_token
             access_token = get_access_token()
 
         if not access_token:
-            return
+            log.warning("Live paper: no Zerodha token for user=%s.", uid)
+            errors.extend(["no_token"] * len(user_configs))
+            total += len(user_configs)
+            continue
 
-    log.info("Live paper: resuming interrupted session %s", session.id)
-    asyncio.create_task(_run_session(session.id, config, access_token, resume=True))
+        for cfg in user_configs:
+            total += 1
+            err = await _start_one_session(db, cfg, access_token)
+            if err == "session_exists":
+                already_running += 1
+            elif err:
+                errors.append(err)
+
+    # All configs failed with real errors → surface first error
+    if errors and len(errors) + already_running == total:
+        return errors[0]
+    # All configs already had sessions → 409 from router
+    if already_running == total:
+        return "session_exists"
+    return None
+
+
+async def check_and_resume_sessions() -> None:
+    """
+    Called at startup to resume all interrupted live sessions from today.
+    Handles multiple parallel sessions (one per config slot).
+    """
+    today = date.today()
+    async with AsyncSessionLocal() as db:
+        sessions = (await db.execute(
+            select(LivePaperSession).where(
+                LivePaperSession.trade_date == today,
+                LivePaperSession.status.in_(("waiting", "entered")),
+            )
+        )).scalars().all()
+
+        for session in sessions:
+            if session.id in _active_session_ids:
+                continue  # already running
+
+            config = (await db.execute(
+                select(LivePaperConfig).where(LivePaperConfig.id == session.config_id)
+            )).scalar_one_or_none()
+            if not config:
+                continue
+
+            uid = config.user_id
+            if uid:
+                access_token = await get_broker_token(db, uid)
+            else:
+                from app.services.zerodha_client import get_access_token
+                access_token = get_access_token()
+
+            if not access_token:
+                continue
+
+            log.info("Live paper: resuming interrupted session %s (label=%s)", session.id, config.label)
+            asyncio.create_task(_run_session(session.id, config, access_token, resume=True))
 
 
 # ── Timing helpers ────────────────────────────────────────────────────────────
@@ -455,8 +514,7 @@ async def _run_session(
     Self-driving asyncio task.  Runs from 09:14 to session exit.
     All DB writes use fresh AsyncSessionLocal() sessions.
     """
-    global _active_session_id
-    _active_session_id = session_id
+    _active_session_ids.add(session_id)
     get_or_create_sse_queue(session_id)
 
     instrument   = config.instrument
@@ -1105,7 +1163,7 @@ async def _run_session(
         await _update_session(session_id, status="error", error_message=str(exc))
         await _broadcast(session_id, {"type": "ERROR", "message": str(exc)})
     finally:
-        _active_session_id = None
+        _active_session_ids.discard(session_id)
 
 
 # ── DB write helpers ──────────────────────────────────────────────────────────

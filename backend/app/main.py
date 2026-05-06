@@ -42,7 +42,54 @@ async def startup():
             raise RuntimeError("SECRET_KEY must be set in production.")
         if not settings.BROKER_TOKEN_ENCRYPTION_KEY:
             raise RuntimeError("BROKER_TOKEN_ENCRYPTION_KEY must be set in production.")
+
+    # Bootstrap schema first (idempotent create_all + seed data).
+    # Alembic migrations run after so they only apply additive changes on top
+    # of an already-consistent schema, avoiding conflicts on fresh databases.
     await init_db()
+
+    # Apply pending Alembic migrations.
+    # On a fresh database init_db() has already created all tables via
+    # create_all(), so we stamp alembic at head before running upgrade to
+    # prevent old non-idempotent migrations (e.g. 0003 create_table) from
+    # being replayed against tables that already exist.
+    import asyncio
+    from pathlib import Path
+    from alembic.config import Config as AlembicConfig
+    from alembic import command as alembic_command
+    from sqlalchemy import text as _sa_text
+    from app.database import engine as _async_engine
+
+    # alembic.ini lives one directory above this file (backend/alembic.ini)
+    _alembic_ini = Path(__file__).parent.parent / "alembic.ini"
+    alembic_cfg = AlembicConfig(str(_alembic_ini))
+
+    # Check alembic_version via the async engine — synchronous inspect() is
+    # explicitly unsupported for AsyncEngine and would raise NoInspectionAvailable.
+    # to_regclass() returns NULL (not an error) when the table is absent.
+    async with _async_engine.connect() as _conn:
+        _vt_oid = (await _conn.execute(
+            _sa_text("SELECT to_regclass('public.alembic_version')")
+        )).scalar()
+        _current = None
+        if _vt_oid:
+            _current = (await _conn.execute(
+                _sa_text("SELECT version_num FROM alembic_version")
+            )).fetchone()
+
+    # Alembic stamp/upgrade call asyncio.run() via env.py — they must run in
+    # a thread where no event loop is active; run_in_executor provides that.
+    if not _current:
+        # Fresh DB — already bootstrapped by init_db(); stamp at head so
+        # upgrade head becomes a no-op and old non-idempotent migrations are
+        # not replayed against tables that create_all() already created.
+        await asyncio.get_event_loop().run_in_executor(
+            None, alembic_command.stamp, alembic_cfg, "head"
+        )
+    else:
+        await asyncio.get_event_loop().run_in_executor(
+            None, alembic_command.upgrade, alembic_cfg, "head"
+        )
 
     # Start the live paper trading scheduler
     from app.services.scheduler import init_scheduler

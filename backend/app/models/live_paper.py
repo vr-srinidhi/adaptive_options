@@ -20,12 +20,13 @@ from app.database import Base
 class LivePaperConfig(Base):
     """
     Persistent config for the live paper trading engine.
-    Expected to have exactly one active row per user.
+    Multiple rows per user are allowed — each represents one parallel time slot.
     """
     __tablename__ = "live_paper_configs"
 
     id           = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     user_id      = Column(UUID(as_uuid=True), nullable=True)          # soft FK to users
+    label        = Column(String(50), nullable=True)                   # e.g. "10:15 slot"
     strategy_id  = Column(String(60), nullable=False, default="short_straddle_dual_lock")
     instrument   = Column(String(20), nullable=False, default="NIFTY")
     capital      = Column(Numeric(15, 2), nullable=False, default=2_500_000)
@@ -54,9 +55,9 @@ class LivePaperSession(Base):
     phase (09:14–09:49) for charting the full-day context on the monitor.
     """
     __tablename__ = "live_paper_sessions"
-    __table_args__ = (
-        UniqueConstraint("user_id", "trade_date", name="uq_live_paper_session_user_date"),
-    )
+    # Uniqueness enforced by a partial index in migration 0007:
+    #   UNIQUE (user_id, trade_date, config_id) WHERE config_id IS NOT NULL
+    __table_args__ = {}
 
     id              = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     config_id       = Column(UUID(as_uuid=True), nullable=True)       # soft FK to live_paper_configs
