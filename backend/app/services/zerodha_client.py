@@ -227,6 +227,20 @@ def get_instruments_with_token(access_token: str, segment: str = "NFO") -> List[
     return instruments
 
 
+def validate_access_token_with_token(access_token: str) -> Dict:
+    """
+    Validate a caller-provided access token without touching the singleton.
+
+    Returns the Zerodha profile payload. Callers should catch exceptions and map
+    them to their own auth/status vocabulary.
+    """
+    if not API_KEY:
+        raise RuntimeError("ZERODHA_API_KEY environment variable is not set.")
+    kite = KiteConnect(api_key=API_KEY)
+    kite.set_access_token(access_token)
+    return kite.profile()
+
+
 # ── Live quote helpers ────────────────────────────────────────────────────────
 
 # Well-known spot symbols for kite.quote()

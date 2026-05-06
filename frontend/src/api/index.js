@@ -141,6 +141,8 @@ export const createLivePaperConfig      = (payload)       => api.post('/v2/live-
 export const updateLivePaperConfigSlot  = (id, payload)   => api.put(`/v2/live-paper/configs/${id}`, payload)
 export const deleteLivePaperConfigSlot  = (id)            => api.delete(`/v2/live-paper/configs/${id}`)
 export const getLivePaperToday          = ()              => api.get('/v2/live-paper/today')
+export const getLiveDataSyncToday       = ()              => api.get('/v2/live-paper/data-sync/today')
+export const triggerLiveDataSyncToday   = ()              => api.post('/v2/live-paper/data-sync/today')
 export const getLivePaperHistory        = (params)        => api.get('/v2/live-paper/history', { params })
 export const startLivePaper             = (body = {})     => api.post('/v2/live-paper/start', body)
 export const stopLivePaper              = (body = {})     => api.post('/v2/live-paper/stop', body)

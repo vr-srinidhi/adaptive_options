@@ -19,7 +19,7 @@ from datetime import date, datetime
 from typing import Any, Dict, List, Optional
 from zoneinfo import ZoneInfo
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from sqlalchemy import select, update
@@ -42,6 +42,8 @@ from app.services.live_paper_engine import (
     start_live_session,
     get_sessions_for_date,
 )
+from app.services.live_data_sync import create_started_live_data_sync_run, get_live_data_sync_today
+from app.services.live_data_sync import run_daily_live_data_sync
 
 log = logging.getLogger(__name__)
 IST = ZoneInfo("Asia/Kolkata")
@@ -442,6 +444,37 @@ async def get_history(
         .offset(offset)
     )).scalars().all()
     return [_serialize_session(r) for r in rows]
+
+
+@router.get("/data-sync/today")
+async def get_data_sync_today(
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_active_user),
+):
+    """Latest read-only warehouse sync status for today's 4 PM live data job."""
+    return await get_live_data_sync_today(db)
+
+
+async def _run_manual_data_sync_background(run_id: uuid.UUID) -> None:
+    async with AsyncSessionLocal() as db:
+        await run_daily_live_data_sync(db, triggered_by="manual", force=False, run_id=run_id)
+
+
+@router.post("/data-sync/today")
+async def trigger_data_sync_today(
+    background_tasks: BackgroundTasks,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_active_user),
+):
+    """Start a manual fill-missing-only warehouse sync for today."""
+    run = await create_started_live_data_sync_run(db, triggered_by="manual")
+    if run is None:
+        raise HTTPException(status_code=409, detail="A sync is already in progress for today.")
+    background_tasks.add_task(_run_manual_data_sync_background, run.id)
+    return {
+        "detail": "Live data sync started.",
+        "status": await get_live_data_sync_today(db),
+    }
 
 
 # ── Start / Stop ──────────────────────────────────────────────────────────────
