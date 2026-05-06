@@ -36,11 +36,17 @@ async def _fire_daily_session() -> None:
 async def _fire_daily_live_data_sync() -> None:
     """APScheduler async job — runs at 16:00 IST on weekdays."""
     from app.database import AsyncSessionLocal
-    from app.services.live_data_sync import run_daily_live_data_sync
+    from app.services.live_data_sync import create_started_live_data_sync_run, run_daily_live_data_sync
 
     log.info("Scheduler: firing daily live data warehouse sync job.")
     async with AsyncSessionLocal() as db:
-        await run_daily_live_data_sync(db, triggered_by="scheduler")
+        run = await create_started_live_data_sync_run(db, triggered_by="scheduler")
+        if run is None:
+            log.info("Scheduler: live data sync already in progress for today, skipping.")
+            return
+
+    async with AsyncSessionLocal() as db:
+        await run_daily_live_data_sync(db, triggered_by="scheduler", run_id=run.id)
 
 
 def init_scheduler() -> None:

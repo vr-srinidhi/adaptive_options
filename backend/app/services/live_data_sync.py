@@ -39,6 +39,9 @@ TOKEN_EXPIRED = "EXPIRED"
 TOKEN_DECRYPTION_FAILED = "DECRYPTION_FAILED"
 TOKEN_VALIDATION_FAILED = "VALIDATION_FAILED"
 
+# Single-process lock: serializes concurrent calls within one uvicorn worker.
+# If scaling to --workers > 1 or multiple replicas, replace with a DB advisory
+# lock or a partial unique constraint on (trade_date) WHERE status = 'STARTED'.
 _sync_start_lock = asyncio.Lock()
 
 
