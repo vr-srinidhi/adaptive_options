@@ -1,4 +1,4 @@
-import { render, screen, waitFor } from '@testing-library/react'
+import { fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 const mocks = vi.hoisted(() => ({
@@ -10,6 +10,7 @@ const mocks = vi.hoisted(() => ({
   getLivePaperToday: vi.fn(),
   getLivePaperHistory: vi.fn(),
   getLiveDataSyncToday: vi.fn(),
+  triggerLiveDataSyncToday: vi.fn(),
   startLivePaper: vi.fn(),
   stopLivePaper: vi.fn(),
   zerodhaSession: vi.fn(),
@@ -34,6 +35,7 @@ vi.mock('../api/index.js', () => ({
   getLivePaperToday: mocks.getLivePaperToday,
   getLivePaperHistory: mocks.getLivePaperHistory,
   getLiveDataSyncToday: mocks.getLiveDataSyncToday,
+  triggerLiveDataSyncToday: mocks.triggerLiveDataSyncToday,
   startLivePaper: mocks.startLivePaper,
   stopLivePaper: mocks.stopLivePaper,
   zerodhaSession: mocks.zerodhaSession,
@@ -70,6 +72,7 @@ describe('LivePaperMonitor data sync status', () => {
       data: { slots: [slot()], token_status: 'valid' },
     })
     mocks.getLivePaperHistory.mockResolvedValue({ data: [] })
+    mocks.triggerLiveDataSyncToday.mockResolvedValue({ data: { detail: 'started' } })
   })
 
   it('renders successful warehouse sync rows and expiries', async () => {
@@ -125,5 +128,32 @@ describe('LivePaperMonitor data sync status', () => {
     expect(screen.getByText('Missing')).toBeInTheDocument()
     expect(screen.getByText('No')).toBeInTheDocument()
     expect(screen.getByText(/No Zerodha token is available/)).toBeInTheDocument()
+  })
+
+  it('starts a manual missing-only warehouse sync from the status card', async () => {
+    mocks.getLiveDataSyncToday.mockResolvedValue({
+      data: {
+        trade_date: '2026-05-06',
+        scheduled_time: '16:00 IST',
+        status: 'PARTIAL_SUCCESS',
+        token_status: 'VALID',
+        backtest_ready: true,
+        last_attempt_at: '2026-05-06T16:00:12+05:30',
+        completed_at: '2026-05-06T16:18:12+05:30',
+        rows: { spot: 375, vix: 375, futures: 375, options: 151279 },
+        option_contracts: 486,
+        expiries: ['2026-05-12'],
+        notes: '54/486 option contracts had no data',
+        error_message: null,
+      },
+    })
+
+    render(<LivePaperMonitor />)
+
+    const button = await screen.findByRole('button', { name: 'Sync missing' })
+    fireEvent.click(button)
+
+    expect(mocks.triggerLiveDataSyncToday).toHaveBeenCalledTimes(1)
+    expect(await screen.findByText('Syncing…')).toBeInTheDocument()
   })
 })

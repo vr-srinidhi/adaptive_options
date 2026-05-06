@@ -182,6 +182,50 @@ def _select_nearest_nifty_future(instruments: list, trade_date: date_type) -> Op
     return sorted(futures, key=lambda item: item[0])[0][1]
 
 
+async def _existing_row_count(db: AsyncSession, table: str, trade_date: date_type) -> int:
+    return int((await db.execute(
+        text(f"SELECT COUNT(*) FROM {table} WHERE trade_date = :d"),
+        {"d": trade_date},
+    )).scalar_one() or 0)
+
+
+async def _existing_option_contract_keys(
+    db: AsyncSession,
+    trade_date: date_type,
+) -> set[Tuple[date_type, str, int]]:
+    rows = (await db.execute(text("""
+        SELECT DISTINCT expiry_date, option_type, strike
+        FROM options_candles
+        WHERE trade_date = :d
+    """), {"d": trade_date})).all()
+    return {(row[0], row[1], int(row[2])) for row in rows}
+
+
+def _missing_option_contracts(
+    contracts: List[Tuple[int, date_type, str, int]],
+    existing_keys: set[Tuple[date_type, str, int]],
+) -> List[Tuple[int, date_type, str, int]]:
+    return [
+        contract for contract in contracts
+        if (contract[1], contract[2], contract[3]) not in existing_keys
+    ]
+
+
+async def _existing_spot_median(db: AsyncSession, trade_date: date_type) -> Optional[float]:
+    rows = (await db.execute(text("""
+        SELECT close
+        FROM spot_candles
+        WHERE trade_date = :d AND symbol = 'NIFTY' AND close IS NOT NULL
+    """), {"d": trade_date})).scalars().all()
+    if not rows:
+        return None
+    values = sorted(float(row) for row in rows)
+    mid = len(values) // 2
+    if len(values) % 2:
+        return values[mid]
+    return (values[mid - 1] + values[mid]) / 2
+
+
 # ── Main function ─────────────────────────────────────────────────────────────
 
 async def ingest_live_day(
@@ -205,21 +249,6 @@ async def ingest_live_day(
         db.add(td)
         await db.flush()
 
-    if td.ingestion_status in ("completed", "completed_with_warnings") and not force:
-        return {
-            "trade_date":       str(trade_date),
-            "status":           "skipped",
-            "notes":            "Already ingested (pass force=true to re-ingest)",
-            "spot_rows":        0,
-            "vix_rows":         0,
-            "futures_rows":     0,
-            "options_rows":     0,
-            "option_contracts": 0,
-            "futures_expiry":   None,
-            "expiries":         [],
-            "failed_items":     [],
-        }
-
     td.ingestion_status = "in_progress"
     await db.flush()
     await db.commit()
@@ -236,19 +265,27 @@ async def ingest_live_day(
         # ── Spot ─────────────────────────────────────────────────────────────
         log.info("live_ingest %s: fetching NIFTY spot (token=%d)", trade_date, UNDERLYING_TOKENS["NIFTY"])
         try:
-            records = await asyncio.to_thread(
-                fetch_candles_with_token,
-                UNDERLYING_TOKENS["NIFTY"], trade_date, access_token,
-            )
-            df_spot = _to_spot_df(records, trade_date, "NIFTY")
             if force:
                 await db.execute(text("DELETE FROM spot_candles WHERE trade_date = :d"), {"d": trade_date})
-            spot_rows = await _bulk_insert(db, df_spot, "spot_candles", SPOT_CHUNK, [])
-            td.spot_available = True
-            td.spot_row_count = spot_rows
-            td.spot_file_name = "zerodha_live"
+            existing_spot_rows = 0 if force else await _existing_row_count(db, "spot_candles", trade_date)
+            if existing_spot_rows > 0:
+                spot_rows = existing_spot_rows
+                td.spot_available = True
+                td.spot_row_count = spot_rows
+                td.spot_file_name = td.spot_file_name or "zerodha_live"
+                log.info("live_ingest %s: spot already present (%d rows)", trade_date, spot_rows)
+            else:
+                records = await asyncio.to_thread(
+                    fetch_candles_with_token,
+                    UNDERLYING_TOKENS["NIFTY"], trade_date, access_token,
+                )
+                df_spot = _to_spot_df(records, trade_date, "NIFTY")
+                spot_rows = await _bulk_insert(db, df_spot, "spot_candles", SPOT_CHUNK, [])
+                td.spot_available = True
+                td.spot_row_count = spot_rows
+                td.spot_file_name = "zerodha_live"
+                log.info("live_ingest %s: spot %d rows", trade_date, spot_rows)
             await db.commit()
-            log.info("live_ingest %s: spot %d rows", trade_date, spot_rows)
         except DataUnavailableError as exc:
             notes.append(f"spot unavailable: {exc}")
             failed_items.append("spot")
@@ -258,18 +295,25 @@ async def ingest_live_day(
         # ── VIX ──────────────────────────────────────────────────────────────
         log.info("live_ingest %s: fetching India VIX (token=%d)", trade_date, VIX_TOKEN)
         try:
-            records = await asyncio.to_thread(
-                fetch_candles_with_token,
-                VIX_TOKEN, trade_date, access_token,
-            )
-            df_vix = _to_vix_df(records, trade_date)
             if force:
                 await db.execute(text("DELETE FROM vix_candles WHERE trade_date = :d"), {"d": trade_date})
-            vix_rows = await _bulk_insert(db, df_vix, "vix_candles", SPOT_CHUNK, [])
-            td.vix_available = True
-            td.vix_file_name = "zerodha_live"
+            existing_vix_rows = 0 if force else await _existing_row_count(db, "vix_candles", trade_date)
+            if existing_vix_rows > 0:
+                vix_rows = existing_vix_rows
+                td.vix_available = True
+                td.vix_file_name = td.vix_file_name or "zerodha_live"
+                log.info("live_ingest %s: vix already present (%d rows)", trade_date, vix_rows)
+            else:
+                records = await asyncio.to_thread(
+                    fetch_candles_with_token,
+                    VIX_TOKEN, trade_date, access_token,
+                )
+                df_vix = _to_vix_df(records, trade_date)
+                vix_rows = await _bulk_insert(db, df_vix, "vix_candles", SPOT_CHUNK, [])
+                td.vix_available = True
+                td.vix_file_name = "zerodha_live"
+                log.info("live_ingest %s: vix %d rows", trade_date, vix_rows)
             await db.commit()
-            log.info("live_ingest %s: vix %d rows", trade_date, vix_rows)
         except DataUnavailableError as exc:
             notes.append(f"vix unavailable: {exc}")
             failed_items.append("vix")
@@ -291,18 +335,25 @@ async def ingest_live_day(
                 "live_ingest %s: fetching NIFTY futures token=%s expiry=%s",
                 trade_date, future.get("instrument_token"), futures_expiry,
             )
-            records = await asyncio.to_thread(
-                fetch_candles_with_token,
-                int(future["instrument_token"]), trade_date, access_token,
-            )
-            df_futures = _to_futures_df(records, trade_date, futures_expiry)
             if force:
                 await db.execute(text("DELETE FROM futures_candles WHERE trade_date = :d"), {"d": trade_date})
-            futures_rows = await _bulk_insert(db, df_futures, "futures_candles", SPOT_CHUNK, [])
-            td.futures_available = True
-            td.futures_file_name = "zerodha_live"
+            existing_futures_rows = 0 if force else await _existing_row_count(db, "futures_candles", trade_date)
+            if existing_futures_rows > 0:
+                futures_rows = existing_futures_rows
+                td.futures_available = True
+                td.futures_file_name = td.futures_file_name or "zerodha_live"
+                log.info("live_ingest %s: futures already present (%d rows)", trade_date, futures_rows)
+            else:
+                records = await asyncio.to_thread(
+                    fetch_candles_with_token,
+                    int(future["instrument_token"]), trade_date, access_token,
+                )
+                df_futures = _to_futures_df(records, trade_date, futures_expiry)
+                futures_rows = await _bulk_insert(db, df_futures, "futures_candles", SPOT_CHUNK, [])
+                td.futures_available = True
+                td.futures_file_name = "zerodha_live"
+                log.info("live_ingest %s: futures %d rows", trade_date, futures_rows)
             await db.commit()
-            log.info("live_ingest %s: futures %d rows", trade_date, futures_rows)
         except DataUnavailableError as exc:
             notes.append(f"futures unavailable: {exc}")
             failed_items.append("futures")
@@ -311,8 +362,15 @@ async def ingest_live_day(
 
         # ── Options ───────────────────────────────────────────────────────────
         # Determine strike range from spot data (fallback: broad range)
+        existing_spot_median = None if df_spot is not None else await _existing_spot_median(db, trade_date)
         if df_spot is not None and not df_spot.empty:
             atm_spot  = float(df_spot["close"].median())
+        elif existing_spot_median is not None:
+            atm_spot = existing_spot_median
+        else:
+            atm_spot = None
+
+        if atm_spot is not None:
             step      = 50   # NIFTY strike step
             atm       = int(round(atm_spot / step) * step)
             lo        = atm - STRIKE_WINDOW_STEPS * step
@@ -358,7 +416,15 @@ async def ingest_live_day(
                     int(inst_strike),
                 ))
 
-        log.info("live_ingest %s: %d option contracts to fetch", trade_date, len(contracts))
+        total_option_contracts = len(contracts)
+        if not force:
+            existing_contracts = await _existing_option_contract_keys(db, trade_date)
+            contracts = _missing_option_contracts(contracts, existing_contracts)
+
+        log.info(
+            "live_ingest %s: %d/%d option contracts to fetch",
+            trade_date, len(contracts), total_option_contracts,
+        )
 
         if force:
             await db.execute(text("DELETE FROM options_candles WHERE trade_date = :d"), {"d": trade_date})
@@ -400,18 +466,19 @@ async def ingest_live_day(
             options_rows += await _bulk_insert(db, combined, "options_candles", OPTIONS_CHUNK, [])
 
         if failed_contracts:
-            notes.append(f"{failed_contracts}/{len(contracts)} option contracts had no data")
+            notes.append(f"{failed_contracts}/{len(contracts)} fetched option contracts had no data")
             failed_items.append("options_partial")
-        if not contracts:
+        if total_option_contracts == 0:
             notes.append("no option contracts matched the target expiries/strike range")
             failed_items.append("options")
 
-        td.options_available = options_rows > 0
-        td.options_row_count = options_rows
-        td.options_file_name = "zerodha_live"
+        total_options_rows = await _existing_row_count(db, "options_candles", trade_date)
+        td.options_available = total_options_rows > 0
+        td.options_row_count = total_options_rows
+        td.options_file_name = td.options_file_name or "zerodha_live"
         log.info(
-            "live_ingest %s: options %d rows  (%d contracts failed)",
-            trade_date, options_rows, failed_contracts,
+            "live_ingest %s: options %d new rows, %d total rows (%d contracts failed)",
+            trade_date, options_rows, total_options_rows, failed_contracts,
         )
 
         # ── Mark readiness ────────────────────────────────────────────────────
@@ -439,7 +506,7 @@ async def ingest_live_day(
         "vix_rows":         vix_rows,
         "futures_rows":     futures_rows,
         "options_rows":     options_rows,
-        "option_contracts": len(contracts),
+        "option_contracts": total_option_contracts if "total_option_contracts" in dir() else len(contracts),
         "futures_expiry":   str(futures_expiry) if futures_expiry else None,
         "expiries":         [str(expiry) for expiry in expiries],
         "failed_items":     failed_items,

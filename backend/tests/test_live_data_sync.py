@@ -35,7 +35,7 @@ from app.services.live_data_sync import (
     STATUS_SUCCESS,
     _sync_status_from_result,
 )
-from app.services.live_ingestion import _select_nearest_nifty_future, _to_futures_df
+from app.services.live_ingestion import _missing_option_contracts, _select_nearest_nifty_future, _to_futures_df
 
 
 def test_select_nearest_nifty_future_uses_next_valid_expiry():
@@ -88,3 +88,20 @@ def test_sync_status_requires_spot_and_options_for_success():
         {"status": "completed_with_warnings", "failed_items": ["spot"]},
         {"spot_rows": 0, "options_rows": 10000},
     ) == STATUS_FAILED
+
+
+def test_missing_option_contracts_filters_contracts_already_in_warehouse():
+    exp = date(2026, 5, 12)
+    contracts = [
+        (101, exp, "CE", 22500),
+        (102, exp, "PE", 22500),
+        (103, exp, "CE", 22550),
+    ]
+    existing = {
+        (exp, "CE", 22500),
+        (exp, "PE", 22500),
+    }
+
+    assert _missing_option_contracts(contracts, existing) == [
+        (103, exp, "CE", 22550),
+    ]

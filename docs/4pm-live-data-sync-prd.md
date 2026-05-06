@@ -155,6 +155,8 @@ It should show:
 - selected expiries
 - notes or error message
 
+The card should also provide a manual `Sync missing` action. The action starts a backend sync without forcing a full delete/reinsert. Existing warehouse rows are preserved, and the backend only fetches symbols/contracts that are not already present in the warehouse. Existing unique constraints still protect against duplicate rows.
+
 Status styling:
 
 - success: green
@@ -172,4 +174,5 @@ Status styling:
 - Re-runs do not create duplicate warehouse rows.
 - A day is backtest-ready only when spot and options are available.
 - The Live page shows sync status without requiring user action.
+- The Live page can manually trigger a fill-missing-only sync after a partial run.
 - Existing live-paper session scheduling remains unchanged.

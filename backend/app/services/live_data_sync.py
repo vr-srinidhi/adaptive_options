@@ -182,12 +182,12 @@ async def run_daily_live_data_sync(
 
     try:
         result = await ingest_live_day(db, access_token, trade_date, force=force)
-        counts = await _warehouse_counts(db, trade_date) if result.get("status") == "skipped" else {}
+        counts = await _warehouse_counts(db, trade_date)
         run.status = _sync_status_from_result(result, counts)
-        run.spot_rows = counts.get("spot_rows", result.get("spot_rows", 0))
-        run.vix_rows = counts.get("vix_rows", result.get("vix_rows", 0))
-        run.futures_rows = counts.get("futures_rows", result.get("futures_rows", 0))
-        run.options_rows = counts.get("options_rows", result.get("options_rows", 0))
+        run.spot_rows = counts.get("spot_rows", 0)
+        run.vix_rows = counts.get("vix_rows", 0)
+        run.futures_rows = counts.get("futures_rows", 0)
+        run.options_rows = counts.get("options_rows", 0)
         run.option_contracts = counts.get("option_contracts", result.get("option_contracts", 0))
         run.expiries_json = counts.get("expiries") or result.get("expiries") or []
         run.failed_items_json = result.get("failed_items") or []
