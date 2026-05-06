@@ -94,15 +94,43 @@ async def init_db():
             "ALTER TABLE paper_trade_headers ADD COLUMN IF NOT EXISTS selected_candidate_score_breakdown_json JSONB",
             # ── paper_sessions SKIPPED status support ─────────────────────────
             "ALTER TABLE paper_sessions ADD COLUMN IF NOT EXISTS error_message TEXT",
+            # ── Live paper multi-session (migration 0007) ──────────────────────
+            # label is in the ORM model so create_all() handles it on fresh DBs;
+            # add here for existing DBs that skipped 0007.
+            "ALTER TABLE live_paper_configs ADD COLUMN IF NOT EXISTS label VARCHAR(50)",
         ]:
             await conn.execute(__import__("sqlalchemy").text(stmt))
+
+        # ── Live paper multi-session partial unique index (migration 0007) ────
+        # The partial index below cannot be expressed in the ORM UniqueConstraint
+        # (SQLAlchemy Core doesn't support partial unique indexes via create_all).
+        # It MUST be created here so fresh databases that bypass Alembic also get
+        # the correct constraint.  Both statements are fully idempotent.
+        _sa_text = __import__("sqlalchemy").text
+        await conn.execute(_sa_text("""
+            DO $$
+            BEGIN
+                IF EXISTS (
+                    SELECT 1 FROM pg_constraint
+                    WHERE conname = 'uq_live_paper_session_user_date'
+                      AND conrelid = 'live_paper_sessions'::regclass
+                ) THEN
+                    ALTER TABLE live_paper_sessions
+                    DROP CONSTRAINT uq_live_paper_session_user_date;
+                END IF;
+            END$$
+        """))
+        await conn.execute(_sa_text("""
+            CREATE UNIQUE INDEX IF NOT EXISTS uq_live_paper_session_user_date_config
+            ON live_paper_sessions (user_id, trade_date, config_id)
+            WHERE config_id IS NOT NULL
+        """))
 
         # ── Warehouse unique constraints ──────────────────────────────────────
         # PostgreSQL does not support ALTER TABLE … ADD CONSTRAINT IF NOT EXISTS.
         # We check pg_constraint first so this block is safe to run repeatedly.
         # We also deduplicate existing rows before adding each constraint so
         # the operation succeeds even when data was loaded before constraints existed.
-        _sa_text = __import__("sqlalchemy").text
         for table, constraint, cols, dedup_key in [
             (
                 "spot_candles",
