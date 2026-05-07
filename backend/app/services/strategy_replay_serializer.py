@@ -111,6 +111,7 @@ def strategy_run_replay_payload(
             "gross_mtm":        float(row.gross_mtm)          if row.gross_mtm          is not None else None,
             "est_exit_charges": float(row.est_exit_charges)   if row.est_exit_charges   is not None else None,
             "net_mtm":          float(row.net_mtm)            if row.net_mtm            is not None else None,
+            "net_delta":        float(row.net_delta)          if row.net_delta          is not None else None,
             "trail_stop_level": float(row.trail_stop_level)   if row.trail_stop_level   is not None else None,
             "event_code":       row.event_code,
             "ce_mtm":           leg_bucket.get("CE"),
@@ -148,6 +149,7 @@ def strategy_run_replay_payload(
             "gross_mtm":        float(row.gross_mtm)  if row.gross_mtm  is not None else None,
             "est_exit_charges": float(row.est_exit_charges) if row.est_exit_charges is not None else None,
             "net_mtm":          float(row.net_mtm)    if row.net_mtm    is not None else None,
+            "net_delta":        float(row.net_delta)  if row.net_delta  is not None else None,
             **leg_cols,
         })
 
