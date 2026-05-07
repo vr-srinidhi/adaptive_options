@@ -248,6 +248,7 @@ SPOT_SYMBOLS: Dict[str, str] = {
     "NIFTY":     "NSE:NIFTY 50",
     "BANKNIFTY": "NSE:NIFTY BANK",
 }
+VIX_SYMBOL = "NSE:INDIA VIX"
 
 
 def fetch_live_quote(symbols: List[str], access_token: str) -> Dict[str, float]:

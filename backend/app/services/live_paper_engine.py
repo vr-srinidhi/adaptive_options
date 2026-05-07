@@ -45,7 +45,7 @@ from app.services.contract_spec_service import get_contract_spec, resolve_atm_st
 from app.services.delta_hedge import parse_delta_hedge_settings, signed_position_delta
 from app.services.token_store import get_broker_token
 from app.services.zerodha_client import (
-    SPOT_SYMBOLS, fetch_live_quote, find_option_symbol,
+    SPOT_SYMBOLS, VIX_SYMBOL, fetch_live_quote, find_option_symbol,
     get_instruments_with_token,
 )
 
@@ -744,6 +744,7 @@ async def _run_session(
         def _compute_net_delta(
             ts: datetime,
             spot: Optional[float],
+            vix: Optional[float],
             straddle_cur: List[Optional[float]],
             wing_cur: List[Optional[float]],
         ) -> Optional[float]:
@@ -776,7 +777,7 @@ async def _run_session(
                     quantity=qty,
                     timestamp=ts,
                     expiry_date=expiry_date,
-                    vix=None,
+                    vix=vix,
                     default_iv=delta_settings.default_iv,
                 )
                 if leg_delta is None:
@@ -817,6 +818,15 @@ async def _run_session(
             except Exception as exc:
                 log.warning("Live paper: spot fetch failed at %s: %s", t, exc)
                 spot = None
+            vix = None
+            if delta_settings.enabled:
+                try:
+                    vix_quotes = await asyncio.to_thread(
+                        fetch_live_quote, [VIX_SYMBOL], access_token
+                    )
+                    vix = vix_quotes.get(VIX_SYMBOL)
+                except Exception as exc:
+                    log.warning("Live paper: VIX fetch failed at %s: %s", t, exc)
 
             # ── Resolve instruments at 09:49 ──────────────────────────────────
             if t >= _RESOLVE_TIME and atm_strike is None and spot is not None:
@@ -1047,7 +1057,7 @@ async def _run_session(
             if net_mtm <= stop_threshold:
                 fired = "STOP_EXIT"
 
-            net_delta = _compute_net_delta(now, spot, straddle_cur, wing_cur)
+            net_delta = _compute_net_delta(now, spot, vix, straddle_cur, wing_cur)
             last_net_delta = net_delta
 
             # ── Delta hedge: opt-in, no-op when disabled ─────────────────────
@@ -1126,7 +1136,7 @@ async def _run_session(
                         delta_reentry_armed = False
                         delta_hedge_status = "hedged"
                         last_delta_hedge_ts = now
-                        net_delta = _compute_net_delta(now, spot, straddle_cur, wing_cur) or net_delta
+                        net_delta = _compute_net_delta(now, spot, vix, straddle_cur, wing_cur) or net_delta
                         last_net_delta = net_delta
 
                         async with AsyncSessionLocal() as db:
@@ -1260,7 +1270,7 @@ async def _run_session(
                 fired
             )
             if _due_for_db_write:
-                await _write_mtm(run_id, now, spot, None, gross_mtm, est_exit, net_mtm, net_delta,
+                await _write_mtm(run_id, now, spot, vix, gross_mtm, est_exit, net_mtm, net_delta,
                                  trail_stop_level, fired,
                                  active_leg_ids, active_cur_prices, active_entry_p, active_sides,
                                  active_stale, lot_size, approved_lots)

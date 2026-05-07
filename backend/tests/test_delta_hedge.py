@@ -39,6 +39,22 @@ def test_delta_hedge_accepts_nested_prd_shape():
     assert settings.reentry_buffer == 25
 
 
+def test_delta_hedge_accepts_flat_ui_shape():
+    settings = parse_delta_hedge_settings({
+        "delta_hedge_enabled": True,
+        "delta_threshold": 125,
+        "hedge_action": "BUY_WING",
+        "hedge_qty_mode": "PARTIAL",
+        "max_hedge_triggers": 4,
+        "reentry_buffer": 40,
+    })
+
+    assert settings.enabled is True
+    assert settings.delta_threshold == 125
+    assert settings.max_hedge_triggers == 4
+    assert settings.reentry_buffer == 40
+
+
 def test_implied_volatility_round_trips_from_black_scholes_price():
     now = datetime(2026, 5, 7, 10, 15)
     years = years_to_expiry(now, date(2026, 5, 14))

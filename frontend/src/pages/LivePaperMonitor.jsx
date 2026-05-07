@@ -35,6 +35,14 @@ function fmtDelta(v) {
   return `${sign}${Number(v).toFixed(0)}`
 }
 
+function deltaStatusColor(value, threshold) {
+  if (value == null || !threshold) return '#94a3b8'
+  const ratio = Math.abs(Number(value)) / Number(threshold)
+  if (ratio >= 1) return '#f87171'
+  if (ratio >= 0.7) return '#fb923c'
+  return '#4ade80'
+}
+
 function StatusBadge({ status }) {
   const map = {
     scheduled:      { color: '#94a3b8', label: 'Scheduled' },
@@ -666,7 +674,7 @@ function SlotDetail({ slot, liveSlotData, navigate }) {
           {[
             { label: 'Net MTM', value: fmtINR(session.net_mtm_latest), color: (session.net_mtm_latest ?? 0) >= 0 ? '#4ade80' : '#f87171' },
             { label: 'Spot',       value: session.spot_latest?.toFixed(0) || '—', color: 'var(--text-primary)' },
-            { label: 'Net Delta',  value: deltaEnabled ? `${fmtDelta(session.net_delta_latest)} · ${session.delta_hedge_status || 'monitoring'} x${session.delta_hedge_count ?? 0}` : 'Off', color: deltaEnabled ? '#facc15' : '#94a3b8' },
+            { label: 'Net Delta',  value: deltaEnabled ? `${fmtDelta(session.net_delta_latest)} · ${session.delta_hedge_status || 'monitoring'} x${session.delta_hedge_count ?? 0}` : 'Off', color: deltaEnabled ? deltaStatusColor(session.net_delta_latest, deltaThreshold) : '#94a3b8' },
             { label: 'ATM Strike', value: session.atm_strike || '—',              color: 'var(--text-primary)' },
             { label: 'Lock',       value: !session.lock_status || session.lock_status === 'none' ? 'Watching' : session.lock_status === 'profit_locked' ? 'Profit' : 'Loss', color: '#94a3b8' },
           ].map(({ label, value, color }) => (

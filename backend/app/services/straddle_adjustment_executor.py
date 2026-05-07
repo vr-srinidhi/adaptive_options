@@ -171,7 +171,7 @@ async def execute_run(
     straddle_leg_ids = [uuid.uuid4(), uuid.uuid4()]
     wing_leg_ids     = [uuid.uuid4(), uuid.uuid4()]
 
-    def _active_delta_legs(
+    def _compute_net_delta(
         ts: datetime,
         spot_close: Optional[float],
         vix_close: Optional[float],
@@ -320,7 +320,7 @@ async def execute_run(
 
         net_mtm = gross_mtm_total - entry_charges - wing_entry_charges - delta_hedge_charges - est_exit_charges
 
-        net_delta = _active_delta_legs(ts, spot_close, vix_close, straddle_cur, wing_cur)
+        net_delta = _compute_net_delta(ts, spot_close, vix_close, straddle_cur, wing_cur)
         last_net_delta = net_delta
 
         # ── Delta hedge: opt-in and isolated from existing lock rules ────────
@@ -411,7 +411,7 @@ async def execute_run(
                     delta_reentry_armed = False
                     delta_hedge_status = "hedged"
                     last_delta_hedge_ts = ts
-                    net_delta = _active_delta_legs(ts, spot_close, vix_close, straddle_cur, wing_cur) or net_delta
+                    net_delta = _compute_net_delta(ts, spot_close, vix_close, straddle_cur, wing_cur) or net_delta
                     last_net_delta = net_delta
                     event_rows.append({
                         "run_id": run_id, "timestamp": ts,
