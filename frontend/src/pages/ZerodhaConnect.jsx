@@ -117,6 +117,13 @@ export default function ZerodhaConnect() {
           </div>
         )}
 
+        {status === 'error' && !loginUrl && message && (
+          <div className="px-3 py-2 rounded text-xs"
+            style={{ background: 'rgba(239,68,68,0.1)', border: '1px solid rgba(239,68,68,0.3)', color: '#ef4444' }}>
+            {message}
+          </div>
+        )}
+
         {status === 'fetching' && (
           <div className="flex items-center gap-3 text-sm" style={{ color: 'var(--text-secondary)' }}>
             <span className="spinner" />
