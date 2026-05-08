@@ -185,15 +185,21 @@ async def _get_mtm_series(db: AsyncSession, run_id: uuid.UUID):
     )).scalars().all()
 
     leg_rows = (await db.execute(
-        select(StrategyRunLeg.option_type, StrategyLegMtm.timestamp, StrategyLegMtm.price)
+        select(StrategyRunLeg.option_type, StrategyRunLeg.side, StrategyRunLeg.leg_index,
+               StrategyLegMtm.timestamp, StrategyLegMtm.price)
         .join(StrategyLegMtm, StrategyLegMtm.leg_id == StrategyRunLeg.id)
-        .where(StrategyRunLeg.run_id == run_id, StrategyRunLeg.side == "SELL")
+        .where(StrategyRunLeg.run_id == run_id)
     )).all()
-    leg_lookup: dict = {}
-    for opt_type, ts, price in leg_rows:
+    sell_lookup: dict = {}   # ts → {CE: price, PE: price}  (straddle SELL legs)
+    wing_lookup: dict = {}   # ts → {CE: price, PE: price}  (wing BUY legs 2+3)
+    for opt_type, side, leg_idx, ts, price in leg_rows:
+        if price is None:
+            continue
         key = ts.isoformat()
-        if price is not None:
-            leg_lookup.setdefault(key, {})[opt_type] = float(price)
+        if side == "SELL":
+            sell_lookup.setdefault(key, {})[opt_type] = float(price)
+        elif side == "BUY" and leg_idx in (2, 3):
+            wing_lookup.setdefault(key, {})[opt_type] = float(price)
 
     return [
         {
@@ -204,8 +210,10 @@ async def _get_mtm_series(db: AsyncSession, run_id: uuid.UUID):
             "net_delta":        float(r.net_delta) if r.net_delta is not None else None,
             "trail_stop_level": float(r.trail_stop_level) if r.trail_stop_level is not None else None,
             "event_code":       r.event_code,
-            "ce_price":         leg_lookup.get(r.timestamp.isoformat(), {}).get("CE"),
-            "pe_price":         leg_lookup.get(r.timestamp.isoformat(), {}).get("PE"),
+            "ce_price":         sell_lookup.get(r.timestamp.isoformat(), {}).get("CE"),
+            "pe_price":         sell_lookup.get(r.timestamp.isoformat(), {}).get("PE"),
+            "wing_ce_price":    wing_lookup.get(r.timestamp.isoformat(), {}).get("CE"),
+            "wing_pe_price":    wing_lookup.get(r.timestamp.isoformat(), {}).get("PE"),
         }
         for r in rows
     ]
@@ -242,11 +250,13 @@ async def _build_slot(db: AsyncSession, cfg: LivePaperConfig, session: Optional[
         mtm_series = await _get_mtm_series(db, session.strategy_run_id)
         events     = await _get_events(db, session.strategy_run_id)
 
-        legs = (await db.execute(
+        all_legs = (await db.execute(
             select(StrategyRunLeg)
-            .where(StrategyRunLeg.run_id == session.strategy_run_id, StrategyRunLeg.side == "SELL")
+            .where(StrategyRunLeg.run_id == session.strategy_run_id)
+            .order_by(StrategyRunLeg.leg_index)
         )).scalars().all()
-        leg_entry = {l.option_type: float(l.entry_price) for l in legs if l.entry_price}
+        sell_legs = [l for l in all_legs if l.side == "SELL"]
+        leg_entry = {l.option_type: float(l.entry_price) for l in sell_legs if l.entry_price}
 
         if run:
             run_info = {
@@ -255,6 +265,16 @@ async def _build_slot(db: AsyncSession, cfg: LivePaperConfig, session: Optional[
                 "approved_lots":      run.approved_lots,
                 "ce_entry_price":     leg_entry.get("CE"),
                 "pe_entry_price":     leg_entry.get("PE"),
+                "legs": [
+                    {
+                        "leg_index":   l.leg_index,
+                        "side":        l.side,
+                        "option_type": l.option_type,
+                        "strike":      l.strike,
+                        "entry_price": float(l.entry_price) if l.entry_price else None,
+                    }
+                    for l in all_legs if l.entry_price is not None
+                ],
             }
 
     return {
