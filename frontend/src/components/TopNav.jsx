@@ -188,6 +188,9 @@ export default function TopNav() {
             borderBottom: '1px solid var(--border)',
             boxShadow: '0 8px 24px rgba(0,0,0,0.4)',
             zIndex: 30,
+            maxHeight: 'calc(100dvh - 48px)',
+            overflowY: 'auto',
+            WebkitOverflowScrolling: 'touch',
           }}
         >
           {PRIMARY_LINKS.map(link => {
