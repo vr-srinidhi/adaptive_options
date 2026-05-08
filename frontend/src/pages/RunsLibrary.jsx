@@ -291,10 +291,9 @@ export default function RunsLibrary() {
           </div>
         ) : (
           <section
-            className="rounded-[10px] overflow-hidden"
-            style={{ background: PALETTE.card, border: `1px solid ${PALETTE.border}` }}
+            className="rounded-[10px]"
+            style={{ background: PALETTE.card, border: `1px solid ${PALETTE.border}`, overflowX: 'auto', WebkitOverflowScrolling: 'touch' }}
           >
-            <div style={{ overflowX: 'auto', WebkitOverflowScrolling: 'touch' }}>
             <table style={{ width: '100%', minWidth: 640, borderCollapse: 'collapse', fontSize: 11 }}>
               <thead>
                 <tr style={{ background: '#334155' }}>
@@ -411,7 +410,6 @@ export default function RunsLibrary() {
                 })}
               </tbody>
             </table>
-            </div>{/* overflow-x wrapper */}
 
             <div
               style={{
