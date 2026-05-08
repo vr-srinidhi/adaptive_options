@@ -14,6 +14,8 @@ This file gives Claude Code full context about the project so it can assist effe
 4. **V2 Workbench** — strategy-agnostic shell (Strategy Catalog → Run Builder → Replay Analyzer → Runs Library) aligned to the product PRD. Two executors are live: `orb_v1` (ORB paper/historical) and `generic_v1` (single-session backtest). 10 further strategies are catalogued as `planned`/`research`.
 5. **Generic Strategy Engine** — declarative executor that powers any strategy defined in the catalog via `leg_template` + `entry_rule_id` + `exit_rule`. No new Python files needed to add a strategy. Short Straddle and Iron Butterfly are live on this engine.
 6. **Live Paper Trading** — self-driving intraday engine that runs the Short Straddle Dual Lock strategy against live Zerodha market data every market day. APScheduler fires at 09:14 IST; UI (`/workbench/live`) is a read-only SSE viewer. Completed sessions write to the same `strategy_runs` tables so ReplayAnalyzer works unchanged. Flip to live execution via `execution_mode: live` config flag (currently paper only).
+7. **4PM Live Data Sync** — daily scheduled job (APScheduler, 16:00 IST weekdays) that fills the historical warehouse with today's live Zerodha candle data (spot, VIX, futures, options). Fill-missing-only — skips rows that already exist. Persists an audit row in `live_data_sync_runs`. Accessible via `GET/POST /api/v2/live-paper/data-sync/today`. UI status panel in `LivePaperMonitor.jsx`.
+8. **Delta Hedge Trigger** — opt-in per-slot feature for the Short Straddle live paper and backtest engines. Computes Black-Scholes net position delta every refresh cycle; when `|net_delta| > delta_threshold` buys the tested-side OTM wing (BUY_WING). Controlled by `delta_hedge_enabled` flag — zero overhead when OFF. Phase 1 only: BUY_WING action. REDUCE_LOTS / FUTURES_HEDGE / FULL_EXIT are Phase 2.
 
 Scope: **backtesting and paper trading only** — no live order placement.
 
@@ -105,7 +107,8 @@ Adaptive_options/
 │       │   ├── historical.py    ← TradingDay, SpotCandle, VixCandle, FuturesCandle, OptionsCandle, SessionBatch
 │       │   ├── user.py          ← User model
 │       │   ├── broker_token.py  ← encrypted Zerodha token storage
-│       │   └── audit_log.py     ← security audit events
+│       │   ├── audit_log.py     ← security audit events
+│       │   └── live_data_sync.py ← LiveDataSyncRun ORM model
 │       ├── routers/
 │       │   ├── live_paper.py    ← /api/v2/live-paper/* endpoints + SSE stream
 │       │   ├── backtest.py      ← synthetic backtest endpoints
@@ -141,7 +144,11 @@ Adaptive_options/
 │           ├── token_store.py            ← broker token encrypt/decrypt
 │           ├── audit.py                  ← audit log helpers
 │           ├── live_paper_engine.py      ← self-driving intraday engine (SSE queues, _run_session loop)
-│           └── scheduler.py             ← APScheduler AsyncIOScheduler, CronTrigger 09:14 IST weekdays
+│           ├── straddle_adjustment_executor.py ← Short Straddle backtest executor with dual-lock + delta hedge
+│           ├── live_data_sync.py         ← 4PM warehouse sync orchestrator (create_started_live_data_sync_run, run_daily_live_data_sync)
+│           ├── live_ingestion.py         ← fill-missing-only Zerodha live candle ingestor
+│           ├── delta_hedge.py            ← Black-Scholes delta, IV inversion (Newton-Raphson), DeltaHedgeSettings, signed_position_delta
+│           └── scheduler.py             ← APScheduler AsyncIOScheduler; 09:14 IST live paper job + 16:00 IST data sync job
 └── frontend/
     ├── Dockerfile
     ├── nginx.conf               ← SPA fallback + /api proxy
@@ -351,6 +358,21 @@ SELL ATM CE + SELL ATM PE at `entry_time`. Profits from premium decay when spot 
 | Time exit | 15:25 |
 | Lot sizes | 75 (NIFTY post-Nov 2024), 50 (NIFTY pre-Nov 2024) |
 
+**Delta Hedge (opt-in, Phase 1 — BUY_WING only)**
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `delta_hedge_enabled` | `false` | Master switch — zero overhead when off |
+| `delta_threshold` | 150 | Absolute net position delta at which hedge fires |
+| `hedge_action` | `BUY_WING` | Buy OTM wing on tested side to cap directional loss |
+| `hedge_qty_mode` | `PARTIAL` | Full or partial imbalance hedge |
+| `max_hedge_triggers` | 3 | Max hedge fires per session |
+| `reentry_buffer` | 50 | Delta must normalize below `threshold − buffer` before next trigger |
+| `cooldown_minutes` | 5 | Minimum minutes between consecutive triggers |
+| `default_iv` | 0.12 | Fallback IV if BS inversion and VIX proxy both fail |
+
+Net delta formula: `(-1 × Delta_CE × CE_Qty) + (-1 × Delta_PE × PE_Qty)`. Negative = market rising (CE side tested). Delta computed via full Black-Scholes using IV from Newton-Raphson inversion → VIX proxy → `default_iv` fallback. State machine: `monitoring → hedged → monitoring` (re-armed when delta falls below `threshold − buffer`) → `exhausted` (after max triggers). Guard conditions: position active, 09:20–15:20, cooldown elapsed, trigger count below max. Event codes: `DELTA_HEDGE_TRIGGERED`, `DELTA_HEDGE_EXECUTED`, `DELTA_HEDGE_FAILED`, `DELTA_NEUTRAL_RESTORED`, `DELTA_HEDGE_EXHAUSTED`.
+
 ### Iron Butterfly — generic_v1 Strategy
 
 SELL ATM CE + SELL ATM PE + BUY OTM CE (ATM + N×step) + BUY OTM PE (ATM − N×step). Defined-risk neutral strategy — profits from premium decay within the wings.
@@ -493,7 +515,9 @@ All under `/api/v2/live-paper`. Requires Bearer token except SSE stream (token v
 | GET | `/v2/live-paper/history` | Past sessions, newest first (`limit`, `offset`) |
 | POST | `/v2/live-paper/start` | Manually trigger today's session (bypasses 09:14 scheduler) |
 | POST | `/v2/live-paper/stop` | Emergency stop — marks session as error, engine exits on next tick |
-| GET | `/v2/live-paper/today/stream` | SSE stream — `?token=<access_token>`; events: SNAPSHOT, WAITING, RESOLVED, ENTRY, LOCK, MTM, DONE, ERROR |
+| GET | `/v2/live-paper/today/stream` | SSE stream — `?token=<access_token>`; events: SNAPSHOT, WAITING, RESOLVED, ENTRY, LOCK, MTM, DELTA_HEDGE, DONE, ERROR |
+| GET | `/v2/live-paper/data-sync/today` | Latest 4PM warehouse sync status for today (read-only) |
+| POST | `/v2/live-paper/data-sync/today` | Manually trigger fill-missing-only warehouse sync; returns 409 if already in progress |
 
 ### Zerodha Auth
 
@@ -554,16 +578,17 @@ JSONB columns: `legs` (option leg objects), `min_data` (`{time, spot, pnl}` per 
 | `instrument_contract_specs` | Lot size + strike step history per instrument (date-range aware; seeded at startup) |
 | `strategy_runs` | One row per `single_session_backtest` or `live_paper_session` run — header, capital, P&L, status |
 | `strategy_run_legs` | One row per option leg — entry/exit prices, gross P&L |
-| `strategy_run_mtm` | One row per minute while trade is open — spot, VIX, gross/net MTM (`timezone=False` columns) |
+| `strategy_run_mtm` | One row per minute while trade is open — spot, VIX, gross/net MTM, `net_delta` (nullable NUMERIC, null when delta hedge disabled) (`timezone=False` columns) |
 | `strategy_leg_mtm` | One row per leg per minute — individual leg price + stale_minutes (`timezone=False` columns) |
 | `strategy_run_events` | ENTRY, EXIT, HOLD, NO_TRADE events with payload JSON (`timezone=False` columns) |
 
-### Live Paper Trading (2 tables)
+### Live Paper Trading (3 tables)
 
 | Table | Description |
 |-------|-------------|
-| `live_paper_configs` | One row per user — strategy_id, instrument, capital, entry_time, params_json (JSONB), enabled, execution_mode |
-| `live_paper_sessions` | One row per trading day — status flow: `scheduled→waiting→entered→exited/no_trade/error`; holds ATM, symbols, lots, lock_status, strategy_run_id FK |
+| `live_paper_configs` | One row per user — strategy_id, instrument, capital, entry_time, params_json (JSONB, includes delta hedge settings), enabled, execution_mode |
+| `live_paper_sessions` | One row per trading day — status flow: `scheduled→waiting→entered→exited/no_trade/error`; holds ATM, symbols, lots, lock_status, strategy_run_id FK; `net_delta_latest`, `delta_hedge_status` (`off\|monitoring\|hedged\|exhausted`), `delta_hedge_count` |
+| `live_data_sync_runs` | One row per 4PM warehouse sync run — `trade_date`, `triggered_by` (`scheduler\|manual`), `token_status`, `status` (STARTED/SUCCESS/PARTIAL_SUCCESS/FAILED/SKIPPED_*), row counts per series, `expiries_json`, `failed_items_json`, `error_message` |
 
 ---
 
@@ -662,7 +687,7 @@ The runtime `create_all` + idempotent `ALTER TABLE IF NOT EXISTS` in `init_db()`
 
 Self-driving intraday engine. Architecture decisions:
 
-**Scheduler** (`services/scheduler.py`): `AsyncIOScheduler` (APScheduler) with `CronTrigger` at 09:14 IST on weekdays. Registered in `startup()` via `init_scheduler()`; shut down in `shutdown()`. `misfire_grace_time=300` so a slow startup doesn't skip the day.
+**Scheduler** (`services/scheduler.py`): `AsyncIOScheduler` (APScheduler) with two weekday jobs: (1) `CronTrigger` at 09:14 IST — fires `start_live_session()`; `misfire_grace_time=300`. (2) `CronTrigger` at 16:00 IST — fires `_fire_daily_live_data_sync()` which routes through `create_started_live_data_sync_run()` (with `_sync_start_lock` guard) before calling `run_daily_live_data_sync()`; `misfire_grace_time=900`. Both registered in `startup()` via `init_scheduler()`; shut down in `shutdown()`.
 
 **Engine task** (`services/live_paper_engine.py`): Single `asyncio.create_task(_run_session(...))` per day. No UI dependency — if the browser is closed, the loop continues. The token and config are read once at session start (passed as parameters). Changing config mid-session has no effect until the next day.
 
@@ -706,6 +731,10 @@ Self-driving intraday engine. Architecture decisions:
 - `_RESOLVE_TIME = time(9, 49)` in `live_paper_engine.py` — instruments master is fetched once and ATM is resolved at this minute. Moving it earlier risks stale spot prices; later cuts into the entry window.
 - `check_and_resume_sessions()` token re-fetch — must always read the token **fresh from DB** (not from in-memory state) so a token stored between crash and restart is picked up.
 - `ts.replace(tzinfo=None)` in `_write_event` / `_write_mtm` — `strategy_run_events`, `strategy_run_mtm`, `strategy_leg_mtm` timestamps are `timezone=False`; inserting aware datetimes raises a `DataError` from asyncpg.
+- `_sync_start_lock` in `live_data_sync.py` — single-process asyncio lock; serialises concurrent API calls within one uvicorn worker. The scheduler job routes through `create_started_live_data_sync_run()` (not `run_daily_live_data_sync()` directly) so both paths share the same guard. Do not call `run_daily_live_data_sync()` directly without first calling `create_started_live_data_sync_run()`.
+- `RISK_FREE_RATE = 0.065` in `delta_hedge.py` — calibrated for NSE options; changing shifts all delta values.
+- Delta hedge `can_trigger` guard order in `live_paper_engine.py` and `straddle_adjustment_executor.py` — `STOP_EXIT` is evaluated before the delta hedge block; do not move delta hedge evaluation above the stop check.
+- `if not delta_settings.enabled: return None` guard in `_compute_net_delta` — ensures zero computation overhead when the feature is off; do not remove.
 
 ---
 

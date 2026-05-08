@@ -4,9 +4,11 @@ A production-quality options strategy platform for Nifty 50 and Bank Nifty with 
 
 1. **V2 Workbench** — strategy-agnostic shell for running, replaying, and comparing any supported strategy. Primary UI entry point.
 2. **Generic Strategy Engine** — declarative executor (`generic_v1`) that runs any strategy expressed as a `leg_template + entry_rule + exit_rule`. Powers the Short Straddle, Iron Butterfly, and all future catalog strategies with zero custom code per strategy.
-3. **Synthetic Backtest** — simulates Iron Condor, Bull Put Spread, and Bear Call Spread strategies using deterministic synthetic candle data with auto-regime detection (EMA/RSI/IV Rank).
-4. **Historical Backtest** — batch-runs any registered strategy over real Zerodha candle data stored in a local warehouse. Supports multi-day runs with full per-session audit trails.
-5. **Paper Trading ORB Replay** — replays any historical trading day using **live Zerodha market data**, evaluates an Opening Range Breakout strategy through a seven-gate decision engine, and produces full per-minute audit logs, trade detail, and raw candle exports.
+3. **Live Paper Trading** — self-driving intraday engine (APScheduler, 09:14 IST) running the Short Straddle Dual Lock strategy against live Zerodha data. Opt-in **Delta Hedge Trigger** adds Black-Scholes delta monitoring and automatic OTM wing buys when `|net_delta|` breaches a configurable threshold.
+4. **4PM Live Data Sync** — daily scheduled job (16:00 IST) that fills the historical warehouse with today's live Zerodha candles (spot, VIX, futures, options) using fill-missing-only logic. Manual trigger available from the UI.
+5. **Synthetic Backtest** — simulates Iron Condor, Bull Put Spread, and Bear Call Spread strategies using deterministic synthetic candle data with auto-regime detection (EMA/RSI/IV Rank).
+6. **Historical Backtest** — batch-runs any registered strategy over real Zerodha candle data stored in a local warehouse. Supports multi-day runs with full per-session audit trails.
+7. **Paper Trading ORB Replay** — replays any historical trading day using **live Zerodha market data**, evaluates an Opening Range Breakout strategy through a seven-gate decision engine, and produces full per-minute audit logs, trade detail, and raw candle exports.
 
 > **For educational and research purposes only. Not financial advice. No live order placement.**
 
@@ -186,6 +188,8 @@ Exit rules:
 - **Time exit**: 15:25
 
 When a TRAIL_EXIT fires, realized P&L is locked at the trail stop level (not the candle close, which may gap through the stop).
+
+**Delta Hedge (opt-in)**: Enable via `delta_hedge_enabled: true`. When enabled, Black-Scholes net position delta is computed every refresh cycle using IV from premium inversion (Newton-Raphson) → VIX proxy → fallback constant. When `|net_delta| > delta_threshold` (default 150), a BUY_WING order is simulated on the tested side. Re-arms after delta normalises below `threshold − reentry_buffer`. Up to `max_hedge_triggers` (default 3) per session with a 5-minute cooldown. Delta hedge gross P&L is included in net MTM and final P&L accounting.
 
 ### Iron Butterfly (generic_v1)
 
@@ -416,7 +420,12 @@ backend/
         ├── charges_service.py        # NSE F&O brokerage calculation (extracted from paper_engine)
         ├── entry_rule_registry.py    # Entry rule plugins (TimedEntryRule + registry)
         ├── generic_executor.py       # validate_run / execute_run for generic_v1 strategies
-        └── strategy_replay_serializer.py  # strategy_run_replay_payload + library item serializers
+        ├── strategy_replay_serializer.py  # strategy_run_replay_payload + library item serializers
+        ├── straddle_adjustment_executor.py # Short Straddle backtest executor (dual-lock + delta hedge)
+        ├── live_data_sync.py         # 4PM warehouse sync orchestrator + status helpers
+        ├── live_ingestion.py         # fill-missing-only Zerodha live candle ingestor
+        ├── delta_hedge.py            # BS delta, IV inversion, DeltaHedgeSettings, signed_position_delta
+        └── scheduler.py             # APScheduler: 09:14 live paper job + 16:00 data sync job
 ```
 
 ### Tech Stack — Backend
@@ -536,11 +545,19 @@ Schema auto-created at startup via `create_all` + Alembic migrations for schema 
 | Table | Description |
 |-------|-------------|
 | `instrument_contract_specs` | Lot size + strike step per instrument per date range (NSE lot size history) |
-| `strategy_runs` | One row per `single_session_backtest` run — instrument, trade_date, status, P&L, strategy config snapshot |
-| `strategy_run_legs` | Entry/exit price per leg in a strategy_run |
-| `strategy_run_mtm` | Per-minute net MTM while the trade is open |
-| `strategy_run_events` | Timestamped events: ENTRY, TARGET_EXIT, STOP_EXIT, TIME_EXIT, DATA_GAP_EXIT, NO_TRADE |
+| `strategy_runs` | One row per `single_session_backtest` or `live_paper_session` run — instrument, trade_date, status, P&L, strategy config snapshot |
+| `strategy_run_legs` | Entry/exit price per leg in a strategy_run (includes delta hedge BUY legs when triggered) |
+| `strategy_run_mtm` | Per-minute net MTM while trade is open; `net_delta` column (nullable, populated when delta hedge enabled) |
+| `strategy_run_events` | Timestamped events: ENTRY, EXIT variants, DELTA_HEDGE_* events, NO_TRADE |
 | `strategy_leg_mtm` | Per-leg per-minute price (for detailed leg breakdown charts) |
+
+### Live Paper Trading + Data Sync (3 tables)
+
+| Table | Description |
+|-------|-------------|
+| `live_paper_configs` | One row per user — params_json includes delta hedge settings |
+| `live_paper_sessions` | One row per trading day; `net_delta_latest`, `delta_hedge_status`, `delta_hedge_count` columns |
+| `live_data_sync_runs` | One row per 4PM sync run — token status, row counts per series, expiries, failed items, error |
 
 ---
 
@@ -580,6 +597,20 @@ Base URL: `http://localhost:8000/api`
 | GET | `/v2/runs/strategy_run/:id/replay/csv` | Full 9-section replay CSV (Trade Summary, Execution Summary, Contracts, MTM Series, CE Premium, PE Premium, NIFTY Spot OHLC, India VIX, Decision Log) |
 | POST | `/v2/runs/strategy_run/export-bundle` | Multi-run bundle: `{run_ids:[...]}`. ≤20 → single stacked CSV; >20 → ZIP. Raises 404 for any unknown ID. |
 | GET | `/v2/runs/compare` | Compare up to 4 runs by comma-separated `refs` |
+
+### Live Paper Trading
+
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/v2/live-paper/config` | Get (or auto-create) user config |
+| PUT | `/v2/live-paper/config` | Update config (capital, entry_time, params, delta hedge settings) |
+| GET | `/v2/live-paper/today` | Full snapshot: config + session + mtm_series + events + token_status |
+| GET | `/v2/live-paper/history` | Past sessions, newest first |
+| POST | `/v2/live-paper/start` | Manually trigger today's session |
+| POST | `/v2/live-paper/stop` | Emergency stop |
+| GET | `/v2/live-paper/today/stream` | SSE stream (`?token=`); events include `DELTA_HEDGE` |
+| GET | `/v2/live-paper/data-sync/today` | Latest 4PM warehouse sync status for today |
+| POST | `/v2/live-paper/data-sync/today` | Manually trigger fill-missing-only warehouse sync (409 if in progress) |
 
 ### Historical Backtest
 
@@ -717,6 +748,7 @@ cd backend && python -m pytest tests/ -v
 | `test_generic_executor.py` | `validate_run` (7 tests) + `execute_run` (6 tests) via async fake DB and service-layer patches |
 | `test_strategy_replay_serializer.py` | 19 tests: CE/PE MTM grouping, MFE/MAE/drawdown, VIX forward-fill + source tagging, spot OHLC completeness, data quality warnings, legs shape, payload regression |
 | `test_iron_butterfly_*.py` | 8 tests: catalog entry, 4-leg CE/PE MTM grouping, config-driven wing offsets, mixed BUY/SELL MTM signs, defined-risk margin sizing, mixed-leg charges (entry + exit + round-trip), 9-section CSV with 4 contracts |
+| `test_delta_hedge.py` | 5 tests: settings defaults, nested PRD schema parsing, IV round-trip via BS price, short straddle net delta direction on rally, long CE hedging negative delta |
 
 ### Frontend (Vitest)
 
