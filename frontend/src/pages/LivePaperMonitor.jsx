@@ -1064,12 +1064,12 @@ export default function LivePaperMonitor() {
   if (error)   return <div style={{ padding: 40, color: '#f87171', fontFamily: 'monospace' }}>Error: {error}</div>
 
   return (
-    <div style={{ padding: '28px 32px', maxWidth: 1280, margin: '0 auto' }}>
+    <div style={{ padding: 'clamp(14px, 3vw, 28px) clamp(12px, 3vw, 32px)', maxWidth: 1280, margin: '0 auto' }}>
 
       {/* Header */}
-      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 20 }}>
+      <div style={{ display: 'flex', flexWrap: 'wrap', justifyContent: 'space-between', alignItems: 'flex-start', gap: 8, marginBottom: 20 }}>
         <div>
-          <h1 style={{ fontSize: 24, fontWeight: 800, color: 'var(--text-primary)', margin: 0 }}>
+          <h1 style={{ fontSize: 'clamp(18px, 5vw, 24px)', fontWeight: 800, color: 'var(--text-primary)', margin: 0 }}>
             Live Paper Trading
           </h1>
           <p style={{ fontSize: 12, color: 'var(--text-secondary)', marginTop: 3 }}>

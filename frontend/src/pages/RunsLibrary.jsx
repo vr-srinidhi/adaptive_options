@@ -194,7 +194,7 @@ export default function RunsLibrary() {
   }
 
   return (
-    <div className="mx-auto max-w-[1360px]" style={{ padding: '18px 20px 0', fontSize: 12 }}>
+    <div className="mx-auto max-w-[1360px]" style={{ padding: 'clamp(12px, 3vw, 18px) clamp(12px, 3vw, 20px) 0', fontSize: 12 }}>
       <div className="space-y-4">
         {/* ── Header ── */}
         <div className="flex items-start justify-between gap-4">
@@ -294,7 +294,8 @@ export default function RunsLibrary() {
             className="rounded-[10px] overflow-hidden"
             style={{ background: PALETTE.card, border: `1px solid ${PALETTE.border}` }}
           >
-            <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 11 }}>
+            <div style={{ overflowX: 'auto', WebkitOverflowScrolling: 'touch' }}>
+            <table style={{ width: '100%', minWidth: 640, borderCollapse: 'collapse', fontSize: 11 }}>
               <thead>
                 <tr style={{ background: '#334155' }}>
                   {/* Select-all checkbox — only meaningful when strategy_run rows are visible */}
@@ -410,6 +411,7 @@ export default function RunsLibrary() {
                 })}
               </tbody>
             </table>
+            </div>{/* overflow-x wrapper */}
 
             <div
               style={{
