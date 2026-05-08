@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import logging
 import uuid
-from datetime import date as date_type, datetime, time
+from datetime import date as date_type, datetime, time, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -42,6 +42,10 @@ from app.services.contract_spec_service import (
     resolve_atm_strike,
     resolve_expiry,
     resolve_leg_strikes,
+)
+from app.services.delta_hedge import (
+    parse_delta_hedge_settings,
+    signed_position_delta,
 )
 from app.services.entry_rule_registry import get_entry_rule
 from app.services.generic_executor import (
@@ -91,6 +95,7 @@ async def execute_run(
     wing_steps        = int(config.get("wing_width_steps")      or exit_rule.get("wing_width_steps")   or 2)
     sq_time           = _parse_time(exit_rule.get("time_exit", "15:25"), default=time(15, 25))
     capital_amount    = float(config.get("capital", 0))
+    delta_settings    = parse_delta_hedge_settings(config)
 
     entry_rule = get_entry_rule(strategy.get("entry_rule_id", "timed_entry"))
 
@@ -139,6 +144,13 @@ async def execute_run(
     wing_stale:           List[int]             = [0, 0]
     wing_lock_ts:         Optional[datetime]    = None
     wing_entry_charges    = 0.0
+    delta_hedges:         List[Dict[str, Any]]  = []
+    delta_hedge_charges   = 0.0
+    delta_hedge_status    = "off" if not delta_settings.enabled else "monitoring"
+    delta_hedge_count     = 0
+    delta_reentry_armed   = True
+    last_delta_hedge_ts:  Optional[datetime] = None
+    last_net_delta:       Optional[float] = None
 
     entry_credit_per_unit = 0.0
     entry_credit_total    = 0.0
@@ -158,6 +170,50 @@ async def execute_run(
 
     straddle_leg_ids = [uuid.uuid4(), uuid.uuid4()]
     wing_leg_ids     = [uuid.uuid4(), uuid.uuid4()]
+
+    def _compute_net_delta(
+        ts: datetime,
+        spot_close: Optional[float],
+        vix_close: Optional[float],
+        straddle_cur: List[Optional[float]],
+        wing_cur: List[Optional[float]],
+    ) -> Optional[float]:
+        if not delta_settings.enabled:
+            return None
+
+        total = 0.0
+        qty = lot_size * approved_lots
+        legs_for_delta = [
+            ("SELL", "CE", atm_strike, straddle_cur[0]),
+            ("SELL", "PE", atm_strike, straddle_cur[1]),
+        ]
+        if wings_locked:
+            legs_for_delta.extend([
+                ("BUY", "CE", wing_ce_strike, wing_cur[0]),
+                ("BUY", "PE", wing_pe_strike, wing_cur[1]),
+            ])
+        legs_for_delta.extend(
+            (h["side"], h["option_type"], h["strike"], h["last_price"])
+            for h in delta_hedges
+        )
+
+        for side, opt_type, strike, price in legs_for_delta:
+            leg_delta = signed_position_delta(
+                side=side,
+                option_type=opt_type,
+                price=price,
+                spot=spot_close,
+                strike=strike,
+                quantity=qty,
+                timestamp=ts,
+                expiry_date=expiry,
+                vix=vix_close,
+                default_iv=delta_settings.default_iv,
+            )
+            if leg_delta is None:
+                return None
+            total += leg_delta
+        return round(total, 4)
 
     for candle in spot_candles:
         ts: datetime = candle["date"]
@@ -179,6 +235,13 @@ async def execute_run(
         if s_pe_price is not None: straddle_last_prices[1] = s_pe_price
         if w_ce_price is not None: wing_last_prices[0] = w_ce_price
         if w_pe_price is not None: wing_last_prices[1] = w_pe_price
+        for hedge in delta_hedges:
+            hedge_price = w_ce_price if hedge["option_type"] == "CE" else w_pe_price
+            if hedge_price is not None:
+                hedge["last_price"] = hedge_price
+                hedge["stale"] = 0
+            else:
+                hedge["stale"] += 1
 
         straddle_cur = [s_ce_price, s_pe_price]
 
@@ -227,26 +290,160 @@ async def execute_run(
         ) * lot_size * approved_lots
 
         wing_gross = 0.0
+        wing_cur = [w_ce_price, w_pe_price]
         if wings_locked:
-            wing_cur = [w_ce_price, w_pe_price]
             wing_gross = sum(
                 (cp - ep)   # BUY leg: profit = current - entry
                 for ep, cp in zip(wing_entry_prices, wing_cur)
                 if ep is not None and cp is not None
             ) * lot_size * approved_lots
 
-        gross_mtm_total = straddle_gross + wing_gross
+        delta_hedge_gross = sum(
+            ((h["last_price"] - h["entry_price"]) * lot_size * approved_lots)
+            for h in delta_hedges
+            if h.get("entry_price") is not None and h.get("last_price") is not None
+        )
+
+        gross_mtm_total = straddle_gross + wing_gross + delta_hedge_gross
 
         # Estimate exit charges for currently active legs
+        delta_hedge_legs = [(h["side"], h["option_type"], h["strike"]) for h in delta_hedges]
+        delta_hedge_prices = [h.get("last_price") for h in delta_hedges]
         if wings_locked:
-            active_legs   = straddle_legs + wing_legs
-            active_prices = [w_ce_price, w_pe_price] if wings_locked else []
-            all_cur_prices = list(straddle_cur) + [w_ce_price, w_pe_price]
+            active_legs   = straddle_legs + wing_legs + delta_hedge_legs
+            all_cur_prices = list(straddle_cur) + [w_ce_price, w_pe_price] + delta_hedge_prices
             est_exit_charges = compute_leg_exit_charges_estimate(approved_lots, lot_size, active_legs, all_cur_prices)
         else:
-            est_exit_charges = compute_leg_exit_charges_estimate(approved_lots, lot_size, straddle_legs, straddle_cur)
+            active_legs = straddle_legs + delta_hedge_legs
+            all_cur_prices = list(straddle_cur) + delta_hedge_prices
+            est_exit_charges = compute_leg_exit_charges_estimate(approved_lots, lot_size, active_legs, all_cur_prices)
 
-        net_mtm = gross_mtm_total - entry_charges - wing_entry_charges - est_exit_charges
+        net_mtm = gross_mtm_total - entry_charges - wing_entry_charges - delta_hedge_charges - est_exit_charges
+
+        net_delta = _compute_net_delta(ts, spot_close, vix_close, straddle_cur, wing_cur)
+        last_net_delta = net_delta
+
+        # ── Delta hedge: opt-in and isolated from existing lock rules ────────
+        if delta_settings.enabled and net_delta is not None:
+            threshold = delta_settings.delta_threshold
+            safe_level = max(0.0, threshold - delta_settings.reentry_buffer)
+            abs_delta = abs(net_delta)
+
+            if not delta_reentry_armed and abs_delta <= safe_level:
+                delta_reentry_armed = True
+                delta_hedge_status = "monitoring"
+                event_rows.append({
+                    "run_id": run_id, "timestamp": ts,
+                    "event_type": "DELTA_HEDGE", "reason_code": "DELTA_NEUTRAL_RESTORED",
+                    "reason_text": f"Net delta normalized to {net_delta:.2f}",
+                    "payload_json": {"net_delta": net_delta, "threshold": threshold, "safe_level": safe_level},
+                })
+
+            if delta_hedge_count >= delta_settings.max_hedge_triggers and delta_hedge_status != "exhausted":
+                delta_hedge_status = "exhausted"
+                event_rows.append({
+                    "run_id": run_id, "timestamp": ts,
+                    "event_type": "DELTA_HEDGE", "reason_code": "DELTA_HEDGE_EXHAUSTED",
+                    "reason_text": "Delta hedge max trigger count reached; existing loss controls remain active.",
+                    "payload_json": {"net_delta": net_delta, "max_triggers": delta_settings.max_hedge_triggers},
+                })
+
+            in_delta_window = time(9, 20) <= t <= time(15, 20)
+            cooldown_ok = (
+                last_delta_hedge_ts is None
+                or ts - last_delta_hedge_ts >= timedelta(minutes=delta_settings.cooldown_minutes)
+            )
+            can_trigger = (
+                delta_hedge_status != "exhausted"
+                and delta_reentry_armed
+                and in_delta_window
+                and cooldown_ok
+                and delta_hedge_count < delta_settings.max_hedge_triggers
+                and abs_delta > threshold
+                and delta_settings.hedge_action == "BUY_WING"
+            )
+            if can_trigger:
+                tested_type = "CE" if net_delta < 0 else "PE"
+                hedge_strike = wing_ce_strike if tested_type == "CE" else wing_pe_strike
+                hedge_price = w_ce_price if tested_type == "CE" else w_pe_price
+                event_rows.append({
+                    "run_id": run_id, "timestamp": ts,
+                    "event_type": "DELTA_HEDGE", "reason_code": "DELTA_HEDGE_TRIGGERED",
+                    "reason_text": f"Net delta {net_delta:.2f} breached {threshold:.2f}; testing {tested_type} wing.",
+                    "payload_json": {
+                        "net_delta": net_delta,
+                        "threshold": threshold,
+                        "hedge_action": delta_settings.hedge_action,
+                        "tested_side": tested_type,
+                    },
+                })
+                if hedge_price is None:
+                    event_rows.append({
+                        "run_id": run_id, "timestamp": ts,
+                        "event_type": "DELTA_HEDGE", "reason_code": "DELTA_HEDGE_FAILED",
+                        "reason_text": f"Delta hedge skipped; {tested_type} wing price unavailable.",
+                        "payload_json": {"net_delta": net_delta, "strike": hedge_strike, "option_type": tested_type},
+                    })
+                    warnings.append(
+                        f"Delta hedge trigger reached at {ts.strftime('%H:%M')} but {tested_type} wing price unavailable — skipping hedge"
+                    )
+                else:
+                    hedge = {
+                        "id": uuid.uuid4(),
+                        "side": "BUY",
+                        "option_type": tested_type,
+                        "strike": hedge_strike,
+                        "entry_price": hedge_price,
+                        "last_price": hedge_price,
+                        "entry_ts": ts,
+                        "stale": 0,
+                    }
+                    delta_hedges.append(hedge)
+                    entry_charge = compute_leg_entry_charges(
+                        approved_lots,
+                        lot_size,
+                        [("BUY", tested_type, hedge_strike)],
+                        [hedge_price],
+                    )
+                    delta_hedge_charges += entry_charge
+                    net_mtm -= entry_charge
+                    delta_hedge_count += 1
+                    delta_reentry_armed = False
+                    delta_hedge_status = "hedged"
+                    last_delta_hedge_ts = ts
+                    net_delta = _compute_net_delta(ts, spot_close, vix_close, straddle_cur, wing_cur) or net_delta
+                    last_net_delta = net_delta
+                    event_rows.append({
+                        "run_id": run_id, "timestamp": ts,
+                        "event_type": "DELTA_HEDGE", "reason_code": "DELTA_HEDGE_EXECUTED",
+                        "reason_text": (
+                            f"Bought {tested_type} delta hedge wing {hedge_strike} @ {hedge_price} "
+                            f"(trigger {delta_hedge_count}/{delta_settings.max_hedge_triggers})"
+                        ),
+                        "payload_json": {
+                            "net_delta": net_delta,
+                            "strike": hedge_strike,
+                            "option_type": tested_type,
+                            "price": hedge_price,
+                            "lots": approved_lots,
+                            "quantity": lot_size * approved_lots,
+                            "entry_charges": entry_charge,
+                        },
+                    })
+
+        # Refresh active-leg charges after any delta hedge inserted at this minute.
+        delta_hedge_gross = sum(
+            ((h["last_price"] - h["entry_price"]) * lot_size * approved_lots)
+            for h in delta_hedges
+            if h.get("entry_price") is not None and h.get("last_price") is not None
+        )
+        gross_mtm_total = straddle_gross + wing_gross + delta_hedge_gross
+        delta_hedge_legs = [(h["side"], h["option_type"], h["strike"]) for h in delta_hedges]
+        delta_hedge_prices = [h.get("last_price") for h in delta_hedges]
+        active_legs = straddle_legs + (wing_legs if wings_locked else []) + delta_hedge_legs
+        all_cur_prices = list(straddle_cur) + (list(wing_cur) if wings_locked else []) + delta_hedge_prices
+        est_exit_charges = compute_leg_exit_charges_estimate(approved_lots, lot_size, active_legs, all_cur_prices)
+        net_mtm = gross_mtm_total - entry_charges - wing_entry_charges - delta_hedge_charges - est_exit_charges
 
         # ── Lock check: profit lock (up) or loss lock (down) ─────────────────
         if not wings_locked:
@@ -309,6 +506,7 @@ async def execute_run(
             "gross_mtm": round(gross_mtm_total, 2),
             "est_exit_charges": round(est_exit_charges, 2),
             "net_mtm": round(net_mtm, 2),
+            "net_delta": round(net_delta, 4) if net_delta is not None else None,
             "trail_stop_level": trail_stop_level,
             "event_code": fired_event,
         })
@@ -334,6 +532,15 @@ async def execute_run(
                     "gross_leg_pnl": round((cp - ep) * lot_size * approved_lots, 2) if ep and cp else None,
                     "stale_minutes": wing_stale[i],
                 })
+        for hedge in delta_hedges:
+            cp = hedge.get("last_price")
+            ep = hedge.get("entry_price")
+            leg_mtm_rows.append({
+                "run_id": run_id, "leg_id": hedge["id"], "timestamp": ts,
+                "price": cp,
+                "gross_leg_pnl": round((cp - ep) * lot_size * approved_lots, 2) if ep and cp else None,
+                "stale_minutes": hedge.get("stale", 0),
+            })
 
         if fired_event:
             exit_reason = fired_event
@@ -368,17 +575,26 @@ async def execute_run(
                 for ep, xp in zip(wing_entry_prices, exit_w_prices)
                 if ep and xp
             )
+        delta_hedge_gross_pnl = sum(
+            (h["last_price"] - h["entry_price"]) * lot_size * approved_lots
+            for h in delta_hedges
+            if h.get("entry_price") and h.get("last_price")
+        )
 
-        gross_pnl = straddle_gross_pnl + wing_gross_pnl
+        gross_pnl = straddle_gross_pnl + wing_gross_pnl + delta_hedge_gross_pnl
+
+        delta_hedge_legs = [(h["side"], h["option_type"], h["strike"]) for h in delta_hedges]
+        delta_entry_prices = [h.get("entry_price") for h in delta_hedges]
+        delta_exit_prices = [h.get("last_price") for h in delta_hedges]
 
         if wings_locked:
-            all_exit_legs   = straddle_legs + wing_legs
-            all_entry_prices = straddle_entry_prices + wing_entry_prices
-            all_exit_prices  = list(straddle_last_prices) + list(wing_last_prices)
+            all_exit_legs   = straddle_legs + wing_legs + delta_hedge_legs
+            all_entry_prices = straddle_entry_prices + wing_entry_prices + delta_entry_prices
+            all_exit_prices  = list(straddle_last_prices) + list(wing_last_prices) + delta_exit_prices
         else:
-            all_exit_legs    = straddle_legs
-            all_entry_prices = straddle_entry_prices
-            all_exit_prices  = list(straddle_last_prices)
+            all_exit_legs    = straddle_legs + delta_hedge_legs
+            all_entry_prices = straddle_entry_prices + delta_entry_prices
+            all_exit_prices  = list(straddle_last_prices) + delta_exit_prices
 
         total_charges = compute_leg_total_charges(
             approved_lots, lot_size, all_exit_legs, all_entry_prices, all_exit_prices
@@ -429,6 +645,10 @@ async def execute_run(
             "wings_locked": wings_locked,
             "lock_reason": lock_reason,
             "wing_lock_ts": wing_lock_ts.isoformat() if wing_lock_ts else None,
+            "delta_hedge_enabled": delta_settings.enabled,
+            "delta_hedge_status": delta_hedge_status,
+            "delta_hedge_count": delta_hedge_count,
+            "last_net_delta": last_net_delta,
         },
     ))
 
@@ -460,6 +680,20 @@ async def execute_run(
                     entry_price=ep, exit_price=xp, gross_leg_pnl=leg_gross,
                     entry_timestamp=wing_ts,
                 ))
+        delta_start_index = 4 if wings_locked else 2
+        for i, hedge in enumerate(delta_hedges):
+            ep = hedge.get("entry_price")
+            xp = hedge.get("last_price")
+            leg_gross = round((xp - ep) * lot_size * approved_lots, 2) if ep and xp else None
+            entry_ts = hedge["entry_ts"].replace(tzinfo=None) if hedge.get("entry_ts") else None
+            db.add(StrategyRunLeg(
+                id=hedge["id"], run_id=run_id, leg_index=delta_start_index + i,
+                side=hedge["side"], option_type=hedge["option_type"], strike=hedge["strike"],
+                expiry_date=expiry,
+                quantity=lot_size * approved_lots,
+                entry_price=ep, exit_price=xp, gross_leg_pnl=leg_gross,
+                entry_timestamp=entry_ts,
+            ))
 
     for row in mtm_rows:
         db.add(StrategyRunMtm(**row))

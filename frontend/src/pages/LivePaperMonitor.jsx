@@ -29,6 +29,20 @@ function fmtTime(iso) {
   return d.toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit', hour12: false })
 }
 
+function fmtDelta(v) {
+  if (v == null) return '—'
+  const sign = v > 0 ? '+' : ''
+  return `${sign}${Number(v).toFixed(0)}`
+}
+
+function deltaStatusColor(value, threshold) {
+  if (value == null || !threshold) return '#94a3b8'
+  const ratio = Math.abs(Number(value)) / Number(threshold)
+  if (ratio >= 1) return '#f87171'
+  if (ratio >= 0.7) return '#fb923c'
+  return '#4ade80'
+}
+
 function StatusBadge({ status }) {
   const map = {
     scheduled:      { color: '#94a3b8', label: 'Scheduled' },
@@ -76,17 +90,20 @@ function LegendPill({ label, color, active, onClick }) {
 
 // ── MTM Chart ────────────────────────────────────────────────────────────────
 
-function MtmChart({ data, entryTs, exitTs }) {
-  const [vis, setVis] = useState({ net: true, spot: false })
+function MtmChart({ data, entryTs, exitTs, deltaThreshold, deltaMarkers = [] }) {
+  const [vis, setVis] = useState({ net: true, spot: false, delta: false })
   const toggle = k => setVis(v => ({ ...v, [k]: !v[k] }))
 
-  const visibleData = data.filter(d => d.net_mtm != null || d.spot != null)
+  const visibleData = data.filter(d => d.net_mtm != null || d.spot != null || d.net_delta != null)
   const netVals  = vis.net  ? visibleData.map(d => d.net_mtm).filter(v => v != null) : []
   const spotVals = vis.spot ? visibleData.map(d => d.spot).filter(v => v != null)    : []
+  const deltaVals = vis.delta ? visibleData.map(d => d.net_delta).filter(v => v != null) : []
   const yMin = netVals.length  ? Math.min(...netVals) * 1.05  : -10000
   const yMax = netVals.length  ? Math.max(...netVals) * 1.05  : 10000
   const spotMin = spotVals.length ? Math.min(...spotVals) * 0.999 : undefined
   const spotMax = spotVals.length ? Math.max(...spotVals) * 1.001 : undefined
+  const deltaAbs = Math.max(deltaThreshold || 0, ...deltaVals.map(v => Math.abs(v)), 100)
+  const deltaDomain = [-deltaAbs * 1.15, deltaAbs * 1.15]
 
   function CustomTooltip({ active, payload }) {
     if (!active || !payload?.length) return null
@@ -101,6 +118,7 @@ function MtmChart({ data, entryTs, exitTs }) {
           MTM: {fmtINR(d?.net_mtm)}
         </div>}
         {vis.spot && <div style={{ color: '#94a3b8' }}>Spot: {d?.spot?.toFixed(0)}</div>}
+        {vis.delta && <div style={{ color: '#facc15' }}>Delta: {fmtDelta(d?.net_delta)}</div>}
         {d?.trail_stop_level != null && (
           <div style={{ color: '#a78bfa' }}>Trail stop: {fmtINR(d.trail_stop_level)}</div>
         )}
@@ -114,6 +132,7 @@ function MtmChart({ data, entryTs, exitTs }) {
         <LegendPill label="Net MTM"    color="#4ade80" active={vis.net}  onClick={() => toggle('net')} />
         <LegendPill label="Trail Stop" color="#a78bfa" active={vis.net}  onClick={() => toggle('net')} />
         <LegendPill label="Spot"       color="#94a3b8" active={vis.spot} onClick={() => toggle('spot')} />
+        <LegendPill label="Net Delta"  color="#facc15" active={vis.delta} onClick={() => toggle('delta')} />
       </div>
       <ResponsiveContainer width="100%" height={240}>
         <LineChart data={visibleData} margin={{ top: 4, right: 8, left: 0, bottom: 0 }}>
@@ -124,13 +143,23 @@ function MtmChart({ data, entryTs, exitTs }) {
             <YAxis yAxisId="spot" orientation="right" domain={[spotMin, spotMax]}
               tickFormatter={v => v?.toFixed(0)} tick={{ fontSize: 10, fill: '#64748b' }} width={50} />
           )}
+          {vis.delta && (
+            <YAxis yAxisId="delta" orientation="right" domain={deltaDomain}
+              tickFormatter={v => v?.toFixed(0)} tick={{ fontSize: 10, fill: '#ca8a04' }} width={50} />
+          )}
           <Tooltip content={<CustomTooltip />} />
           <ReferenceLine y={0} stroke="var(--border)" />
+          {vis.delta && deltaThreshold > 0 && <ReferenceLine yAxisId="delta" y={deltaThreshold} stroke="#facc15" strokeDasharray="4 2" />}
+          {vis.delta && deltaThreshold > 0 && <ReferenceLine yAxisId="delta" y={-deltaThreshold} stroke="#facc15" strokeDasharray="4 2" />}
           {entryTs && <ReferenceLine x={entryTs} stroke="#4ade80" strokeDasharray="4 2" label={{ value: 'IN', fill: '#4ade80', fontSize: 10 }} />}
           {exitTs  && <ReferenceLine x={exitTs}  stroke="#f87171" strokeDasharray="4 2" label={{ value: 'OUT', fill: '#f87171', fontSize: 10 }} />}
+          {deltaMarkers.map(ts => (
+            <ReferenceLine key={ts} x={ts} stroke="#facc15" strokeDasharray="3 3" label={{ value: 'DH', fill: '#facc15', fontSize: 10 }} />
+          ))}
           {vis.net && <Line type="monotone" dataKey="net_mtm" stroke="#4ade80" strokeWidth={1.5} dot={false} activeDot={{ r: 3 }} connectNulls={false} />}
           {vis.net && <Line type="monotone" dataKey="trail_stop_level" stroke="#a78bfa" strokeWidth={1} strokeDasharray="4 2" dot={false} connectNulls={false} />}
           {vis.spot && <Line yAxisId="spot" type="monotone" dataKey="spot" stroke="#94a3b8" strokeWidth={1} dot={false} activeDot={{ r: 2 }} />}
+          {vis.delta && <Line yAxisId="delta" type="monotone" dataKey="net_delta" stroke="#facc15" strokeWidth={1.2} dot={false} activeDot={{ r: 2 }} connectNulls={false} />}
         </LineChart>
       </ResponsiveContainer>
     </div>
@@ -157,21 +186,30 @@ function ConfigPanel({ config, onSave }) {
       stop_capital_pct:      config.params?.stop_capital_pct      ?? 0.015,
       poll_interval_seconds: config.params?.poll_interval_seconds ?? 60,
       expiry_offset:         config.params?.expiry_offset         ?? 0,
+      delta_hedge_enabled:   config.params?.delta_hedge_enabled   ?? false,
+      delta_threshold:       config.params?.delta_threshold       ?? 150,
+      hedge_action:          config.params?.hedge_action          ?? 'BUY_WING',
+      hedge_qty_mode:        config.params?.hedge_qty_mode        ?? 'PARTIAL',
+      max_hedge_triggers:    config.params?.max_hedge_triggers    ?? 3,
+      reentry_buffer:        config.params?.reentry_buffer        ?? 50,
+      default_iv:            config.params?.default_iv            ?? 0.12,
     })
   }, [config?.id])
 
   if (!form) return null
 
-  const field = (label, key, type = 'number', step) => (
+  const field = (label, key, type = 'number', step, disabled = false) => (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 3 }}>
       <label style={{ fontSize: 11, color: 'var(--text-secondary)' }}>{label}</label>
       <input
         type={type} step={step}
         value={form[key]}
+        disabled={disabled}
         onChange={e => setForm(f => ({ ...f, [key]: type === 'number' ? Number(e.target.value) : e.target.value }))}
         style={{
           background: 'var(--surface)', border: '1px solid var(--border)',
           borderRadius: 6, padding: '5px 8px', color: 'var(--text-primary)', fontSize: 12, width: '100%',
+          opacity: disabled ? 0.55 : 1,
         }}
       />
     </div>
@@ -194,6 +232,13 @@ function ConfigPanel({ config, onSave }) {
           stop_capital_pct:      form.stop_capital_pct,
           poll_interval_seconds: form.poll_interval_seconds,
           expiry_offset:         form.expiry_offset,
+          delta_hedge_enabled:   form.delta_hedge_enabled,
+          delta_threshold:       form.delta_threshold,
+          hedge_action:          form.hedge_action,
+          hedge_qty_mode:        form.hedge_qty_mode,
+          max_hedge_triggers:    form.max_hedge_triggers,
+          reentry_buffer:        form.reentry_buffer,
+          default_iv:            form.default_iv,
           time_exit:             '15:25',
           trail_pct:             0.50,
         },
@@ -218,6 +263,59 @@ function ConfigPanel({ config, onSave }) {
         {field('Loss Lock (₹)', 'loss_lock_trigger')}
         {field('Wing Width Steps', 'wing_width_steps')}
         {field('Trail Trigger (₹)', 'trail_trigger')}
+      </div>
+
+      <div style={{
+        border: '1px solid var(--border)', borderRadius: 8, padding: 10,
+        background: 'var(--surface)', display: 'flex', flexDirection: 'column', gap: 10,
+      }}>
+        <label style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 12, color: 'var(--text-primary)', cursor: 'pointer' }}>
+          <input
+            type="checkbox"
+            checked={form.delta_hedge_enabled}
+            onChange={e => setForm(f => ({ ...f, delta_hedge_enabled: e.target.checked }))}
+          />
+          Enable Delta Hedge
+        </label>
+        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10 }}>
+          {field('Delta Threshold', 'delta_threshold', 'number', undefined, !form.delta_hedge_enabled)}
+          {field('Max Hedge Triggers', 'max_hedge_triggers', 'number', undefined, !form.delta_hedge_enabled)}
+          {field('Re-entry Buffer', 'reentry_buffer', 'number', undefined, !form.delta_hedge_enabled)}
+          {field('Fallback IV', 'default_iv', 'number', '0.01', !form.delta_hedge_enabled)}
+        </div>
+        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10 }}>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 3 }}>
+            <label style={{ fontSize: 11, color: 'var(--text-secondary)' }}>Hedge Action</label>
+            <select
+              value={form.hedge_action}
+              disabled={!form.delta_hedge_enabled}
+              onChange={e => setForm(f => ({ ...f, hedge_action: e.target.value }))}
+              style={{
+                background: 'var(--surface-2)', border: '1px solid var(--border)',
+                borderRadius: 6, padding: '5px 8px', color: 'var(--text-primary)', fontSize: 12,
+                opacity: form.delta_hedge_enabled ? 1 : 0.55,
+              }}
+            >
+              <option value="BUY_WING">BUY_WING</option>
+            </select>
+          </div>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 3 }}>
+            <label style={{ fontSize: 11, color: 'var(--text-secondary)' }}>Hedge Qty Mode</label>
+            <select
+              value={form.hedge_qty_mode}
+              disabled={!form.delta_hedge_enabled}
+              onChange={e => setForm(f => ({ ...f, hedge_qty_mode: e.target.value }))}
+              style={{
+                background: 'var(--surface-2)', border: '1px solid var(--border)',
+                borderRadius: 6, padding: '5px 8px', color: 'var(--text-primary)', fontSize: 12,
+                opacity: form.delta_hedge_enabled ? 1 : 0.55,
+              }}
+            >
+              <option value="PARTIAL">PARTIAL</option>
+              <option value="FULL">FULL</option>
+            </select>
+          </div>
+        </div>
       </div>
 
       <div style={{ display: 'flex', flexDirection: 'column', gap: 3 }}>
@@ -278,6 +376,7 @@ function EventLog({ events }) {
   const colorMap = {
     ENTRY: '#4ade80', STOP_EXIT: '#f87171', TRAIL_EXIT: '#a78bfa',
     TIME_EXIT: '#94a3b8', HOLD: '#64748b', NO_TRADE: '#64748b', WINGS_LOCKED: '#fb923c',
+    DELTA_HEDGE: '#facc15',
   }
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 4, maxHeight: 200, overflowY: 'auto' }}>
@@ -287,7 +386,7 @@ function EventLog({ events }) {
           borderBottom: '0.5px solid var(--border)', paddingBottom: 4,
         }}>
           <span style={{ color: 'var(--text-secondary)', flexShrink: 0 }}>{fmtTime(ev.timestamp)}</span>
-          <span style={{ color: colorMap[ev.event_type] || '#94a3b8', fontWeight: 600, flexShrink: 0, minWidth: 60 }}>
+          <span style={{ color: colorMap[ev.event_type] || '#94a3b8', fontWeight: 600, flexShrink: 0, minWidth: 88 }}>
             {ev.event_type}
           </span>
           <span style={{ color: 'var(--text-secondary)' }}>
@@ -556,6 +655,11 @@ function SlotDetail({ slot, liveSlotData, navigate }) {
 
   const entryEvent = events.find(e => e.event_type === 'ENTRY')
   const exitEvent  = events.find(e => ['STOP_EXIT', 'TRAIL_EXIT', 'TIME_EXIT', 'DATA_GAP_EXIT'].includes(e.event_type))
+  const deltaMarkers = events
+    .filter(e => e.reason_code === 'DELTA_HEDGE_EXECUTED')
+    .map(e => e.timestamp)
+  const deltaEnabled = Boolean(config?.params?.delta_hedge_enabled)
+  const deltaThreshold = Number(config?.params?.delta_threshold ?? 150)
 
   const chartData = [
     ...(session?.waiting_spot_json || []).map(r => ({ timestamp: r.timestamp, spot: r.spot })),
@@ -566,12 +670,13 @@ function SlotDetail({ slot, liveSlotData, navigate }) {
     <div>
       {/* Live stats row */}
       {session && (
-        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 12, marginBottom: 20 }}>
+        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(110px, 1fr))', gap: 12, marginBottom: 20 }}>
           {[
             { label: 'Net MTM', value: fmtINR(session.net_mtm_latest), color: (session.net_mtm_latest ?? 0) >= 0 ? '#4ade80' : '#f87171' },
             { label: 'Spot',       value: session.spot_latest?.toFixed(0) || '—', color: 'var(--text-primary)' },
+            { label: 'Net Delta',  value: deltaEnabled ? `${fmtDelta(session.net_delta_latest)} · ${session.delta_hedge_status || 'monitoring'} x${session.delta_hedge_count ?? 0}` : 'Off', color: deltaEnabled ? deltaStatusColor(session.net_delta_latest, deltaThreshold) : '#94a3b8' },
             { label: 'ATM Strike', value: session.atm_strike || '—',              color: 'var(--text-primary)' },
-            { label: 'Lock',       value: !session.lock_status || session.lock_status === 'none' ? '🟢 Watching' : session.lock_status === 'profit_locked' ? '🔒 Profit' : '🛡️ Loss', color: '#94a3b8' },
+            { label: 'Lock',       value: !session.lock_status || session.lock_status === 'none' ? 'Watching' : session.lock_status === 'profit_locked' ? 'Profit' : 'Loss', color: '#94a3b8' },
           ].map(({ label, value, color }) => (
             <div key={label}>
               <div style={{ fontSize: 10, color: 'var(--text-secondary)', marginBottom: 2 }}>{label}</div>
@@ -618,7 +723,13 @@ function SlotDetail({ slot, liveSlotData, navigate }) {
 
       {/* MTM chart */}
       {chartData.length > 0 ? (
-        <MtmChart data={chartData} entryTs={entryEvent?.timestamp} exitTs={exitEvent?.timestamp} />
+        <MtmChart
+          data={chartData}
+          entryTs={entryEvent?.timestamp}
+          exitTs={exitEvent?.timestamp}
+          deltaThreshold={deltaThreshold}
+          deltaMarkers={deltaMarkers}
+        />
       ) : (
         <div style={{
           height: 240, display: 'flex', alignItems: 'center', justifyContent: 'center',
@@ -795,11 +906,34 @@ export default function LivePaperMonitor() {
             session: { ...(existing.session || {}), lock_status: `${data.lock_reason}_locked` },
             events:  [...existing.events, { timestamp: data.timestamp, event_type: 'WINGS_LOCKED', reason_text: `${data.lock_reason} lock — wings bought` }],
           }}
-        case 'MTM': {
-          const mtmRow = { timestamp: data.timestamp, net_mtm: data.net_mtm, gross_mtm: data.gross_mtm, trail_stop_level: data.trail_stop_level, spot: data.spot }
+        case 'DELTA_HEDGE':
           return { ...prev, [sessionId]: {
             ...existing,
-            session: { ...(existing.session || {}), net_mtm_latest: data.net_mtm, spot_latest: data.spot },
+            session: {
+              ...(existing.session || {}),
+              net_delta_latest: data.net_delta,
+              delta_hedge_status: 'hedged',
+              delta_hedge_count: data.delta_hedge_count,
+            },
+            events: [...existing.events, {
+              timestamp: data.timestamp,
+              event_type: 'DELTA_HEDGE',
+              reason_code: 'DELTA_HEDGE_EXECUTED',
+              reason_text: `${data.option_type} ${data.strike} @ ${data.price}`,
+            }],
+          }}
+        case 'MTM': {
+          const mtmRow = { timestamp: data.timestamp, net_mtm: data.net_mtm, gross_mtm: data.gross_mtm, trail_stop_level: data.trail_stop_level, spot: data.spot, net_delta: data.net_delta }
+          return { ...prev, [sessionId]: {
+            ...existing,
+            session: {
+              ...(existing.session || {}),
+              net_mtm_latest: data.net_mtm,
+              spot_latest: data.spot,
+              net_delta_latest: data.net_delta,
+              delta_hedge_status: data.delta_hedge_status,
+              delta_hedge_count: data.delta_hedge_count,
+            },
             mtmData: [...existing.mtmData, mtmRow],
             ceData:  data.ce_price != null ? [...existing.ceData, { timestamp: data.timestamp, price: data.ce_price }] : existing.ceData,
             peData:  data.pe_price != null ? [...existing.peData, { timestamp: data.timestamp, price: data.pe_price }] : existing.peData,

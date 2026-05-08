@@ -134,6 +134,7 @@ class StrategyRunMtm(Base):
     gross_mtm = Column(Numeric(12, 2), nullable=True)
     est_exit_charges = Column(Numeric(10, 2), nullable=True)
     net_mtm = Column(Numeric(12, 2), nullable=True)
+    net_delta = Column(Numeric(12, 4), nullable=True)
 
     # Trailing stop overlay — null until trail activates
     trail_stop_level = Column(Numeric(12, 2), nullable=True)

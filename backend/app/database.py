@@ -99,6 +99,11 @@ async def init_db():
             # label is in the ORM model so create_all() handles it on fresh DBs;
             # add here for existing DBs that skipped 0007.
             "ALTER TABLE live_paper_configs ADD COLUMN IF NOT EXISTS label VARCHAR(50)",
+            # ── Delta hedge tracking (migration 0009) ─────────────────────────
+            "ALTER TABLE strategy_run_mtm ADD COLUMN IF NOT EXISTS net_delta NUMERIC(12,4)",
+            "ALTER TABLE live_paper_sessions ADD COLUMN IF NOT EXISTS net_delta_latest NUMERIC(12,4)",
+            "ALTER TABLE live_paper_sessions ADD COLUMN IF NOT EXISTS delta_hedge_status VARCHAR(20) DEFAULT 'off'",
+            "ALTER TABLE live_paper_sessions ADD COLUMN IF NOT EXISTS delta_hedge_count INTEGER DEFAULT 0 NOT NULL",
         ]:
             await conn.execute(__import__("sqlalchemy").text(stmt))
 

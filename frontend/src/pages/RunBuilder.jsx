@@ -699,7 +699,7 @@ export default function RunBuilder() {
       }
     }, 600)
     return () => clearTimeout(validateTimer.current)
-  }, [runType, strategyId, config.trade_date, config.entry_time, config.capital, config.instrument, config.wing_width_steps, config.target_amount, config.stop_loss_amount, config.target_pct, config.stop_capital_pct, config.vix_guardrail_enabled, config.vix_min, config.vix_max])
+  }, [runType, strategyId, config.trade_date, config.entry_time, config.capital, config.instrument, config.wing_width_steps, config.target_amount, config.stop_loss_amount, config.target_pct, config.stop_capital_pct, config.delta_hedge_enabled, config.delta_threshold, config.max_hedge_triggers, config.reentry_buffer, config.vix_guardrail_enabled, config.vix_min, config.vix_max])
 
   const scopedFields = useMemo(() => {
     const schema = (strategy?.params_schema || []).filter(field => !field.modes || field.modes.includes(runType))

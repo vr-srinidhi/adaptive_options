@@ -80,6 +80,9 @@ class LivePaperSession(Base):
     # Live state — updated every minute for fast status polling
     net_mtm_latest  = Column(Numeric(12, 2), nullable=True)
     spot_latest     = Column(Numeric(10, 2), nullable=True)
+    net_delta_latest = Column(Numeric(12, 4), nullable=True)
+    delta_hedge_status = Column(String(20), nullable=True, default="off")  # off|monitoring|hedged|exhausted
+    delta_hedge_count = Column(Integer, nullable=False, default=0)
     lock_status     = Column(String(20), nullable=True, default="none")  # none|profit_locked|loss_locked
 
     # Final outcome
