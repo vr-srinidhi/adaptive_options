@@ -300,7 +300,8 @@ export default function ReplayDesk() {
                 </div>
               </div>
             ) : (
-              <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 11 }}>
+              <div style={{ overflowX: 'auto', WebkitOverflowScrolling: 'touch' }}>
+              <table style={{ width: '100%', minWidth: 480, borderCollapse: 'collapse', fontSize: 11 }}>
                 <thead>
                   <tr style={{ background: PALETTE.bg }}>
                     {['Strategy', 'Date', 'Instrument', 'Net P&L', 'Status', ''].map(header => (
@@ -356,6 +357,7 @@ export default function ReplayDesk() {
                   ))}
                 </tbody>
               </table>
+              </div>
             )}
           </section>
         </div>

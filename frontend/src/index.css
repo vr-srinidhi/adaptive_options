@@ -310,6 +310,11 @@ body {
   .grid.md\:grid-cols-2 {
     grid-template-columns: 1fr !important;
   }
+
+  /* LivePaperMonitor: collapse 2-panel layout to single column */
+  .live-two-col {
+    grid-template-columns: 1fr !important;
+  }
 }
 
 @media print {

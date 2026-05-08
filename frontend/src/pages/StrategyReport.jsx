@@ -142,7 +142,7 @@ export default function StrategyReport() {
   const isPositive = s.net_pnl >= 0
 
   return (
-    <div style={{ padding: '32px 40px', maxWidth: 1100, margin: '0 auto' }}>
+    <div style={{ padding: 'clamp(14px, 3vw, 32px) clamp(12px, 4vw, 40px)', maxWidth: 1100, margin: '0 auto' }}>
       {/* Back link */}
       <button
         onClick={() => navigate('/workbench')}
@@ -358,9 +358,9 @@ export default function StrategyReport() {
       <SectionTitle title="Monthly Breakdown" />
       <div style={{
         background: 'var(--surface-2)', border: '1px solid var(--border)',
-        borderRadius: 10, overflow: 'hidden',
+        borderRadius: 10, overflowX: 'auto', WebkitOverflowScrolling: 'touch',
       }}>
-        <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 13 }}>
+        <table style={{ width: '100%', minWidth: 480, borderCollapse: 'collapse', fontSize: 13 }}>
           <thead>
             <tr style={{ borderBottom: '1px solid var(--border)' }}>
               {['Month', 'Sessions', 'Wins', 'Losses', 'Win %', 'P&L'].map(h => (

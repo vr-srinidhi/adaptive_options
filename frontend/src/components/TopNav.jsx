@@ -224,6 +224,30 @@ export default function TopNav() {
             )
           })}
 
+          {/* Legacy section */}
+          <div style={{ padding: '8px 20px 4px', fontSize: 10, fontWeight: 600, letterSpacing: '0.1em', color: 'var(--text-secondary)', textTransform: 'uppercase', borderTop: '1px solid var(--border)', marginTop: 4 }}>
+            Legacy
+          </div>
+          {LEGACY_LINKS.map(link => (
+            <NavLink
+              key={link.to}
+              to={link.to}
+              onClick={() => setMenuOpen(false)}
+              style={{
+                display: 'flex', alignItems: 'center', gap: 12,
+                padding: '11px 20px',
+                borderBottom: '0.5px solid var(--border)',
+                textDecoration: 'none',
+                color: 'var(--text-secondary)',
+                fontSize: 13,
+                transition: 'background 0.15s',
+              }}
+            >
+              <span style={{ width: 20 }} />
+              {link.label}
+            </NavLink>
+          ))}
+
           {/* Zerodha + divider at bottom of drawer */}
           <div style={{ padding: '12px 20px', display: 'flex', gap: 12, alignItems: 'center' }}>
             <NavLink

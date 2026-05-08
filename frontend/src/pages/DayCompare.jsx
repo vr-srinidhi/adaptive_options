@@ -315,7 +315,7 @@ export default function DayCompare() {
   const worst  = sorted[sorted.length - 1]
 
   return (
-    <div style={{ padding: '32px 40px', maxWidth: 1300, margin: '0 auto' }}>
+    <div style={{ padding: 'clamp(14px, 3vw, 32px) clamp(12px, 4vw, 40px)', maxWidth: 1300, margin: '0 auto' }}>
       <button
         onClick={() => navigate('/workbench')}
         style={{ background: 'none', border: 'none', cursor: 'pointer', color: '#6366f1', fontSize: 13, padding: 0, marginBottom: 20 }}
@@ -467,12 +467,12 @@ export default function DayCompare() {
           {strategies.length >= 2 && (
             <div style={{
               background: 'var(--surface-2)', border: '1px solid var(--border)',
-              borderRadius: 10, overflow: 'hidden', marginBottom: 32,
+              borderRadius: 10, overflowX: 'auto', WebkitOverflowScrolling: 'touch', marginBottom: 32,
             }}>
               <div style={{ padding: '12px 20px', borderBottom: '1px solid var(--border)', fontSize: 12, fontWeight: 700, color: 'var(--text-secondary)', textTransform: 'uppercase', letterSpacing: '0.04em' }}>
                 P&L Differences
               </div>
-              <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 13 }}>
+              <table style={{ width: '100%', minWidth: 480, borderCollapse: 'collapse', fontSize: 13 }}>
                 <thead>
                   <tr style={{ borderBottom: '1px solid var(--border)' }}>
                     <th style={{ padding: '10px 16px', textAlign: 'left', color: 'var(--text-secondary)', fontWeight: 600, fontSize: 11 }}>Strategy</th>
