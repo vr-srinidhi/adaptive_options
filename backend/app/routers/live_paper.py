@@ -198,7 +198,7 @@ async def _get_mtm_series(db: AsyncSession, run_id: uuid.UUID):
         key = ts.isoformat()
         if side == "SELL":
             sell_lookup.setdefault(key, {})[opt_type] = float(price)
-        elif side == "BUY" and leg_idx in (2, 3):
+        elif side == "BUY":
             wing_lookup.setdefault(key, {})[opt_type] = float(price)
 
     return [

@@ -180,7 +180,7 @@ function calcPayoffAtExpiry(legs, spot, qty) {
   }, 0)
 }
 
-function PayoffChart({ legs, atm, lotSize, lots, currentSpot, currentMtm }) {
+function PayoffChart({ legs, atm, lotSize, lots, currentSpot, currentMtm, gradId }) {
   const [showStraddle, setShowStraddle] = useState(false)
 
   if (!atm || !legs || legs.length === 0 || !lotSize || !lots) return null
@@ -268,7 +268,7 @@ function PayoffChart({ legs, atm, lotSize, lots, currentSpot, currentMtm }) {
       <ResponsiveContainer width="100%" height={200}>
         <AreaChart data={data} margin={{ top: 4, right: 8, left: 0, bottom: 0 }}>
           <defs>
-            <linearGradient id={`payoffGrad-${atm}`} x1="0" y1="0" x2="0" y2="1">
+            <linearGradient id={gradId} x1="0" y1="0" x2="0" y2="1">
               <stop offset="0%"        stopColor="#22c55e" stopOpacity={0.35} />
               <stop offset={zeroFracPct} stopColor="#22c55e" stopOpacity={0.10} />
               <stop offset={zeroFracPct} stopColor="#ef4444" stopOpacity={0.10} />
@@ -313,7 +313,7 @@ function PayoffChart({ legs, atm, lotSize, lots, currentSpot, currentMtm }) {
             dataKey="pnl"
             stroke="#818cf8"
             strokeWidth={1.5}
-            fill={`url(#payoffGrad-${atm})`}
+            fill={`url(#${gradId})`}
             dot={false}
             activeDot={{ r: 3, fill: '#818cf8' }}
             isAnimationActive={false}
@@ -946,6 +946,7 @@ function SlotDetail({ slot, liveSlotData, navigate }) {
           lots={run?.approved_lots ?? session?.approved_lots ?? 1}
           currentSpot={session?.spot_latest ?? null}
           currentMtm={session?.net_mtm_latest ?? null}
+          gradId={`payoffGrad-${session?.id ?? session?.atm_strike}`}
         />
       )}
 
