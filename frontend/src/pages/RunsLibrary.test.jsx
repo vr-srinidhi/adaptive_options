@@ -84,10 +84,8 @@ describe('RunsLibrary', () => {
 
   it('checkboxes appear only on strategy_run rows; export button appears after selection', async () => {
     renderRunsLibrary()
-    await screen.findByText('Runs Library')
-
-    // select-all header + 2 strategy_run row checkboxes (paper_session has no checkbox)
-    const checkboxes = screen.getAllByRole('checkbox')
+    // Wait for the table to finish loading (checkboxes only appear after API resolves)
+    const checkboxes = await screen.findAllByRole('checkbox')
     expect(checkboxes.length).toBe(3)
 
     // No export button before any selection (the footer hint doesn't count — it's a span, not a button)

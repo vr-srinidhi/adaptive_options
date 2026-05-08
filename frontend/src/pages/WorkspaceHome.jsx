@@ -140,15 +140,15 @@ export default function WorkspaceHome() {
   const strategies = data?.strategies || []
 
   return (
-    <div style={{ padding: '32px 40px', maxWidth: 1100, margin: '0 auto' }}>
+    <div className="mx-auto w-full" style={{ padding: 'clamp(16px, 4vw, 40px) clamp(12px, 4vw, 40px)', maxWidth: 1100 }}>
       <div style={{ marginBottom: 28 }}>
-        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start' }}>
+        <div className="flex flex-wrap items-start justify-between gap-3">
           <div>
-            <h1 style={{ fontSize: 26, fontWeight: 800, color: 'var(--text-primary)', margin: 0 }}>
+            <h1 style={{ fontSize: 'clamp(20px, 5vw, 26px)', fontWeight: 800, color: 'var(--text-primary)', margin: 0 }}>
               Strategy Dashboard
             </h1>
             <p style={{ fontSize: 13, color: 'var(--text-secondary)', marginTop: 4 }}>
-              Cumulative P&L across all backtest sessions. Click a card for the full report.
+              Cumulative P&amp;L across all backtest sessions. Click a card for the full report.
             </p>
           </div>
           <button

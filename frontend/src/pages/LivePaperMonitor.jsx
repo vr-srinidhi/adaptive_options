@@ -254,7 +254,7 @@ function ConfigPanel({ config, onSave }) {
         Slot Configuration
       </div>
 
-      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10 }}>
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(120px, 1fr))', gap: 10 }}>
         {field('Slot Label', 'label', 'text')}
         {field('Entry Time', 'entry_time', 'text')}
         {field('Capital (₹)', 'capital')}
@@ -277,13 +277,13 @@ function ConfigPanel({ config, onSave }) {
           />
           Enable Delta Hedge
         </label>
-        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10 }}>
+        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(120px, 1fr))', gap: 10 }}>
           {field('Delta Threshold', 'delta_threshold', 'number', undefined, !form.delta_hedge_enabled)}
           {field('Max Hedge Triggers', 'max_hedge_triggers', 'number', undefined, !form.delta_hedge_enabled)}
           {field('Re-entry Buffer', 'reentry_buffer', 'number', undefined, !form.delta_hedge_enabled)}
           {field('Fallback IV', 'default_iv', 'number', '0.01', !form.delta_hedge_enabled)}
         </div>
-        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10 }}>
+        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(120px, 1fr))', gap: 10 }}>
           <div style={{ display: 'flex', flexDirection: 'column', gap: 3 }}>
             <label style={{ fontSize: 11, color: 'var(--text-secondary)' }}>Hedge Action</label>
             <select
@@ -702,7 +702,7 @@ function SlotDetail({ slot, liveSlotData, navigate }) {
           </div>
           {run && (
             <div style={{
-              display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 8,
+              display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(100px, 1fr))', gap: 8,
               padding: '8px 12px', background: 'var(--surface)', borderRadius: 8,
             }}>
               {[
@@ -743,7 +743,7 @@ function SlotDetail({ slot, liveSlotData, navigate }) {
 
       {/* CE / PE premium charts */}
       {(ceData.length > 0 || peData.length > 0) && (
-        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 16, marginTop: 16 }}>
+        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(140px, 1fr))', gap: 16, marginTop: 16 }}>
           <PremiumChart data={ceData} entryPrice={entryPrices.ce} color="#f59e0b" label={friendlyLeg(session, 'CE')} />
           <PremiumChart data={peData} entryPrice={entryPrices.pe} color="#22d3ee" label={friendlyLeg(session, 'PE')} />
         </div>
@@ -1064,12 +1064,12 @@ export default function LivePaperMonitor() {
   if (error)   return <div style={{ padding: 40, color: '#f87171', fontFamily: 'monospace' }}>Error: {error}</div>
 
   return (
-    <div style={{ padding: '28px 32px', maxWidth: 1280, margin: '0 auto' }}>
+    <div style={{ padding: 'clamp(14px, 3vw, 28px) clamp(12px, 3vw, 32px)', maxWidth: 1280, margin: '0 auto' }}>
 
       {/* Header */}
-      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 20 }}>
+      <div style={{ display: 'flex', flexWrap: 'wrap', justifyContent: 'space-between', alignItems: 'flex-start', gap: 8, marginBottom: 20 }}>
         <div>
-          <h1 style={{ fontSize: 24, fontWeight: 800, color: 'var(--text-primary)', margin: 0 }}>
+          <h1 style={{ fontSize: 'clamp(18px, 5vw, 24px)', fontWeight: 800, color: 'var(--text-primary)', margin: 0 }}>
             Live Paper Trading
           </h1>
           <p style={{ fontSize: 12, color: 'var(--text-secondary)', marginTop: 3 }}>
@@ -1174,7 +1174,7 @@ export default function LivePaperMonitor() {
 
       {/* Two-panel layout */}
       {activeSlot && (
-        <div style={{ display: 'grid', gridTemplateColumns: '1fr 320px', gap: 20, marginBottom: 24 }}>
+        <div className="live-two-col" style={{ display: 'grid', gridTemplateColumns: '1fr 320px', gap: 20, marginBottom: 24 }}>
 
           {/* Left: active slot session detail */}
           <div style={{

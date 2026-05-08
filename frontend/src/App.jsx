@@ -29,7 +29,7 @@ export default function App() {
   return (
     <AuthProvider>
       <BrowserRouter>
-        <div className="min-h-screen flex flex-col" style={{ background: 'var(--surface)' }}>
+        <div className="min-h-screen flex flex-col overflow-x-hidden" style={{ background: 'var(--surface)' }}>
           <Routes>
             {/* Public routes */}
             <Route path="/login" element={<Login />} />

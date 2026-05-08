@@ -627,7 +627,7 @@ function StrategyRunAnalyzer({ payload, kind, id, navigate }) {
   const pnl  = run.realized_net_pnl
 
   return (
-    <div className="mx-auto max-w-[1360px] replay-v2-container" style={{ padding: '18px 20px 24px', fontSize: 12 }}>
+    <div className="mx-auto max-w-[1360px] replay-v2-container" style={{ padding: 'clamp(12px, 3vw, 18px) clamp(12px, 3vw, 20px) 24px', fontSize: 12 }}>
 
       {/* ── Header ── */}
       <section className="wb-card p-6 print-section">
@@ -849,7 +849,7 @@ export default function ReplayAnalyzer() {
   const backRoute = kind === 'paper_session' ? '/workbench/replay' : session.batch_id ? `/workbench/history/historical_batch/${session.batch_id}` : '/workbench/history'
 
   return (
-    <div className="mx-auto max-w-[1360px]" style={{ padding: '18px 20px 24px', fontSize: 12 }}>
+    <div className="mx-auto max-w-[1360px]" style={{ padding: 'clamp(12px, 3vw, 18px) clamp(12px, 3vw, 20px) 24px', fontSize: 12 }}>
       <section className="wb-card p-6">
         <div className="flex items-start justify-between gap-5 flex-wrap">
           <div>
