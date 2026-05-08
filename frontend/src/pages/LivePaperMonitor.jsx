@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState, useCallback } from 'react'
 import { useNavigate } from 'react-router-dom'
 import {
-  LineChart, Line, XAxis, YAxis, Tooltip, ReferenceLine,
+  LineChart, Line, AreaChart, Area, XAxis, YAxis, Tooltip, ReferenceLine,
   ResponsiveContainer, CartesianGrid,
 } from 'recharts'
 import { useAuth } from '../contexts/AuthContext'
@@ -161,6 +161,164 @@ function MtmChart({ data, entryTs, exitTs, deltaThreshold, deltaMarkers = [] }) 
           {vis.spot && <Line yAxisId="spot" type="monotone" dataKey="spot" stroke="#94a3b8" strokeWidth={1} dot={false} activeDot={{ r: 2 }} />}
           {vis.delta && <Line yAxisId="delta" type="monotone" dataKey="net_delta" stroke="#facc15" strokeWidth={1.2} dot={false} activeDot={{ r: 2 }} connectNulls={false} />}
         </LineChart>
+      </ResponsiveContainer>
+    </div>
+  )
+}
+
+// ── Payoff Chart ─────────────────────────────────────────────────────────────
+
+function calcPayoffAtExpiry(legs, spot, qty) {
+  return legs.reduce((sum, leg) => {
+    if (leg.entry_price == null) return sum
+    const intrinsic = leg.option_type === 'CE'
+      ? Math.max(0, spot - leg.strike)
+      : Math.max(0, leg.strike - spot)
+    return sum + (leg.side === 'SELL'
+      ? (leg.entry_price - intrinsic) * qty
+      : (intrinsic - leg.entry_price) * qty)
+  }, 0)
+}
+
+function PayoffChart({ legs, atm, lotSize, lots, currentSpot, currentMtm, gradId }) {
+  const [showStraddle, setShowStraddle] = useState(false)
+
+  if (!atm || !legs || legs.length === 0 || !lotSize || !lots) return null
+
+  const qty = lotSize * lots
+  const step = 50   // NIFTY strike step
+  const range = Math.ceil(atm * 0.14 / step) * step   // ±14% rounded to nearest step
+  const points = 80
+  const spotMin = atm - range
+  const spotMax = atm + range
+
+  const straddleLegs = legs.filter(l => l.side === 'SELL')
+  const displayLegs  = showStraddle ? straddleLegs : legs
+  const hasAdjustments = legs.some(l => l.side === 'BUY')
+
+  const data = Array.from({ length: points + 1 }, (_, i) => {
+    const s = spotMin + (i / points) * (spotMax - spotMin)
+    return {
+      spot: Math.round(s),
+      pnl:  Math.round(calcPayoffAtExpiry(displayLegs, s, qty)),
+    }
+  })
+
+  const pnlVals = data.map(d => d.pnl)
+  const yMin    = Math.min(...pnlVals)
+  const yMax    = Math.max(...pnlVals)
+  const yPad    = Math.max(Math.abs(yMax), Math.abs(yMin)) * 0.12 || 5000
+  const yDomain = [Math.floor((yMin - yPad) / 1000) * 1000, Math.ceil((yMax + yPad) / 1000) * 1000]
+
+  // Gradient zero-crossing fraction (SVG y goes top→bottom, yMax is top)
+  const totalSpan = yDomain[1] - yDomain[0]
+  const zeroFrac  = totalSpan > 0 ? ((yDomain[1]) / totalSpan) : 0.5
+  const zeroFracPct = `${Math.min(99, Math.max(1, zeroFrac * 100)).toFixed(1)}%`
+
+  // Break-even crossings
+  const breakEvens = []
+  for (let i = 1; i < data.length; i++) {
+    if (data[i - 1].pnl * data[i].pnl < 0) {
+      const be = data[i - 1].spot +
+        (data[i].spot - data[i - 1].spot) *
+        (-data[i - 1].pnl / (data[i].pnl - data[i - 1].pnl))
+      breakEvens.push(Math.round(be / step) * step)
+    }
+  }
+
+  const fmtSpot = v => {
+    if (v >= 10000) return `${(v / 1000).toFixed(0)}k`
+    return String(Math.round(v))
+  }
+  const fmtPnl = v => {
+    const abs = Math.abs(v)
+    const s = abs >= 100000 ? `${(abs / 100000).toFixed(1)}L` : `${(abs / 1000).toFixed(0)}k`
+    return v < 0 ? `-${s}` : `+${s}`
+  }
+
+  return (
+    <div style={{ marginTop: 20 }}>
+      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 8, gap: 8, flexWrap: 'wrap' }}>
+        <div style={{ fontSize: 12, fontWeight: 700, color: 'var(--text-primary)' }}>
+          Payoff at Expiry
+        </div>
+        <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', alignItems: 'center' }}>
+          {hasAdjustments && (
+            <button
+              onClick={() => setShowStraddle(s => !s)}
+              style={{
+                fontSize: 10, padding: '3px 8px', borderRadius: 10,
+                cursor: 'pointer',
+                border: `1px solid ${showStraddle ? '#f59e0b44' : '#6366f144'}`,
+                background: showStraddle ? '#f59e0b11' : '#6366f111',
+                color: showStraddle ? '#f59e0b' : '#818cf8',
+              }}
+            >
+              {showStraddle ? 'Straddle only' : 'With adjustments'}
+            </button>
+          )}
+          {breakEvens.map((be, i) => (
+            <span key={i} style={{ fontSize: 10, color: '#facc15', background: '#facc1511', border: '1px solid #facc1533', borderRadius: 8, padding: '2px 7px' }}>
+              BE {fmtSpot(be)}
+            </span>
+          ))}
+        </div>
+      </div>
+
+      <ResponsiveContainer width="100%" height={200}>
+        <AreaChart data={data} margin={{ top: 4, right: 8, left: 0, bottom: 0 }}>
+          <defs>
+            <linearGradient id={gradId} x1="0" y1="0" x2="0" y2="1">
+              <stop offset="0%"        stopColor="#22c55e" stopOpacity={0.35} />
+              <stop offset={zeroFracPct} stopColor="#22c55e" stopOpacity={0.10} />
+              <stop offset={zeroFracPct} stopColor="#ef4444" stopOpacity={0.10} />
+              <stop offset="100%"      stopColor="#ef4444" stopOpacity={0.35} />
+            </linearGradient>
+          </defs>
+          <CartesianGrid strokeDasharray="3 3" stroke="var(--border)" />
+          <XAxis
+            dataKey="spot"
+            type="number"
+            domain={[spotMin, spotMax]}
+            tickFormatter={fmtSpot}
+            tick={{ fontSize: 10, fill: 'var(--text-secondary)' }}
+            minTickGap={55}
+          />
+          <YAxis
+            domain={yDomain}
+            tickFormatter={fmtPnl}
+            tick={{ fontSize: 10, fill: 'var(--text-secondary)' }}
+            width={48}
+          />
+          <Tooltip
+            formatter={(val) => [fmtPnl(val), 'P&L at expiry']}
+            labelFormatter={(s) => `Spot ${fmtSpot(s)}`}
+            contentStyle={{ background: 'var(--surface-secondary)', border: '1px solid var(--border)', borderRadius: 6, fontSize: 11 }}
+          />
+          <ReferenceLine y={0} stroke="#475569" strokeWidth={1} />
+          {breakEvens.map((be, i) => (
+            <ReferenceLine key={i} x={be} stroke="#facc15" strokeDasharray="3 3"
+              label={{ value: fmtSpot(be), fill: '#facc15', fontSize: 9, position: 'insideTopLeft' }} />
+          ))}
+          {currentSpot != null && (
+            <ReferenceLine x={Math.round(currentSpot)} stroke="#94a3b8" strokeWidth={1.5}
+              label={{ value: 'NOW', fill: '#94a3b8', fontSize: 9, position: 'insideTopRight' }} />
+          )}
+          {currentMtm != null && (
+            <ReferenceLine y={Math.round(currentMtm)} stroke="#4ade80" strokeDasharray="4 2"
+              label={{ value: `Live ${fmtPnl(currentMtm)}`, fill: '#4ade80', fontSize: 9, position: 'insideRight' }} />
+          )}
+          <Area
+            type="monotone"
+            dataKey="pnl"
+            stroke="#818cf8"
+            strokeWidth={1.5}
+            fill={`url(#${gradId})`}
+            dot={false}
+            activeDot={{ r: 3, fill: '#818cf8' }}
+            isAnimationActive={false}
+          />
+        </AreaChart>
       </ResponsiveContainer>
     </div>
   )
@@ -649,9 +807,12 @@ function SlotDetail({ slot, liveSlotData, navigate }) {
   const mtmData     = sd.mtmData     || slot.mtm_series  || []
   const ceData      = sd.ceData      || []
   const peData      = sd.peData      || []
+  const wingCeData  = sd.wingCeData  || []
+  const wingPeData  = sd.wingPeData  || []
   const events      = sd.events      || slot.events       || []
   const run         = sd.run         || slot.run
   const entryPrices = sd.entryPrices || { ce: run?.ce_entry_price ?? null, pe: run?.pe_entry_price ?? null }
+  const payoffLegs  = sd.legs?.length > 0 ? sd.legs : (run?.legs || [])
 
   const entryEvent = events.find(e => e.event_type === 'ENTRY')
   const exitEvent  = events.find(e => ['STOP_EXIT', 'TRAIL_EXIT', 'TIME_EXIT', 'DATA_GAP_EXIT'].includes(e.event_type))
@@ -741,12 +902,52 @@ function SlotDetail({ slot, liveSlotData, navigate }) {
         </div>
       )}
 
-      {/* CE / PE premium charts */}
+      {/* CE / PE premium charts — straddle SELL legs (unchanged) */}
       {(ceData.length > 0 || peData.length > 0) && (
         <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(140px, 1fr))', gap: 16, marginTop: 16 }}>
           <PremiumChart data={ceData} entryPrice={entryPrices.ce} color="#f59e0b" label={friendlyLeg(session, 'CE')} />
           <PremiumChart data={peData} entryPrice={entryPrices.pe} color="#22d3ee" label={friendlyLeg(session, 'PE')} />
         </div>
+      )}
+
+      {/* Wing / hedge premium charts — appear after lock or delta hedge fires */}
+      {(wingCeData.length > 0 || wingPeData.length > 0) && (
+        <div style={{ marginTop: 12 }}>
+          <div style={{ fontSize: 10, color: 'var(--text-secondary)', marginBottom: 8, textTransform: 'uppercase', letterSpacing: '0.08em' }}>
+            Wing / Hedge Premiums
+          </div>
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(140px, 1fr))', gap: 16 }}>
+            {wingCeData.length > 0 && (
+              <PremiumChart
+                data={wingCeData}
+                entryPrice={payoffLegs.find(l => l.side === 'BUY' && l.option_type === 'CE')?.entry_price ?? null}
+                color="#a78bfa"
+                label="Wing CE (BUY)"
+              />
+            )}
+            {wingPeData.length > 0 && (
+              <PremiumChart
+                data={wingPeData}
+                entryPrice={payoffLegs.find(l => l.side === 'BUY' && l.option_type === 'PE')?.entry_price ?? null}
+                color="#fb7185"
+                label="Wing PE (BUY)"
+              />
+            )}
+          </div>
+        </div>
+      )}
+
+      {/* Payoff at expiry — new standalone panel, existing charts above are untouched */}
+      {payoffLegs.length > 0 && session?.atm_strike && (
+        <PayoffChart
+          legs={payoffLegs}
+          atm={session.atm_strike}
+          lotSize={run?.lot_size ?? session?.lot_size ?? 75}
+          lots={run?.approved_lots ?? session?.approved_lots ?? 1}
+          currentSpot={session?.spot_latest ?? null}
+          currentMtm={session?.net_mtm_latest ?? null}
+          gradId={`payoffGrad-${session?.id ?? session?.atm_strike}`}
+        />
       )}
 
       {/* Final result */}
@@ -839,11 +1040,14 @@ export default function LivePaperMonitor() {
           next[sid] = {
             session:     slot.session,
             mtmData:     series,
-            ceData:      series.filter(r => r.ce_price  != null).map(r => ({ timestamp: r.timestamp, price: r.ce_price  })),
-            peData:      series.filter(r => r.pe_price  != null).map(r => ({ timestamp: r.timestamp, price: r.pe_price  })),
+            ceData:      series.filter(r => r.ce_price      != null).map(r => ({ timestamp: r.timestamp, price: r.ce_price })),
+            peData:      series.filter(r => r.pe_price      != null).map(r => ({ timestamp: r.timestamp, price: r.pe_price })),
+            wingCeData:  series.filter(r => r.wing_ce_price != null).map(r => ({ timestamp: r.timestamp, price: r.wing_ce_price })),
+            wingPeData:  series.filter(r => r.wing_pe_price != null).map(r => ({ timestamp: r.timestamp, price: r.wing_pe_price })),
             events:      slot.events || [],
             run:         slot.run,
             entryPrices: slot.run ? { ce: slot.run.ce_entry_price ?? null, pe: slot.run.pe_entry_price ?? null } : { ce: null, pe: null },
+            legs:        slot.run?.legs || [],
           }
         }
         return next
@@ -885,7 +1089,8 @@ export default function LivePaperMonitor() {
     }
     setLiveData(prev => {
       const existing = prev[sessionId] || {
-        mtmData: [], ceData: [], peData: [], events: [], session: null, entryPrices: { ce: null, pe: null },
+        mtmData: [], ceData: [], peData: [], wingCeData: [], wingPeData: [],
+        events: [], session: null, entryPrices: { ce: null, pe: null }, legs: [],
       }
       switch (data.type) {
         case 'SNAPSHOT':
@@ -893,20 +1098,33 @@ export default function LivePaperMonitor() {
         case 'STATUS':
         case 'RESOLVED':
           return { ...prev, [sessionId]: { ...existing, session: { ...(existing.session || {}), ...data } } }
-        case 'ENTRY':
+        case 'ENTRY': {
+          const newLegs = [
+            { side: 'SELL', option_type: 'CE', strike: data.atm_strike, entry_price: data.ce_price },
+            { side: 'SELL', option_type: 'PE', strike: data.atm_strike, entry_price: data.pe_price },
+          ]
           return { ...prev, [sessionId]: {
             ...existing,
-            session:     { ...(existing.session || {}), status: 'entered' },
+            session:     { ...(existing.session || {}), status: 'entered', lot_size: data.lot_size, approved_lots: data.approved_lots },
             entryPrices: { ce: data.ce_price, pe: data.pe_price },
+            legs:        newLegs,
             events:      [...existing.events, { timestamp: data.timestamp, event_type: 'ENTRY', reason_text: `CE@${data.ce_price} PE@${data.pe_price}` }],
           }}
-        case 'LOCK':
+        }
+        case 'LOCK': {
+          const wingLegs = [
+            { side: 'BUY', option_type: 'CE', strike: data.wing_ce_strike, entry_price: data.wing_ce_price },
+            { side: 'BUY', option_type: 'PE', strike: data.wing_pe_strike, entry_price: data.wing_pe_price },
+          ]
           return { ...prev, [sessionId]: {
             ...existing,
             session: { ...(existing.session || {}), lock_status: `${data.lock_reason}_locked` },
+            legs:    [...existing.legs, ...wingLegs],
             events:  [...existing.events, { timestamp: data.timestamp, event_type: 'WINGS_LOCKED', reason_text: `${data.lock_reason} lock — wings bought` }],
           }}
-        case 'DELTA_HEDGE':
+        }
+        case 'DELTA_HEDGE': {
+          const hedgeLeg = { side: 'BUY', option_type: data.option_type, strike: data.strike, entry_price: data.price }
           return { ...prev, [sessionId]: {
             ...existing,
             session: {
@@ -915,6 +1133,7 @@ export default function LivePaperMonitor() {
               delta_hedge_status: 'hedged',
               delta_hedge_count: data.delta_hedge_count,
             },
+            legs:   [...existing.legs, hedgeLeg],
             events: [...existing.events, {
               timestamp: data.timestamp,
               event_type: 'DELTA_HEDGE',
@@ -922,6 +1141,7 @@ export default function LivePaperMonitor() {
               reason_text: `${data.option_type} ${data.strike} @ ${data.price}`,
             }],
           }}
+        }
         case 'MTM': {
           const mtmRow = { timestamp: data.timestamp, net_mtm: data.net_mtm, gross_mtm: data.gross_mtm, trail_stop_level: data.trail_stop_level, spot: data.spot, net_delta: data.net_delta }
           return { ...prev, [sessionId]: {
@@ -934,9 +1154,11 @@ export default function LivePaperMonitor() {
               delta_hedge_status: data.delta_hedge_status,
               delta_hedge_count: data.delta_hedge_count,
             },
-            mtmData: [...existing.mtmData, mtmRow],
-            ceData:  data.ce_price != null ? [...existing.ceData, { timestamp: data.timestamp, price: data.ce_price }] : existing.ceData,
-            peData:  data.pe_price != null ? [...existing.peData, { timestamp: data.timestamp, price: data.pe_price }] : existing.peData,
+            mtmData:    [...existing.mtmData, mtmRow],
+            ceData:     data.ce_price      != null ? [...existing.ceData,     { timestamp: data.timestamp, price: data.ce_price      }] : existing.ceData,
+            peData:     data.pe_price      != null ? [...existing.peData,     { timestamp: data.timestamp, price: data.pe_price      }] : existing.peData,
+            wingCeData: data.wing_ce_price != null ? [...existing.wingCeData, { timestamp: data.timestamp, price: data.wing_ce_price }] : existing.wingCeData,
+            wingPeData: data.wing_pe_price != null ? [...existing.wingPeData, { timestamp: data.timestamp, price: data.wing_pe_price }] : existing.wingPeData,
           }}
         }
         default:

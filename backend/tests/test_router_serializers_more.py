@@ -240,9 +240,15 @@ async def test_live_paper_mtm_and_event_helpers_join_leg_prices():
         reason_text="entered",
         payload_json={"spot": 22500},
     )
+    wing_ts = ts
     db = _FakeDb([
         _ExecuteResult(scalars=[mtm]),
-        _ExecuteResult(rows=[("CE", ts, Decimal("100.00"))]),
+        _ExecuteResult(rows=[
+            ("CE", "SELL", 0, ts, Decimal("100.00")),
+            ("PE", "SELL", 1, ts, Decimal("90.00")),
+            ("CE", "BUY",  2, ts, Decimal("30.00")),   # static lock wing
+            ("CE", "BUY",  4, ts, Decimal("28.00")),   # delta hedge leg at index 4+
+        ]),
         _ExecuteResult(scalars=[event]),
     ])
 
@@ -250,7 +256,12 @@ async def test_live_paper_mtm_and_event_helpers_join_leg_prices():
     events = await live_paper._get_events(db, run_id)
 
     assert mtm_series[0]["ce_price"] == 100.0
+    assert mtm_series[0]["pe_price"] == 90.0
     assert mtm_series[0]["net_delta"] == -25.5
+    # BUY legs at both index 2 and 4+ must appear in wing_ce_price
+    # last writer wins for same opt_type; delta hedge (idx=4) arrives after lock wing (idx=2)
+    assert mtm_series[0]["wing_ce_price"] == 28.0
+    assert mtm_series[0]["wing_pe_price"] is None
     assert events[0]["payload"] == {"spot": 22500}
 
 

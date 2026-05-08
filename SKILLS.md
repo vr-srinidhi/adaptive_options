@@ -258,6 +258,42 @@ Delta_PE  = N(d1) - 1
 
 **Replay:** `net_delta` column available in `strategy_run_mtm` → exposed in `mtm_series` payload → yellow delta overlay on Live Monitor chart with threshold bands and DH vertical markers. Net Delta stat card uses three-state color: green (<70% of threshold), orange (70–99%), red (≥100%).
 
+### Live Payoff Chart
+
+A real-time at-expiry P&L visualisation rendered in a Recharts `AreaChart` on the Live Slot card. Shows projected profit/loss across a 1000-point spot range (ATM ± 500) using the at-expiry formula.
+
+**At-expiry formula:**
+```
+SELL leg: pnl = (entry_price − intrinsic(S)) × qty
+BUY  leg: pnl = (intrinsic(S) − entry_price) × qty
+
+intrinsic CE(S) = max(0, S − strike)
+intrinsic PE(S) = max(0, strike − S)
+
+total payoff = Σ pnl across all open legs
+```
+
+**State updates via SSE:**
+
+| Event | Action |
+|-------|--------|
+| `ENTRY` | Adds SELL CE + SELL PE legs. Chart renders tent shape. |
+| `LOCK` | Appends BUY CE + BUY PE wing legs. Chart updates to Iron Butterfly shape. |
+| `MTM` | Re-renders chart with latest spot. Vertical reference line tracks current spot. |
+
+**Gradient fill:** green above zero, red below. Zero-crossing fraction computed as `yDomain[1] / totalSpan` to split the gradient exactly at the P&L zero line.
+
+**Multi-slot isolation:** all leg/wing state stored inside `liveData[sessionId]`. Gradient SVG ID scoped to `payoffGrad-${atm}` to prevent cross-tab rendering conflicts.
+
+**Wing/hedge premium chart fix:** removed `side == "SELL"` filter from `_get_mtm_series()` in `live_paper.py`. BUY wing legs now appear in the CE Premium and PE Premium charts after the delta hedge fires. `_build_slot()` queries all legs and returns them in `run_info.legs` so the payoff chart initialises correctly on page load/refresh.
+
+**SSE broadcast additions:**
+- `ENTRY`: `lot_size`, `approved_lots`
+- `LOCK`: `wing_ce_strike`, `wing_pe_strike`
+- `MTM`: `wing_ce_price`, `wing_pe_price` (null when wings not locked)
+
+See [docs/prd-live-payoff-chart.md](docs/prd-live-payoff-chart.md) for the full PRD.
+
 ---
 
 ## Iron Butterfly Strategy

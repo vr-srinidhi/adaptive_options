@@ -999,6 +999,8 @@ async def _run_session(
                     "pe_price": straddle_entry_prices[1],
                     "entry_credit_total": round(entry_credit_total, 2),
                     "atm_strike": atm_strike,
+                    "lot_size": lot_size,
+                    "approved_lots": approved_lots,
                 })
                 log.info("Live paper: ENTERED straddle at %s CE=%.2f PE=%.2f credit=%.0f",
                          t, straddle_entry_prices[0], straddle_entry_prices[1], entry_credit_total)
@@ -1237,6 +1239,8 @@ async def _run_session(
                         "net_mtm": round(net_mtm, 2),
                         "wing_ce_price": w_ce_price,
                         "wing_pe_price": w_pe_price,
+                        "wing_ce_strike": wing_ce_strike,
+                        "wing_pe_strike": wing_pe_strike,
                     })
                     log.info("Live paper: %s fired at %s net_mtm=%.0f", label, t, net_mtm)
 
@@ -1290,6 +1294,8 @@ async def _run_session(
                 "spot": spot,
                 "ce_price": s_ce_price,
                 "pe_price": s_pe_price,
+                "wing_ce_price": w_ce_price if wings_locked else None,
+                "wing_pe_price": w_pe_price if wings_locked else None,
                 "net_mtm": round(net_mtm, 2),
                 "gross_mtm": round(gross_mtm, 2),
                 "trail_stop_level": trail_stop_level,
