@@ -4,7 +4,7 @@ A production-quality options strategy platform for Nifty 50 and Bank Nifty with 
 
 1. **V2 Workbench** — strategy-agnostic shell for running, replaying, and comparing any supported strategy. Primary UI entry point.
 2. **Generic Strategy Engine** — declarative executor (`generic_v1`) that runs any strategy expressed as a `leg_template + entry_rule + exit_rule`. Powers the Short Straddle, Iron Butterfly, and all future catalog strategies with zero custom code per strategy.
-3. **Live Paper Trading** — self-driving intraday engine (APScheduler, 09:14 IST) running the Short Straddle Dual Lock strategy against live Zerodha data. Opt-in **Delta Hedge Trigger** adds Black-Scholes delta monitoring and automatic OTM wing buys when `|net_delta|` breaches a configurable threshold.
+3. **Live Paper Trading** — self-driving intraday engine (APScheduler, 09:14 IST) running the Short Straddle Dual Lock strategy against live Zerodha data. Opt-in **Delta Hedge Trigger** adds Black-Scholes delta monitoring and automatic OTM wing buys when `|net_delta|` breaches a configurable threshold. Real-time **at-expiry payoff chart** shows the projected P&L curve across spot levels and automatically updates shape when wings/hedges are added.
 4. **4PM Live Data Sync** — daily scheduled job (16:00 IST) that fills the historical warehouse with today's live Zerodha candles (spot, VIX, futures, options) using fill-missing-only logic. Manual trigger available from the UI.
 5. **Synthetic Backtest** — simulates Iron Condor, Bull Put Spread, and Bear Call Spread strategies using deterministic synthetic candle data with auto-regime detection (EMA/RSI/IV Rank).
 6. **Historical Backtest** — batch-runs any registered strategy over real Zerodha candle data stored in a local warehouse. Supports multi-day runs with full per-session audit trails.
@@ -190,6 +190,8 @@ Exit rules:
 When a TRAIL_EXIT fires, realized P&L is locked at the trail stop level (not the candle close, which may gap through the stop).
 
 **Delta Hedge (opt-in)**: Enable via `delta_hedge_enabled: true`. When enabled, Black-Scholes net position delta is computed every refresh cycle using IV from premium inversion (Newton-Raphson) → VIX proxy → fallback constant. When `|net_delta| > delta_threshold` (default 150), a BUY_WING order is simulated on the tested side. Re-arms after delta normalises below `threshold − reentry_buffer`. Up to `max_hedge_triggers` (default 3) per session with a 5-minute cooldown. Delta hedge gross P&L is included in net MTM and final P&L accounting.
+
+**Payoff Chart (live)**: A real-time at-expiry P&L curve displayed on the Live Slot card. Computed across a 1000-point spot range (ATM ± 500) using the `calcPayoffAtExpiry` formula. At entry, the curve is tent-shaped (neutral straddle); when a BUY_WING delta hedge fires, the curve automatically updates to an Iron Butterfly shape with capped downside. CE and PE wing premium charts also populate with live prices once wings are locked. Updated on every SSE MTM tick; isolated per slot tab to prevent cross-slot state bleed.
 
 ### Iron Butterfly (generic_v1)
 
