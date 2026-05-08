@@ -15,6 +15,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+import app.services.live_paper_engine as live_paper_engine
 from app.services.live_paper_engine import (
     _stop_requested,
     _load_resume_state,
@@ -64,6 +65,34 @@ def _make_config(**kw):
     )
     defaults.update(kw)
     return SimpleNamespace(**defaults)
+
+
+class _RecordingSession:
+    added = []
+    executed = []
+    commits = 0
+
+    def add(self, obj):
+        self.__class__.added.append(obj)
+
+    async def execute(self, stmt):
+        self.__class__.executed.append(stmt)
+        return SimpleNamespace(scalar_one_or_none=lambda: None)
+
+    async def commit(self):
+        self.__class__.commits += 1
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *args):
+        return None
+
+
+def _reset_recording_session():
+    _RecordingSession.added = []
+    _RecordingSession.executed = []
+    _RecordingSession.commits = 0
 
 
 # ── Fix 5: stop fires before lock ────────────────────────────────────────────
@@ -341,6 +370,161 @@ def test_live_paper_session_has_unique_constraint():
     assert LivePaperSession.__table_args__ == {}, (
         "LivePaperSession.__table_args__ must be {} after multi-session migration"
     )
+
+
+@pytest.mark.asyncio
+async def test_run_session_resolves_enters_locks_and_time_exits(monkeypatch):
+    """Drive the live engine with a fake clock and quotes, without real sleeps or Zerodha."""
+    from app.models.strategy_run import StrategyRun, StrategyRunLeg
+
+    _reset_recording_session()
+    session_id = uuid.uuid4()
+    updates = []
+    broadcasts = []
+    events = []
+    mtm_writes = []
+
+    class _FakeDateTime(datetime):
+        _ticks = [
+            datetime(2026, 5, 8, 9, 49, tzinfo=live_paper_engine.IST),
+            datetime(2026, 5, 8, 9, 50, tzinfo=live_paper_engine.IST),
+            datetime(2026, 5, 8, 15, 25, tzinfo=live_paper_engine.IST),
+        ]
+
+        @classmethod
+        def now(cls, tz=None):
+            value = cls._ticks.pop(0)
+            return value if tz else value.replace(tzinfo=None)
+
+    async def fake_sleep(_seconds):
+        return None
+
+    async def fake_to_thread(func, *args):
+        return func(*args)
+
+    async def fake_update(sid, **fields):
+        updates.append((sid, fields))
+
+    async def fake_broadcast(sid, data):
+        broadcasts.append((sid, data))
+
+    async def fake_waiting_spot(sid, entry):
+        updates.append((sid, {"waiting_spot": entry}))
+
+    async def fake_event(run_id, ts, event_type, reason_code, payload=None):
+        events.append((run_id, ts, event_type, reason_code, payload or {}))
+
+    async def fake_mtm(*args):
+        mtm_writes.append(args)
+
+    async def fake_stop(_sid):
+        return False
+
+    async def fake_contract_spec(_db, _instrument, _trade_date):
+        return SimpleNamespace(lot_size=75, strike_step=50, estimated_margin_per_lot=250000)
+
+    def fake_instruments(_token):
+        return [
+            {"name": "NIFTY", "instrument_type": "CE", "expiry": date(2026, 5, 14)},
+        ]
+
+    def fake_find_symbol(_instruments, instrument, expiry, option_type, strike):
+        return f"{instrument}:{expiry}:{strike}:{option_type}"
+
+    def fake_quote(symbols, _token):
+        if symbols == ["NSE:NIFTY 50"]:
+            return {"NSE:NIFTY 50": 22500.0}
+        prices = {}
+        for sym in symbols:
+            if sym.endswith(":CE") and ":22600:" in sym:
+                prices[sym] = 12.0
+            elif sym.endswith(":PE") and ":22400:" in sym:
+                prices[sym] = 12.0
+            elif sym.endswith(":CE"):
+                prices[sym] = 50.0 if _FakeDateTime._ticks == [] else 100.0
+            elif sym.endswith(":PE"):
+                prices[sym] = 50.0 if _FakeDateTime._ticks == [] else 100.0
+        return prices
+
+    monkeypatch.setattr(live_paper_engine, "datetime", _FakeDateTime)
+    monkeypatch.setattr(live_paper_engine.asyncio, "sleep", fake_sleep)
+    monkeypatch.setattr(live_paper_engine.asyncio, "to_thread", fake_to_thread)
+    monkeypatch.setattr(live_paper_engine, "AsyncSessionLocal", lambda: _RecordingSession())
+    monkeypatch.setattr(live_paper_engine, "_update_session", fake_update)
+    monkeypatch.setattr(live_paper_engine, "_broadcast", fake_broadcast)
+    monkeypatch.setattr(live_paper_engine, "_append_waiting_spot", fake_waiting_spot)
+    monkeypatch.setattr(live_paper_engine, "_write_event", fake_event)
+    monkeypatch.setattr(live_paper_engine, "_write_mtm", fake_mtm)
+    monkeypatch.setattr(live_paper_engine, "_stop_requested", fake_stop)
+    monkeypatch.setattr(live_paper_engine, "get_contract_spec", fake_contract_spec)
+    monkeypatch.setattr(live_paper_engine, "get_instruments_with_token", fake_instruments)
+    monkeypatch.setattr(live_paper_engine, "find_option_symbol", fake_find_symbol)
+    monkeypatch.setattr(live_paper_engine, "fetch_live_quote", fake_quote)
+
+    config = _make_config(
+        user_id=uuid.uuid4(),
+        capital=500000,
+        entry_time="09:50",
+        params_json={
+            "poll_interval_seconds": 3,
+            "lock_trigger": 1000,
+            "loss_lock_trigger": 1000,
+            "trail_trigger": 0,
+            "trail_pct": 0,
+            "time_exit": "15:25",
+        },
+    )
+
+    await live_paper_engine._run_session(session_id, config, "token")
+
+    assert live_paper_engine.is_session_active(session_id) is False
+    assert any(isinstance(obj, StrategyRun) for obj in _RecordingSession.added)
+    assert len([obj for obj in _RecordingSession.added if isinstance(obj, StrategyRunLeg)]) >= 2
+    assert any(fields.get("status") == "entered" for _sid, fields in updates)
+    assert any(fields.get("lock_status") == "profit_locked" for _sid, fields in updates)
+    assert any(data.get("type") == "DONE" for _sid, data in broadcasts)
+    assert [event[3] for event in events if event[3] in {"ENTRY_SCHEDULED", "WINGS_LOCKED", "TIME_EXIT"}] == [
+        "ENTRY_SCHEDULED",
+        "WINGS_LOCKED",
+        "TIME_EXIT",
+    ]
+    assert mtm_writes and mtm_writes[-1][9] == "TIME_EXIT"
+
+
+@pytest.mark.asyncio
+async def test_write_event_and_mtm_persist_strategy_rows(monkeypatch):
+    from app.models.strategy_run import StrategyLegMtm, StrategyRunEvent, StrategyRunMtm
+
+    _reset_recording_session()
+    monkeypatch.setattr(live_paper_engine, "AsyncSessionLocal", lambda: _RecordingSession())
+    run_id = uuid.uuid4()
+    leg_id = uuid.uuid4()
+    ts = datetime(2026, 5, 8, 10, 0)
+
+    await live_paper_engine._write_event(run_id, ts, "ENTRY", "ENTRY_SCHEDULED", {"spot": 22500})
+    await live_paper_engine._write_mtm(
+        run_id,
+        ts,
+        22500.0,
+        12.5,
+        1500.0,
+        100.0,
+        1400.0,
+        -25.12345,
+        700.0,
+        "TIME_EXIT",
+        [leg_id],
+        [90.0],
+        [100.0],
+        ["SELL"],
+        [0],
+        75,
+        1,
+    )
+
+    assert any(isinstance(obj, StrategyRunEvent) and obj.payload_json == {"spot": 22500} for obj in _RecordingSession.added)
+    assert any(isinstance(obj, StrategyRunMtm) and float(obj.net_delta) == -25.1234 for obj in _RecordingSession.added)
+    assert any(isinstance(obj, StrategyLegMtm) and float(obj.gross_leg_pnl) == 750.0 for obj in _RecordingSession.added)
 
 
 # ── Fix 2: resume loads existing run (not a new one) ─────────────────────────

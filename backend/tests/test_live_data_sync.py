@@ -68,8 +68,14 @@ class _ExecuteResult:
     def scalar_one(self):
         return self._scalar
 
+    def scalar_one_or_none(self):
+        return self._scalar
+
     def scalars(self):
         return _ScalarResult(self._scalars)
+
+    def all(self):
+        return self._scalars
 
 
 class _FakeDb:
@@ -348,3 +354,111 @@ async def test_run_daily_live_data_sync_persists_partial_success_summary(monkeyp
     assert run.notes == "futures unavailable"
     assert db.flushes == 2
     assert db.commits == 1
+
+
+@pytest.mark.asyncio
+async def test_started_run_creation_status_and_today_payload(monkeypatch):
+    trade_date = date(2026, 5, 6)
+    started = SimpleNamespace(
+        id=SimpleNamespace(),
+        trade_date=trade_date,
+        started_at=datetime(2026, 5, 6, 16, 0),
+        completed_at=datetime(2026, 5, 6, 16, 5),
+        triggered_by="manual",
+        token_status=live_data_sync.TOKEN_VALID,
+        status=live_data_sync.STATUS_SUCCESS,
+        spot_rows=376,
+        vix_rows=375,
+        futures_rows=376,
+        options_rows=12000,
+        option_contracts=4,
+        expiries_json=["2026-05-12"],
+        notes="ok",
+        error_message=None,
+    )
+    db = _FakeDb([
+        _ExecuteResult(scalar=None),
+        _ExecuteResult(scalar=started),
+        _ExecuteResult(scalar=started),
+        _ExecuteResult(scalar=SimpleNamespace(backtest_ready=True)),
+    ])
+
+    created = await live_data_sync.create_started_live_data_sync_run(db, trade_date, "manual")
+    assert created.status == live_data_sync.STATUS_STARTED
+    assert db.commits == 1
+    assert await live_data_sync.get_started_live_data_sync_run(db, trade_date) is started
+    payload = await live_data_sync.get_live_data_sync_today(db, trade_date)
+    assert payload["status"] == live_data_sync.STATUS_SUCCESS
+    assert payload["rows"] == {"spot": 376, "vix": 375, "futures": 376, "options": 12000}
+    assert payload["backtest_ready"] is True
+
+
+@pytest.mark.asyncio
+async def test_today_payload_without_run_uses_current_token_status(monkeypatch):
+    trade_date = date(2026, 5, 6)
+
+    async def token_status(_db, requested_date):
+        assert requested_date == trade_date
+        return live_data_sync.TOKEN_EXPIRED
+
+    monkeypatch.setattr(live_data_sync, "current_system_token_status", token_status)
+    db = _FakeDb([_ExecuteResult(scalar=None)])
+
+    payload = await live_data_sync.get_live_data_sync_today(db, trade_date)
+
+    assert payload["status"] == live_data_sync.STATUS_NOT_RUN
+    assert payload["token_status"] == live_data_sync.TOKEN_EXPIRED
+    assert payload["rows"]["spot"] == 0
+
+
+@pytest.mark.asyncio
+async def test_warehouse_counts_and_current_token_status(monkeypatch):
+    trade_date = date(2026, 5, 6)
+    db = _FakeDb([
+        _ExecuteResult(scalars=[date(2026, 5, 12), date(2026, 5, 19)]),
+        _ExecuteResult(scalars=[("2026-05-12", "CE", 22500), ("2026-05-12", "PE", 22500)]),
+        _ExecuteResult(scalar=376),
+        _ExecuteResult(scalar=375),
+        _ExecuteResult(scalar=100),
+        _ExecuteResult(scalar=12000),
+    ])
+
+    counts = await live_data_sync._warehouse_counts(db, trade_date)
+    assert counts["option_contracts"] == 2
+    assert counts["expiries"] == ["2026-05-12", "2026-05-19"]
+    assert counts["options_rows"] == 12000
+
+    async def latest_token(_db):
+        return SimpleNamespace(token_date=trade_date, encrypted_token="encrypted")
+
+    monkeypatch.setattr(live_data_sync, "_latest_zerodha_token", latest_token)
+    monkeypatch.setattr(live_data_sync, "decrypt_token", lambda token: "access-token")
+    assert await live_data_sync.current_system_token_status(_FakeDb(), trade_date) == live_data_sync.TOKEN_VALID
+
+
+@pytest.mark.asyncio
+async def test_run_daily_live_data_sync_records_ingestion_exception(monkeypatch):
+    trade_date = date(2026, 5, 6)
+
+    async def latest_token(_db):
+        return SimpleNamespace(token_date=trade_date, encrypted_token="ok")
+
+    async def to_thread(func, *args):
+        return func(*args)
+
+    async def ingest(*_args, **_kwargs):
+        raise RuntimeError("warehouse unavailable")
+
+    monkeypatch.setattr(live_data_sync, "_latest_zerodha_token", latest_token)
+    monkeypatch.setattr(live_data_sync, "decrypt_token", lambda _token: "access-token")
+    monkeypatch.setattr(live_data_sync, "validate_access_token_with_token", lambda _token: True)
+    monkeypatch.setattr(live_data_sync.asyncio, "to_thread", to_thread)
+    monkeypatch.setattr(live_data_sync, "ingest_live_day", ingest)
+
+    db = _FakeDb()
+    run = await live_data_sync.run_daily_live_data_sync(db, trade_date)
+
+    assert run.status == live_data_sync.STATUS_FAILED
+    assert run.error_message == "warehouse unavailable"
+    assert db.rollbacks == 1
+    assert db.merged == [run]

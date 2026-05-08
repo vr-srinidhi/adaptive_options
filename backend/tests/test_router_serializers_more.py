@@ -72,6 +72,9 @@ class _ExecuteResult:
     def all(self):
         return self._rows
 
+    def scalar(self):
+        return self._scalar
+
 
 class _FakeDb:
     def __init__(self, execute_results=None):
@@ -363,3 +366,131 @@ async def test_live_paper_trigger_data_sync_conflict_and_success(monkeypatch):
     assert result["detail"] == "Live data sync started."
     assert result["status"] == {"status": "STARTED"}
     assert tasks.calls == [(live_paper._run_manual_data_sync_background, (run_id,))]
+
+
+@pytest.mark.asyncio
+async def test_live_paper_config_crud_today_stop_and_streams(monkeypatch):
+    user = SimpleNamespace(id=uuid.uuid4(), is_active=True)
+    cfg = LivePaperConfig(
+        id=uuid.uuid4(),
+        user_id=user.id,
+        label="Default",
+        strategy_id="short_straddle_dual_lock",
+        instrument="NIFTY",
+        capital=Decimal("2500000.00"),
+        entry_time="10:15",
+        params_json={"lock_trigger": 20000},
+        enabled=False,
+        execution_mode="paper",
+    )
+    second = LivePaperConfig(
+        id=uuid.uuid4(),
+        user_id=user.id,
+        label="Second",
+        strategy_id="short_straddle_dual_lock",
+        instrument="NIFTY",
+        capital=Decimal("1000000.00"),
+        entry_time="09:50",
+        params_json={},
+        enabled=True,
+        execution_mode="paper",
+    )
+    session = LivePaperSession(id=uuid.uuid4(), config_id=cfg.id, user_id=user.id, trade_date=date.today(), status="entered")
+
+    async def existing_config(_db, _user):
+        return cfg
+
+    async def sessions_for_date(_db, _trade_date, user_id=None):
+        assert user_id == user.id
+        return [session]
+
+    async def token_status(_db, _user):
+        return "valid"
+
+    async def build_slot(_db, config, slot_session):
+        return {"config": live_paper._serialize_config(config), "session": live_paper._serialize_session(slot_session)}
+
+    monkeypatch.setattr(live_paper, "_get_or_create_config", existing_config)
+    monkeypatch.setattr(live_paper, "get_sessions_for_date", sessions_for_date)
+    monkeypatch.setattr(live_paper, "_token_status", token_status)
+    monkeypatch.setattr(live_paper, "_build_slot", build_slot)
+
+    db = _FakeDb([
+        _ExecuteResult(scalars=[cfg, second]),
+        _ExecuteResult(scalar=cfg),
+        _ExecuteResult(scalar=cfg),
+        _ExecuteResult(scalar=second),
+        _ExecuteResult(scalars=[cfg, second]),
+        _ExecuteResult(scalar=None),
+        _ExecuteResult(scalars=[cfg]),
+    ])
+
+    assert len(await live_paper.list_configs(db, user)) == 2
+    created = await live_paper.create_config(live_paper.ConfigCreate(label="New", entry_time="09:30", params={"trail_trigger": 1}), db, user)
+    assert created["label"] == "New"
+
+    updated = await live_paper.update_config_slot(str(cfg.id), live_paper.ConfigUpdate(label="Updated", params={"loss_lock_trigger": 25000}, enabled=True), db, user)
+    assert updated["label"] == "Updated"
+    assert updated["params"]["loss_lock_trigger"] == 25000
+
+    deleted = await live_paper.delete_config_slot(str(second.id), db, user)
+    assert deleted == {"detail": "Config deleted."}
+    assert db.deleted == [second]
+
+    today = await live_paper.get_today(db, user)
+    assert today["token_status"] == "valid"
+    assert today["slots"][0]["session"]["status"] == "entered"
+
+    stopped = await live_paper.manual_stop(live_paper.StopBody(), _FakeDb(), user)
+    assert stopped == {"detail": "Stop signal sent to 1 session(s)."}
+
+    stream = await live_paper.stream_session(str(uuid.uuid4()), _FakeDb([_ExecuteResult(scalar=None)]), user)
+    chunks = []
+    async for chunk in stream.body_iterator:
+        chunks.append(chunk)
+    assert "NO_SESSION" in chunks[0]
+
+
+@pytest.mark.asyncio
+async def test_live_paper_config_error_and_token_user_paths(monkeypatch):
+    user = SimpleNamespace(id=uuid.uuid4(), is_active=True)
+    cfg = LivePaperConfig(
+        id=uuid.uuid4(),
+        user_id=user.id,
+        label="Default",
+        strategy_id="short_straddle_dual_lock",
+        instrument="NIFTY",
+        capital=Decimal("2500000.00"),
+        entry_time="10:15",
+        params_json={},
+        enabled=False,
+        execution_mode="paper",
+    )
+
+    with pytest.raises(HTTPException) as live_mode:
+        await live_paper.update_config_slot(str(cfg.id), live_paper.ConfigUpdate(execution_mode="live"), _FakeDb([_ExecuteResult(scalar=cfg)]), user)
+    assert live_mode.value.status_code == 422
+
+    with pytest.raises(HTTPException) as missing:
+        await live_paper.delete_config_slot(str(uuid.uuid4()), _FakeDb([_ExecuteResult(scalar=None)]), user)
+    assert missing.value.status_code == 404
+
+    with pytest.raises(HTTPException) as last_slot:
+        await live_paper.delete_config_slot(str(cfg.id), _FakeDb([_ExecuteResult(scalar=cfg), _ExecuteResult(scalars=[cfg])]), user)
+    assert last_slot.value.status_code == 409
+
+    async def existing_config(_db, _user):
+        return cfg
+
+    monkeypatch.setattr(live_paper, "_get_or_create_config", existing_config)
+    updated = await live_paper.update_config(live_paper.ConfigUpdate(instrument="BANKNIFTY", params={"lock_trigger": 1}), _FakeDb(), user)
+    assert updated["instrument"] == "BANKNIFTY"
+    assert updated["params"]["lock_trigger"] == 1
+
+    monkeypatch.setattr(live_paper, "decode_access_token", lambda token: {"sub": str(user.id)})
+    found = await live_paper._get_user_from_token_param("token", _FakeDb([_ExecuteResult(scalar=user)]))
+    assert found.id == user.id
+
+    with pytest.raises(HTTPException) as bad_user:
+        await live_paper._get_user_from_token_param("token", _FakeDb([_ExecuteResult(scalar=None)]))
+    assert bad_user.value.status_code == 401
