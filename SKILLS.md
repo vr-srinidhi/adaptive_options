@@ -223,6 +223,41 @@ ATM = `round(spot_at_entry / strike_step) * strike_step`
 | `TIME_EXIT` | 15:25 |
 | `DATA_GAP_EXIT` | option price stale > 1 minute |
 
+### Delta Hedge (opt-in, Phase 1)
+
+An optional proactive risk layer that monitors net position delta and buys an OTM wing on the tested side when directional skew becomes dangerous — before P&L deteriorates to the Loss Lock level.
+
+**Delta formula:**
+```
+Net Delta = (-1 × Delta_CE × CE_Qty) + (-1 × Delta_PE × PE_Qty)
+d1        = [ln(S/K) + (r + σ²/2) × T] / (σ × √T)   where r = 0.065
+Delta_CE  = N(d1)
+Delta_PE  = N(d1) - 1
+```
+
+**IV source priority:** BS inversion via Newton-Raphson from option premium → India VIX proxy (`VIX/100`) → configurable `default_iv` (12%).
+
+**State machine:** `monitoring → hedged → monitoring` (re-armed when `|delta| < threshold − buffer`) → `exhausted` (after `max_hedge_triggers`).
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `delta_hedge_enabled` | `false` | Master flag — zero overhead when off |
+| `delta_threshold` | 150 | Absolute net delta at which hedge fires |
+| `max_hedge_triggers` | 3 | Max BUY_WING orders per session |
+| `reentry_buffer` | 50 | Delta must normalize before next trigger |
+| `cooldown_minutes` | 5 | Minimum gap between triggers |
+| `default_iv` | 0.12 | Fallback when inversion and VIX fail |
+
+**Guard conditions:** position active, time 09:20–15:20, cooldown elapsed, trigger count < max.
+
+**BUY_WING action:** If net delta < 0 (market rising, CE side tested) → buy CE wing at `ATM + wing_width_steps × strike_step`. Mirror for PE side. Uses same wing strikes as the profit/loss lock wings.
+
+**Accounting:** delta hedge gross P&L (`Σ (last_price − entry_price) × qty`) added to `gross_mtm`; `delta_hedge_charges` deducted from `net_mtm`. Hedge legs persisted as `StrategyRunLeg` rows and included in exit charge calculation.
+
+**Event codes:** `DELTA_HEDGE_TRIGGERED`, `DELTA_HEDGE_EXECUTED`, `DELTA_HEDGE_FAILED`, `DELTA_NEUTRAL_RESTORED`, `DELTA_HEDGE_EXHAUSTED`.
+
+**Replay:** `net_delta` column available in `strategy_run_mtm` → exposed in `mtm_series` payload → yellow delta overlay on Live Monitor chart with threshold bands and DH vertical markers. Net Delta stat card uses three-state color: green (<70% of threshold), orange (70–99%), red (≥100%).
+
 ---
 
 ## Iron Butterfly Strategy
@@ -535,6 +570,7 @@ This is why IV Rank drives strategy selection — you want to sell premium when 
 | Backend | pytest | `test_generic_executor.py` | `validate_run` (7 tests) + `execute_run` (6 tests) via async fake DB and service patches |
 | Backend | pytest | `test_strategy_replay_serializer.py` | 19 tests: CE/PE MTM grouping, MFE/MAE/drawdown, VIX forward-fill + source tagging, spot OHLC completeness, data quality warnings, legs shape (lots/lot_size), payload regression |
 | Backend | pytest | `test_iron_butterfly_*.py` | 8 tests: catalog entry, config-driven wing offsets, 4-leg CE/PE MTM grouping (SELL+BUY per type), mixed BUY/SELL MTM signs, defined-risk margin sizing, mixed-leg entry/exit/round-trip charges, 9-section CSV with 4 contracts |
+| Backend | pytest | `test_delta_hedge.py` | 5 tests: settings defaults (disabled), nested PRD schema parsing, IV round-trip from BS price, short straddle net delta direction on rally, long CE delta offsetting negative position delta |
 | Frontend | Vitest | `TopNav.test.jsx` | Primary + legacy nav links, workbench visibility rules, active state |
 | Frontend | Vitest | `Backtest.test.jsx` | Form, API call, loading state |
 | Frontend | Vitest | `Dashboard.test.jsx` | Data render, navigation, empty/error states |
