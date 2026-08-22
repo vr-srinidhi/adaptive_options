@@ -272,6 +272,9 @@ async def _build_slot(db: AsyncSession, cfg: LivePaperConfig, session: Optional[
                         "option_type": l.option_type,
                         "strike":      l.strike,
                         "entry_price": float(l.entry_price) if l.entry_price else None,
+                        # Delta hedge legs can be smaller than the straddle, so the
+                        # payoff chart must weight each leg by its own quantity.
+                        "quantity":    int(l.quantity) if l.quantity else None,
                     }
                     for l in all_legs if l.entry_price is not None
                 ],

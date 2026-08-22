@@ -171,12 +171,15 @@ function MtmChart({ data, entryTs, exitTs, deltaThreshold, deltaMarkers = [] }) 
 function calcPayoffAtExpiry(legs, spot, qty) {
   return legs.reduce((sum, leg) => {
     if (leg.entry_price == null) return sum
+    // Delta hedge legs can be smaller than the straddle, so prefer the leg's own
+    // quantity. Falling back to the full size keeps older sessions rendering.
+    const legQty = leg.quantity ?? qty
     const intrinsic = leg.option_type === 'CE'
       ? Math.max(0, spot - leg.strike)
       : Math.max(0, leg.strike - spot)
     return sum + (leg.side === 'SELL'
-      ? (leg.entry_price - intrinsic) * qty
-      : (intrinsic - leg.entry_price) * qty)
+      ? (leg.entry_price - intrinsic) * legQty
+      : (intrinsic - leg.entry_price) * legQty)
   }, 0)
 }
 
@@ -1124,7 +1127,10 @@ export default function LivePaperMonitor() {
           }}
         }
         case 'DELTA_HEDGE': {
-          const hedgeLeg = { side: 'BUY', option_type: data.option_type, strike: data.strike, entry_price: data.price }
+          const hedgeLeg = {
+            side: 'BUY', option_type: data.option_type, strike: data.strike,
+            entry_price: data.price, quantity: data.quantity ?? null,
+          }
           return { ...prev, [sessionId]: {
             ...existing,
             session: {

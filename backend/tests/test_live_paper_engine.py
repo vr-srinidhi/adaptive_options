@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import uuid
-from datetime import date, datetime, time
+from datetime import date, datetime, time, timedelta
 from types import SimpleNamespace
 from typing import Optional
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -417,8 +417,10 @@ async def test_run_session_resolves_enters_locks_and_time_exits(monkeypatch):
         return SimpleNamespace(lot_size=75, strike_step=50, estimated_margin_per_lot=250000)
 
     def fake_instruments(_token):
+        # The engine resolves against date.today(), so keep the expiry relative
+        # or this test only passes during the week it was written.
         return [
-            {"name": "NIFTY", "instrument_type": "CE", "expiry": date(2026, 5, 14)},
+            {"name": "NIFTY", "instrument_type": "CE", "expiry": date.today() + timedelta(days=6)},
         ]
 
     def fake_find_symbol(_instruments, instrument, expiry, option_type, strike):

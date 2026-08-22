@@ -201,3 +201,123 @@ async def test_execute_run_no_spot_data_returns_no_trade(monkeypatch):
     assert result.status == "no_trade"
     assert result.exit_reason == "NO_SPOT_DATA"
     assert result.realized_net_pnl is None
+
+
+# ── Delta hedge sizing ────────────────────────────────────────────────────────
+
+def _hedge_config(**overrides):
+    """Dual-lock config with the delta hedge armed and locks pushed out of reach,
+    so a test isolates hedge behaviour."""
+    values = _config(
+        delta_hedge_enabled=True,
+        delta_threshold=150,
+        lock_trigger=10_000_000,
+        loss_lock_trigger=10_000_000,
+        stop_capital_pct=0.9,
+    )
+    values.update(overrides)
+    return values
+
+
+def _hedge_market():
+    """Spot rallies hard after entry so the short straddle builds negative delta
+    and the CE side gets tested."""
+    spot = _spot((9, 50, 22500), (9, 55, 22800), (15, 25, 22800))
+    index = _index([
+        (22500, "CE", 9, 50, 100), (22500, "PE", 9, 50, 100),
+        (22600, "CE", 9, 50, 40),  (22400, "PE", 9, 50, 40),
+        (22500, "CE", 9, 55, 320), (22500, "PE", 9, 55, 15),
+        (22600, "CE", 9, 55, 240), (22400, "PE", 9, 55, 8),
+        (22500, "CE", 15, 25, 300), (22500, "PE", 15, 25, 10),
+        (22600, "CE", 15, 25, 210), (22400, "PE", 15, 25, 5),
+    ])
+    return spot, index
+
+
+@pytest.mark.asyncio
+async def test_delta_hedge_sizes_to_the_imbalance_not_full_position(monkeypatch):
+    db = _FakeDb()
+    spot, index = _hedge_market()
+    await _patch_common_loaders(monkeypatch, spot, index)
+
+    result = await executor.execute_run(
+        db, uuid.uuid4(), _strategy(), _hedge_config(),
+        _validation(approved_lots=13),
+    )
+
+    assert result.status == "completed"
+    hedge_legs = [
+        leg for leg in db.added
+        if isinstance(leg, StrategyRunLeg) and leg.side == "BUY" and leg.entry_timestamp is not None
+    ]
+    assert hedge_legs, "expected the delta hedge to fire on a 300-point rally"
+    hedge = hedge_legs[0]
+    # The whole point: strictly smaller than the 13-lot straddle it protects.
+    assert 0 < hedge.quantity < 13 * 75
+    assert hedge.quantity % 75 == 0
+    assert hedge.leg_index >= 4
+
+
+@pytest.mark.asyncio
+async def test_full_mode_still_hedges_with_the_whole_position(monkeypatch):
+    db = _FakeDb()
+    spot, index = _hedge_market()
+    await _patch_common_loaders(monkeypatch, spot, index)
+
+    result = await executor.execute_run(
+        db, uuid.uuid4(), _strategy(), _hedge_config(hedge_qty_mode="FULL"),
+        _validation(approved_lots=13),
+    )
+
+    assert result.status == "completed"
+    hedge_legs = [
+        leg for leg in db.added
+        if isinstance(leg, StrategyRunLeg) and leg.side == "BUY" and leg.entry_timestamp is not None
+    ]
+    assert hedge_legs
+    assert hedge_legs[0].quantity == 13 * 75
+
+
+@pytest.mark.asyncio
+async def test_delta_hedge_is_ignored_for_other_strategies_on_this_executor(monkeypatch):
+    """short_straddle_profit_lock shares this executor but never offers the hedge."""
+    db = _FakeDb()
+    spot, index = _hedge_market()
+    await _patch_common_loaders(monkeypatch, spot, index)
+
+    strategy = {**_strategy(), "id": "short_straddle_profit_lock"}
+    result = await executor.execute_run(
+        db, uuid.uuid4(), strategy, _hedge_config(), _validation(approved_lots=13),
+    )
+
+    assert result.status == "completed"
+    assert not [
+        leg for leg in db.added
+        if isinstance(leg, StrategyRunLeg) and leg.side == "BUY" and leg.entry_timestamp is not None
+    ]
+    assert not [
+        e for e in db.added
+        if isinstance(e, StrategyRunEvent) and e.event_type == "DELTA_HEDGE"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_stop_exit_wins_over_delta_hedge_on_the_same_minute(monkeypatch):
+    """Regression: the backtest used to buy a hedge wing on the minute it stopped
+    out, because STOP_EXIT was evaluated after the hedge block."""
+    db = _FakeDb()
+    spot, index = _hedge_market()
+    await _patch_common_loaders(monkeypatch, spot, index)
+
+    # 0.1% of 25L = Rs2,500 — the 22500 CE running 100 -> 320 blows through it.
+    result = await executor.execute_run(
+        db, uuid.uuid4(), _strategy(),
+        _hedge_config(stop_capital_pct=0.001),
+        _validation(approved_lots=13),
+    )
+
+    assert result.exit_reason == "STOP_EXIT"
+    assert not [
+        e for e in db.added
+        if isinstance(e, StrategyRunEvent) and e.reason_code == "DELTA_HEDGE_EXECUTED"
+    ]

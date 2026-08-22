@@ -47,7 +47,8 @@ def _run(**kwargs):
     return SimpleNamespace(**defaults)
 
 
-def _leg(leg_index, side, option_type, strike, entry_price, exit_price, gross_leg_pnl):
+def _leg(leg_index, side, option_type, strike, entry_price, exit_price, gross_leg_pnl,
+         quantity=150):
     return SimpleNamespace(
         id=uuid4(),
         leg_index=leg_index,
@@ -55,7 +56,7 @@ def _leg(leg_index, side, option_type, strike, entry_price, exit_price, gross_le
         option_type=option_type,
         strike=strike,
         expiry_date=date(2026, 4, 10),
-        quantity=150,
+        quantity=quantity,
         entry_price=Decimal(str(entry_price)),
         exit_price=Decimal(str(exit_price)),
         gross_leg_pnl=Decimal(str(gross_leg_pnl)),
@@ -323,12 +324,26 @@ def test_spot_series_full_includes_ohlc():
 
 def test_legs_include_lots_and_lot_size():
     run = _run(approved_lots=3, lot_size=75)
-    leg = _leg(0, "SELL", "CE", 23000, 100, 80, 3000)
+    leg = _leg(0, "SELL", "CE", 23000, 100, 80, 3000, quantity=225)
     payload = strategy_run_replay_payload(run, [leg], [], [], [])
     leg_row = payload["legs"][0]
     assert leg_row["lots"] == 3
     assert leg_row["lot_size"] == 75
-    assert leg_row["quantity"] == 150  # from _leg fixture
+    assert leg_row["quantity"] == 225
+
+
+def test_leg_lots_derive_from_quantity_not_run_size():
+    """A delta hedge can be smaller than the run's approved_lots; the legs table
+    must not report the two inconsistently."""
+    run = _run(approved_lots=13, lot_size=75)
+    straddle = _leg(0, "SELL", "CE", 23000, 100, 80, 3000, quantity=13 * 75)
+    hedge    = _leg(4, "BUY", "PE", 22900, 110, 65, -4000, quantity=4 * 75)
+
+    payload = strategy_run_replay_payload(run, [straddle, hedge], [], [], [])
+
+    assert payload["legs"][0]["lots"] == 13
+    assert payload["legs"][1]["lots"] == 4
+    assert payload["legs"][1]["quantity"] == 300
 
 
 def test_legs_include_expiry_date():

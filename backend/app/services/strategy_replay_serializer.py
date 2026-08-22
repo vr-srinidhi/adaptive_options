@@ -69,7 +69,12 @@ def strategy_run_replay_payload(
             "strike":       leg.strike,
             "expiry_date":  leg.expiry_date.isoformat() if leg.expiry_date else None,
             "quantity":     leg.quantity,
-            "lots":         run.approved_lots,
+            # Derive from the leg's own quantity: a delta hedge can be smaller
+            # than the run's approved_lots, and the two must not disagree.
+            "lots":         (
+                int(leg.quantity) // int(run.lot_size)
+                if leg.quantity and run.lot_size else run.approved_lots
+            ),
             "lot_size":     run.lot_size,
             "entry_price":     float(leg.entry_price) if leg.entry_price is not None else None,
             "exit_price":      float(leg.exit_price)  if leg.exit_price  is not None else None,
