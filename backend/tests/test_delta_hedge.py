@@ -235,14 +235,3 @@ def test_low_delta_wing_yields_zero_lots_and_is_flagged_unhedgeable():
 
     assert lots == 0
     assert is_hedgeable_delta(-0.009) is False   # so callers say LOW_DELTA, not UNDERSIZED
-
-
-def test_both_engines_size_identically_for_the_same_inputs():
-    """Live and backtest must agree, or replays stop predicting live. Both call
-    this one helper -- pin that they resolve to the same object."""
-    from app.services import live_paper_engine, straddle_adjustment_executor
-
-    assert live_paper_engine.hedge_lots_for_delta is hedge_lots_for_delta
-    assert straddle_adjustment_executor.hedge_lots_for_delta is hedge_lots_for_delta
-    assert live_paper_engine.is_hedgeable_delta is is_hedgeable_delta
-    assert straddle_adjustment_executor.is_hedgeable_delta is is_hedgeable_delta

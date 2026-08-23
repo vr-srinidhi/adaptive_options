@@ -668,7 +668,11 @@ async def _run_session(
         delta_hedge_status    = "off" if not delta_settings.enabled else "monitoring"
         delta_hedge_count     = 0
         delta_reentry_armed   = True
-        undersized_logged     = False
+        # Once-per-episode diagnostic throttles, one per cause. In-memory only:
+        # a crash resume mid-episode re-emits that episode's note once. Accepted —
+        # see "Scope of the guarantee" in docs/delta-hedge-sizing-spec.md.
+        undersized_logged     = False   # gap < 1 lot
+        low_delta_logged      = False   # wing has ~no delta
         wing_unavailable_logged = False
         last_delta_hedge_ts: Optional[datetime] = None
         last_net_delta: Optional[float] = None
@@ -1133,6 +1137,7 @@ async def _run_session(
                     # that branch never opens after a skip-only episode and the
                     # once-per-episode notes would degrade to once-per-session.
                     undersized_logged = False
+                    low_delta_logged = False
                     wing_unavailable_logged = False
                     if not delta_reentry_armed:
                         delta_reentry_armed = True
@@ -1202,22 +1207,25 @@ async def _run_session(
                     elif hedge_lots <= 0:
                         # Two very different causes, and the wrong label here sends
                         # someone debugging in exactly the wrong direction.
+                        # The two causes are opposites and each gets its own
+                        # throttle: one must not suppress the other inside the
+                        # same episode.
                         hedgeable = is_hedgeable_delta(hedge_unit_delta)
-                        if not undersized_logged:
-                            undersized_logged = True
+                        already = undersized_logged if hedgeable else low_delta_logged
+                        if not already:
                             if hedgeable:
-                                code = "DELTA_HEDGE_SKIPPED_UNDERSIZED"
-                                text_delta = None
+                                undersized_logged = True
                             else:
-                                code = "DELTA_HEDGE_SKIPPED_LOW_DELTA"
-                                text_delta = hedge_unit_delta
+                                low_delta_logged = True
                             await _write_event(
-                                run_id, now, "DELTA_HEDGE", code,
+                                run_id, now, "DELTA_HEDGE",
+                                "DELTA_HEDGE_SKIPPED_UNDERSIZED" if hedgeable
+                                else "DELTA_HEDGE_SKIPPED_LOW_DELTA",
                                 payload={
                                     "net_delta": net_delta,
                                     "strike": hedge_strike,
                                     "option_type": tested_type,
-                                    "unit_delta": text_delta if text_delta is not None else hedge_unit_delta,
+                                    "unit_delta": hedge_unit_delta,
                                     "reason": (
                                         "Imbalance smaller than one lot; hedging would overshoot."
                                         if hedgeable else
@@ -1260,7 +1268,11 @@ async def _run_session(
                     delta_reentry_armed = False
                     delta_hedge_status = "hedged"
                     last_delta_hedge_ts = now
-                    net_delta = _compute_net_delta(now, spot, vix, straddle_cur, wing_cur) or net_delta
+                    # `or` would treat an exactly-neutral 0.0 as missing and
+                    # report the old breached delta instead. Only None is missing.
+                    _post = _compute_net_delta(now, spot, vix, straddle_cur, wing_cur)
+                    if _post is not None:
+                        net_delta = _post
                     last_net_delta = net_delta
 
                     async with AsyncSessionLocal() as db:

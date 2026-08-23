@@ -299,6 +299,9 @@ async def test_delta_hedge_is_ignored_for_other_strategies_on_this_executor(monk
         e for e in db.added
         if isinstance(e, StrategyRunEvent) and e.event_type == "DELTA_HEDGE"
     ]
+    # ...and the caller is told its config was ignored, rather than the run
+    # quietly looking like a normal unhedged result.
+    assert any("only supported on short_straddle_dual_lock" in w for w in result.warnings)
 
 
 @pytest.mark.asyncio
@@ -430,3 +433,46 @@ async def test_skip_note_is_logged_once_per_episode_not_once_per_session(monkeyp
         f"{codes.count('DELTA_HEDGE_SKIPPED_LOW_DELTA')} -- the re-arm reset is "
         "probably trapped inside the `not delta_reentry_armed` guard"
     )
+
+
+@pytest.mark.asyncio
+async def test_persisted_hedge_size_matches_the_sizing_helper(monkeypatch):
+    """Behavioural parity: the quantity the executor actually writes must equal
+    what `hedge_lots_for_delta` returns for the same inputs, recomputed here
+    independently from the events the engine itself recorded.
+
+    Asserting the two modules imported the same symbol is near-tautological; the
+    divergence that actually bit us last round was a caller passing different
+    arguments, which only a check at this level catches.
+    """
+    from app.services.delta_hedge import hedge_lots_for_delta
+
+    db = _FakeDb()
+    spot, index = _hedge_market()
+    await _patch_common_loaders(monkeypatch, spot, index)
+
+    result = await executor.execute_run(
+        db, uuid.uuid4(), _strategy(), _hedge_config(), _validation(approved_lots=13),
+    )
+    assert result.status == "completed"
+
+    events = [e for e in db.added if isinstance(e, StrategyRunEvent)]
+    triggered = next(e for e in events if e.reason_code == "DELTA_HEDGE_TRIGGERED")
+    executed  = next(e for e in events if e.reason_code == "DELTA_HEDGE_EXECUTED")
+    hedge_leg = next(l for l in db.added
+                     if isinstance(l, StrategyRunLeg) and l.leg_index >= 4)
+
+    # Pre-hedge delta comes from TRIGGERED; EXECUTED carries the post-hedge one.
+    expected_lots = hedge_lots_for_delta(
+        net_delta=triggered.payload_json["net_delta"],
+        option_delta=executed.payload_json["unit_delta"],
+        lot_size=75,
+        max_lots=13,
+        mode="PARTIAL",
+    )
+
+    assert expected_lots > 0, "fixture should breach hard enough to need a hedge"
+    assert executed.payload_json["lots"] == expected_lots
+    assert hedge_leg.quantity == 75 * expected_lots
+    # And the sizing genuinely did its job: strictly smaller than the straddle.
+    assert hedge_leg.quantity < 13 * 75

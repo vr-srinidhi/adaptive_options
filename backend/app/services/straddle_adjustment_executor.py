@@ -142,6 +142,13 @@ async def execute_run(
     # pin it off there rather than relying on config discipline.
     if strategy.get("id") != _DELTA_HEDGE_STRATEGY_ID and delta_settings.enabled:
         delta_settings = replace(delta_settings, enabled=False)
+        # Surface it the way live does, so a misconfigured replay doesn't read
+        # as a normal unhedged result.
+        warnings.append(
+            f"Delta hedge requested but only supported on {_DELTA_HEDGE_STRATEGY_ID}; disabled for this run"
+        )
+        log.warning("Delta hedge requested for %s but only supported on %s — disabled",
+                    strategy.get("id"), _DELTA_HEDGE_STRATEGY_ID)
 
     entry_rule = get_entry_rule(strategy.get("entry_rule_id", "timed_entry"))
 
@@ -195,7 +202,8 @@ async def execute_run(
     delta_hedge_status    = "off" if not delta_settings.enabled else "monitoring"
     delta_hedge_count     = 0
     delta_reentry_armed   = True
-    undersized_logged     = False
+    undersized_logged     = False   # gap < 1 lot
+    low_delta_logged      = False   # wing has ~no delta
     wing_unavailable_logged = False
     last_delta_hedge_ts:  Optional[datetime] = None
     last_net_delta:       Optional[float] = None
@@ -390,6 +398,7 @@ async def execute_run(
                 # hedge armed, so that branch never opens after a skip-only episode
                 # and the once-per-episode notes degrade to once-per-session.
                 undersized_logged = False
+                low_delta_logged = False
                 wing_unavailable_logged = False
             if not delta_reentry_armed and abs_delta <= safe_level:
                 delta_reentry_armed = True
@@ -466,9 +475,15 @@ async def execute_run(
                 elif hedge_lots <= 0:
                     # Two very different causes; the wrong label sends whoever reads
                     # this event in exactly the wrong direction.
+                    # The two causes are opposites and each gets its own throttle:
+                    # one must not suppress the other inside the same episode.
                     hedgeable = is_hedgeable_delta(hedge_unit_delta)
-                    if not undersized_logged:
-                        undersized_logged = True
+                    already = undersized_logged if hedgeable else low_delta_logged
+                    if not already:
+                        if hedgeable:
+                            undersized_logged = True
+                        else:
+                            low_delta_logged = True
                         event_rows.append({
                             "run_id": run_id, "timestamp": ts,
                             "event_type": "DELTA_HEDGE",
@@ -527,7 +542,11 @@ async def execute_run(
                 delta_reentry_armed = False
                 delta_hedge_status = "hedged"
                 last_delta_hedge_ts = ts
-                net_delta = _compute_net_delta(ts, spot_close, vix_close, straddle_cur, wing_cur) or net_delta
+                # `or` would treat an exactly-neutral 0.0 as missing and report
+                # the old breached delta instead. Only None is missing.
+                _post = _compute_net_delta(ts, spot_close, vix_close, straddle_cur, wing_cur)
+                if _post is not None:
+                    net_delta = _post
                 last_net_delta = net_delta
                 event_rows.append({
                     "run_id": run_id, "timestamp": ts,

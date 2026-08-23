@@ -67,7 +67,9 @@ Three conditions cause the hedge not to proceed. None of them consumes a trigger
 
 The last two are opposite conditions and must not share a label: a near-zero-delta wing would *under*shoot by a wide margin (at `|d| = 0.009` and a 200 delta gap, neutrality needs ~297 lots), whereas a sub-one-lot gap would *over*shoot. `is_hedgeable_delta()` classifies which occurred so both engines emit the same code.
 
-**Episode boundary.** The once-per-episode counters reset whenever `|net_delta|` falls back to `safe_level`, deliberately **outside** the `not delta_reentry_armed` branch. A skip leaves the hedge armed by design, so a reset placed inside that branch would never run after a skip-only episode and the notes would silently degrade to once per session.
+**Episode boundary.** The once-per-episode counters reset whenever `|net_delta|` falls back to `safe_level`, deliberately **outside** the `not delta_reentry_armed` branch. A skip leaves the hedge armed by design, so a reset placed inside that branch would never run after a skip-only episode and the notes would silently degrade to once per session. Each cause carries its own counter, so a `LOW_DELTA` note cannot suppress an `UNDERSIZED` one later in the same episode.
+
+**Scope of the guarantee: an uninterrupted engine run.** The counters are in-memory and `_load_resume_state()` does not restore them. If the live engine restarts mid-episode while the condition still holds, the first resumed tick re-emits that episode's note even though `|net_delta|` never crossed back through `safe_level`. Deliberately not fixed: these are diagnostic events with no P&L effect, and persisting throttle state (or replaying the event log on resume) is more machinery than one duplicate row per restart justifies. Revisit if resume frequency ever makes it noisy.
 
 `DELTA_HEDGE_TRIGGERED` is emitted only for hedges that actually proceed, so the event log no longer implies an action that never happened.
 
@@ -147,11 +149,12 @@ The robust claim is the risk profile: comparable return at 2.8× the return-per-
 
 ## Testing
 
-`cd backend && python -m pytest tests/ -v` → **550 passing** (main: 368 passing, 1 failing).
+`cd backend && python -m pytest tests/ -v` → **551 passing** (main: 368 passing, 1 failing).
 
 - `test_delta_hedge.py` — sizing, no mocks. The no-sign-flip guarantee is parametrised across **all three** inputs (gap × `option_delta` × `lot_size`, 160 combinations) rather than one slice, since flooring is a property of all of them. Plus the 12 Aug reconstruction, CE/PE symmetry, `max_lots` clamp, `FULL` passthrough, unit-vs-position delta consistency, the `is_hedgeable_delta` classifier, and a proof that a sub-one-lot result is unreachable whenever `delta_threshold >= lot_size`.
 - `test_straddle_adjustment_executor_more.py` — 7 executor cases: hedge leg strictly smaller than the straddle, `FULL` still buys all 13, other strategies on this executor never hedge, a regression pinning stop-before-hedge, and three covering the no-op paths — that a skip consumes no trigger and does not disarm, that a missing wing quote is logged once rather than per candle, and that **two separate breach episodes produce two notes**.
-- Both engines are pinned to resolve to the same `hedge_lots_for_delta` and `is_hedgeable_delta`, so replays cannot silently diverge from live on sizing.
+- `test_shadow_mtm.py` — new. `_compute_shadow_mtm` previously had **no coverage at all**, which is how a mechanical refactor inverted every shadow curve: the per-leg loop was converted to attribute access while the price lookup kept reading names leaked from an earlier positional loop, so every leg was priced with the last leg's quote. The test uses a 3-leg book with distinct prices per strike and fails if any leg borrows another's.
+- Behavioural engine parity: `test_persisted_hedge_size_matches_the_sizing_helper` recomputes the expected lots from the engine's own `TRIGGERED`/`EXECUTED` events and asserts the persisted `StrategyRunLeg.quantity` matches. An earlier version only asserted both modules imported the same symbol, which is near-tautological — the divergence that actually occurred was a caller passing different arguments.
 
 The per-episode and throttling tests were **mutation-verified**: reverting each fix in turn makes the corresponding test fail, which an earlier draft of the per-episode test did not.
 - `test_strategy_replay_serializer.py` — leg `lots` derived from quantity, not run size.

@@ -130,7 +130,7 @@ Chart header: **Payoff at Expiry** with a grey subtitle showing the spot range (
 
 1. On a session with no active trade, the payoff chart is not shown.
 2. After ENTRY fires, a tent-shaped curve appears centred at the ATM strike.
-3. After a BUY_WING delta hedge fires (LOCK event), the curve updates to the capped Iron Butterfly shape.
+3. After the lock wings are bought (LOCK event), the curve updates to the capped Iron Butterfly shape. A BUY_WING delta hedge is sized to the delta gap and is usually smaller than the straddle, so it caps only its own share of the tail; the chart weights every leg by its own `quantity` rather than assuming full size.
 4. On every MTM tick, the current spot is marked on the x-axis with a vertical reference line.
 5. The at-expiry P&L zero line is clearly visible on the y-axis.
 6. Wing leg prices appear in the CE Premium and PE Premium charts after LOCK fires.

@@ -867,22 +867,22 @@ async def _compute_shadow_mtm(db: AsyncSession, run_row, legs) -> list:
 
     # Option candles after exit, keyed (strike, opt_type, ts) -> price
     option_prices: dict = {}
-    for side, opt_type, strike, expiry, _, _ in leg_info:
+    for leg in leg_info:
         rows = (await db.execute(
             select(OptionsCandle)
             .where(
                 OptionsCandle.symbol == run_row.instrument,
                 OptionsCandle.trade_date == run_row.trade_date,
-                OptionsCandle.expiry_date == expiry,
-                OptionsCandle.strike == strike,
-                OptionsCandle.option_type == opt_type,
+                OptionsCandle.expiry_date == leg.expiry_date,
+                OptionsCandle.strike == leg.strike,
+                OptionsCandle.option_type == leg.option_type,
                 OptionsCandle.timestamp > exit_dt,
                 OptionsCandle.timestamp <= sq_dt,
             )
             .order_by(OptionsCandle.timestamp)
         )).scalars().all()
         for row in rows:
-            option_prices[(strike, opt_type, row.timestamp)] = float(row.close)
+            option_prices[(leg.strike, leg.option_type, row.timestamp)] = float(row.close)
 
     _SHADOW_MAX_STALE = 1  # same bound as executor _MAX_STALE_MINUTES
     shadow: list = []
@@ -893,7 +893,7 @@ async def _compute_shadow_mtm(db: AsyncSession, run_row, legs) -> list:
         cur: dict = {}
         for leg in leg_info:
             key = (leg.strike, leg.option_type)
-            p = option_prices.get((strike, opt_type, ts))
+            p = option_prices.get((leg.strike, leg.option_type, ts))
             if p is not None:
                 cur[key] = p
                 last_prices[key] = p
