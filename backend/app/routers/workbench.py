@@ -4,7 +4,7 @@ import asyncio
 import uuid
 from collections import defaultdict
 from datetime import date
-from typing import Any, Optional
+from typing import Any, NamedTuple, Optional
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Request
 from pydantic import BaseModel, Field
@@ -799,6 +799,17 @@ async def get_run_detail(
     raise HTTPException(status_code=404, detail="Unsupported run kind.")
 
 
+class _ShadowLeg(NamedTuple):
+    """One leg of a shadow-MTM reconstruction. `lots` is per-leg: a delta hedge
+    can be smaller than the straddle it protects."""
+    side: str
+    option_type: str
+    strike: int
+    expiry_date: date
+    entry_price: float
+    lots: int
+
+
 async def _compute_shadow_mtm(db: AsyncSession, run_row, legs) -> list:
     """
     Hypothetical MTM from exit_time → 15:25 using actual entry prices.
@@ -827,15 +838,16 @@ async def _compute_shadow_mtm(db: AsyncSession, run_row, legs) -> list:
     # Each leg carries its own lot count: a delta hedge can be smaller than the
     # straddle, so the shadow curve must not weight it as full protection.
     leg_info = [
-        (l.side, l.option_type, l.strike, l.expiry_date, float(l.entry_price),
-         (int(l.quantity) // lot_size) if l.quantity else approved_lots)
+        _ShadowLeg(l.side, l.option_type, l.strike, l.expiry_date, float(l.entry_price),
+                   (int(l.quantity) // lot_size) if l.quantity else approved_lots)
         for l in legs if l.entry_price is not None
     ]
-    charge_legs = [(side, opt_type, strike) for side, opt_type, strike, _, _, _ in leg_info]
-    entry_prices = [ep for _, _, _, _, ep, _ in leg_info]
+    charge_legs  = [(l.side, l.option_type, l.strike) for l in leg_info]
+    entry_prices = [l.entry_price for l in leg_info]
+    leg_lots     = [l.lots for l in leg_info]
     entry_charges = sum(
         compute_leg_entry_charges(lots, lot_size, [leg], [ep])
-        for leg, ep, lots in zip(charge_legs, entry_prices, [l[5] for l in leg_info])
+        for leg, ep, lots in zip(charge_legs, entry_prices, leg_lots)
     )
 
     # Spot candles after exit
@@ -879,8 +891,8 @@ async def _compute_shadow_mtm(db: AsyncSession, run_row, legs) -> list:
     for spot_row in spot_rows:
         ts = spot_row.timestamp
         cur: dict = {}
-        for side, opt_type, strike, _, _, _ in leg_info:
-            key = (strike, opt_type)
+        for leg in leg_info:
+            key = (leg.strike, leg.option_type)
             p = option_prices.get((strike, opt_type, ts))
             if p is not None:
                 cur[key] = p
@@ -895,14 +907,16 @@ async def _compute_shadow_mtm(db: AsyncSession, run_row, legs) -> list:
             continue  # skip minutes with missing/stale data
 
         gross_mtm_total = sum(
-            ((ep - cur[(strike, opt_type)]) if side == "SELL" else (cur[(strike, opt_type)] - ep))
-            * lot_size * lots
-            for side, opt_type, strike, _, ep, lots in leg_info
+            ((l.entry_price - cur[(l.strike, l.option_type)])
+             if l.side == "SELL" else
+             (cur[(l.strike, l.option_type)] - l.entry_price))
+            * lot_size * l.lots
+            for l in leg_info
         )
-        cur_prices = [cur[(strike, opt_type)] for _, opt_type, strike, _, _, _ in leg_info]
+        cur_prices = [cur[(l.strike, l.option_type)] for l in leg_info]
         est_exit = sum(
             compute_leg_exit_charges_estimate(lots, lot_size, [leg], [cp])
-            for leg, cp, lots in zip(charge_legs, cur_prices, [l[5] for l in leg_info])
+            for leg, cp, lots in zip(charge_legs, cur_prices, leg_lots)
         )
         net_mtm  = gross_mtm_total - entry_charges - est_exit
         shadow.append({"timestamp": ts.isoformat(), "net_mtm": round(net_mtm, 2)})

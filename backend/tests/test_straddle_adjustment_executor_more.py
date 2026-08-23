@@ -321,3 +321,112 @@ async def test_stop_exit_wins_over_delta_hedge_on_the_same_minute(monkeypatch):
         e for e in db.added
         if isinstance(e, StrategyRunEvent) and e.reason_code == "DELTA_HEDGE_EXECUTED"
     ]
+
+
+@pytest.mark.asyncio
+async def test_low_delta_wing_skip_does_not_consume_a_trigger_or_disarm(monkeypatch):
+    """The three properties the spec claims for a skip: no trigger consumed, no
+    disarm, and the note logged once per episode rather than once per candle.
+
+    Needs a genuinely far-OTM wing: at the default 2-step width the tested wing
+    is at/in the money (delta ~0.73) and always hedgeable, so a wide wing is the
+    only way to reach the zero-lot branch at all.
+    """
+    db = _FakeDb()
+    # Spot rallies and stays there, so delta stays breached for many candles.
+    spot = _spot((9, 50, 22500), (9, 55, 22800), (10, 0, 22810), (10, 5, 22820),
+                 (10, 10, 22830), (15, 25, 22840))
+    ce_w, pe_w = 23500, 21500          # ATM +/- 20 steps
+    rows = []
+    for hh, mm, ce, pe in ((9, 50, 100, 100), (9, 55, 320, 15), (10, 0, 322, 14),
+                           (10, 5, 324, 13), (10, 10, 326, 12), (15, 25, 330, 10)):
+        rows += [(22500, "CE", hh, mm, ce), (22500, "PE", hh, mm, pe),
+                 (ce_w, "CE", hh, mm, 0.05), (pe_w, "PE", hh, mm, 0.05)]
+    await _patch_common_loaders(monkeypatch, spot, _index(rows))
+
+    result = await executor.execute_run(
+        db, uuid.uuid4(), _strategy(), _hedge_config(wing_width_steps=20),
+        _validation(approved_lots=13),
+    )
+
+    assert result.status == "completed"
+    events = [e for e in db.added if isinstance(e, StrategyRunEvent)]
+    codes = [e.reason_code for e in events]
+
+    # No hedge leg was ever bought.
+    assert not [l for l in db.added
+                if isinstance(l, StrategyRunLeg) and l.leg_index >= 4]
+    # A skip must not masquerade as a fired trigger.
+    assert "DELTA_HEDGE_EXECUTED" not in codes
+    assert "DELTA_HEDGE_TRIGGERED" not in codes
+    # Logged once, not once per candle, even though the breach persisted.
+    assert codes.count("DELTA_HEDGE_SKIPPED_LOW_DELTA") == 1
+    # And labelled by cause: near-zero delta, NOT "gap too small".
+    assert "DELTA_HEDGE_SKIPPED_UNDERSIZED" not in codes
+    assert "near-zero delta" in next(
+        e for e in events if e.reason_code == "DELTA_HEDGE_SKIPPED_LOW_DELTA").reason_text
+    # Skipping never burned the trigger budget.
+    assert "DELTA_HEDGE_EXHAUSTED" not in codes
+
+
+@pytest.mark.asyncio
+async def test_missing_wing_price_is_logged_once_not_every_candle(monkeypatch):
+    """The wing-unavailable branch consumes no trigger either, so without a
+    throttle it writes a TRIGGERED+FAILED pair on every tick for the rest of the
+    session (~720 rows/hour live at a 10s poll)."""
+    db = _FakeDb()
+    spot = _spot((9, 50, 22500), (9, 55, 22800), (10, 0, 22810), (10, 5, 22820), (15, 25, 22830))
+    # Straddle strikes priced; wing strikes entirely absent from the index.
+    index = _index([
+        (22500, "CE", 9, 50, 100), (22500, "PE", 9, 50, 100),
+        (22500, "CE", 9, 55, 320), (22500, "PE", 9, 55, 15),
+        (22500, "CE", 10, 0, 322), (22500, "PE", 10, 0, 14),
+        (22500, "CE", 10, 5, 324), (22500, "PE", 10, 5, 13),
+        (22500, "CE", 15, 25, 330), (22500, "PE", 15, 25, 10),
+    ])
+    await _patch_common_loaders(monkeypatch, spot, index)
+
+    result = await executor.execute_run(
+        db, uuid.uuid4(), _strategy(), _hedge_config(), _validation(approved_lots=13),
+    )
+
+    assert result.status == "completed"
+    codes = [e.reason_code for e in db.added if isinstance(e, StrategyRunEvent)]
+    assert codes.count("DELTA_HEDGE_FAILED") == 1
+    # TRIGGERED must not be emitted for a hedge that never happened.
+    assert "DELTA_HEDGE_TRIGGERED" not in codes
+
+
+@pytest.mark.asyncio
+async def test_skip_note_is_logged_once_per_episode_not_once_per_session(monkeypatch):
+    """Two separate breach episodes must produce two notes.
+
+    This is the test that pins "per episode". The reset has to live outside the
+    `not delta_reentry_armed` guard, because a skip deliberately leaves the hedge
+    armed -- so if the reset sits inside that guard it never runs and the note
+    silently degrades to once per session.
+    """
+    db = _FakeDb()
+    # breach -> back inside the safe band -> breach again
+    spot = _spot((9, 50, 22500), (9, 55, 22800), (10, 0, 22500),
+                 (10, 5, 22800), (15, 25, 22820))
+    ce_w, pe_w = 23500, 21500          # ATM +/- 20 steps, far OTM on purpose
+    rows = []
+    for hh, mm, ce, pe in ((9, 50, 100, 100), (9, 55, 320, 15), (10, 0, 100, 100),
+                           (10, 5, 320, 15), (15, 25, 330, 10)):
+        rows += [(22500, "CE", hh, mm, ce), (22500, "PE", hh, mm, pe),
+                 (ce_w, "CE", hh, mm, 0.05), (pe_w, "PE", hh, mm, 0.05)]
+    await _patch_common_loaders(monkeypatch, spot, _index(rows))
+
+    result = await executor.execute_run(
+        db, uuid.uuid4(), _strategy(), _hedge_config(wing_width_steps=20),
+        _validation(approved_lots=13),
+    )
+
+    assert result.status == "completed"
+    codes = [e.reason_code for e in db.added if isinstance(e, StrategyRunEvent)]
+    assert codes.count("DELTA_HEDGE_SKIPPED_LOW_DELTA") == 2, (
+        "expected one note per breach episode, got "
+        f"{codes.count('DELTA_HEDGE_SKIPPED_LOW_DELTA')} -- the re-arm reset is "
+        "probably trapped inside the `not delta_reentry_armed` guard"
+    )

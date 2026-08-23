@@ -3,9 +3,11 @@ from datetime import date, datetime, timedelta
 import pytest
 
 from app.services.delta_hedge import (
+    MIN_HEDGE_OPTION_DELTA,
     black_scholes_delta,
     black_scholes_price,
     hedge_lots_for_delta,
+    is_hedgeable_delta,
     implied_volatility,
     parse_delta_hedge_settings,
     signed_position_delta,
@@ -126,14 +128,34 @@ def test_partial_sizing_neutralises_without_inverting():
 
 
 @pytest.mark.parametrize("gap", [60, 100, 152.05, 180, 250, 400, 600, 5000])
-def test_partial_sizing_never_flips_the_sign(gap):
-    """Rounding down is what guarantees this; it must hold at every gap size."""
+@pytest.mark.parametrize("unit_delta", [-0.02, -0.15, -0.4569, -0.72, -0.99])
+@pytest.mark.parametrize("lot_size", [25, 35, 50, 75])
+def test_partial_sizing_never_flips_the_sign(gap, unit_delta, lot_size):
+    """Flooring is what guarantees this. The property is over all three inputs,
+    not one slice of them, so parametrise the whole space."""
+    max_lots = 13
     lots = hedge_lots_for_delta(
-        net_delta=gap, option_delta=_AUG12_UNIT_DELTA, lot_size=75, max_lots=13
+        net_delta=gap, option_delta=unit_delta, lot_size=lot_size, max_lots=max_lots
     )
 
-    assert lots <= 13
-    assert gap + lots * 75 * _AUG12_UNIT_DELTA >= 0
+    assert 0 <= lots <= max_lots
+    residual = gap + lots * lot_size * unit_delta
+    assert residual >= 0, "hedge overshot through zero and inverted the book"
+
+
+@pytest.mark.parametrize("lot_size,threshold", [(75, 150), (35, 150), (50, 150)])
+def test_zero_lots_is_unreachable_via_small_gap_at_shipped_defaults(lot_size, threshold):
+    """With |option_delta| <= 1, lots >= floor(threshold/lot_size). So whenever
+    delta_threshold >= lot_size, a zero-lot result can only mean the instrument
+    is unhedgeable -- never that the gap was too small. Callers rely on this to
+    label the skip correctly."""
+    smallest_breach = threshold + 0.01
+    for step in range(1, 101):
+        unit = -step / 100.0                     # -0.01 .. -1.00
+        lots = hedge_lots_for_delta(
+            net_delta=smallest_breach, option_delta=unit, lot_size=lot_size, max_lots=13
+        )
+        assert lots >= 1, f"unexpectedly zero at unit_delta={unit}"
 
 
 def test_partial_sizing_is_symmetric_for_negative_delta():
@@ -193,3 +215,34 @@ def test_unit_delta_matches_position_delta_per_unit():
 
     assert unit < 0
     assert position == pytest.approx(unit * 975, rel=1e-9)
+
+
+def test_is_hedgeable_delta_separates_the_two_zero_lot_causes():
+    """A zero-lot result means one of two opposite things; the classifier is how
+    callers tell them apart and pick the right reason code."""
+    assert is_hedgeable_delta(-0.45) is True
+    assert is_hedgeable_delta(MIN_HEDGE_OPTION_DELTA) is True
+    assert is_hedgeable_delta(MIN_HEDGE_OPTION_DELTA / 2) is False
+    assert is_hedgeable_delta(0.0) is False
+    assert is_hedgeable_delta(None) is False
+
+
+def test_low_delta_wing_yields_zero_lots_and_is_flagged_unhedgeable():
+    """The only zero-lot path production can reach at default config."""
+    lots = hedge_lots_for_delta(
+        net_delta=200, option_delta=-0.009, lot_size=75, max_lots=13
+    )
+
+    assert lots == 0
+    assert is_hedgeable_delta(-0.009) is False   # so callers say LOW_DELTA, not UNDERSIZED
+
+
+def test_both_engines_size_identically_for_the_same_inputs():
+    """Live and backtest must agree, or replays stop predicting live. Both call
+    this one helper -- pin that they resolve to the same object."""
+    from app.services import live_paper_engine, straddle_adjustment_executor
+
+    assert live_paper_engine.hedge_lots_for_delta is hedge_lots_for_delta
+    assert straddle_adjustment_executor.hedge_lots_for_delta is hedge_lots_for_delta
+    assert live_paper_engine.is_hedgeable_delta is is_hedgeable_delta
+    assert straddle_adjustment_executor.is_hedgeable_delta is is_hedgeable_delta

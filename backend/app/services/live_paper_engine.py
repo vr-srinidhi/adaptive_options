@@ -45,6 +45,7 @@ from app.services.charges_service import (
 from app.services.contract_spec_service import get_contract_spec, resolve_atm_strike
 from app.services.delta_hedge import (
     hedge_lots_for_delta,
+    is_hedgeable_delta,
     parse_delta_hedge_settings,
     signed_position_delta,
     unit_delta_for_option,
@@ -668,6 +669,7 @@ async def _run_session(
         delta_hedge_count     = 0
         delta_reentry_armed   = True
         undersized_logged     = False
+        wing_unavailable_logged = False
         last_delta_hedge_ts: Optional[datetime] = None
         last_net_delta: Optional[float] = None
         entry_credit_per_unit = 0.0
@@ -1124,15 +1126,22 @@ async def _run_session(
                 safe_level = max(0.0, threshold - delta_settings.reentry_buffer)
                 abs_delta = abs(net_delta)
 
-                if not delta_reentry_armed and abs_delta <= safe_level:
-                    delta_reentry_armed = True
-                    delta_hedge_status = "monitoring"
-                    undersized_logged = False   # new episode; allow one more skip note
-                    await _write_event(run_id, now, "DELTA_HEDGE", "DELTA_NEUTRAL_RESTORED", payload={
-                        "net_delta": net_delta,
-                        "threshold": threshold,
-                        "safe_level": safe_level,
-                    })
+                if abs_delta <= safe_level:
+                    # Delta is back in the safe band: a new episode starts here.
+                    # These resets must NOT sit inside the `not delta_reentry_armed`
+                    # branch below — a skip deliberately leaves the hedge armed, so
+                    # that branch never opens after a skip-only episode and the
+                    # once-per-episode notes would degrade to once-per-session.
+                    undersized_logged = False
+                    wing_unavailable_logged = False
+                    if not delta_reentry_armed:
+                        delta_reentry_armed = True
+                        delta_hedge_status = "monitoring"
+                        await _write_event(run_id, now, "DELTA_HEDGE", "DELTA_NEUTRAL_RESTORED", payload={
+                            "net_delta": net_delta,
+                            "threshold": threshold,
+                            "safe_level": safe_level,
+                        })
 
                 if delta_hedge_count >= delta_settings.max_hedge_triggers and delta_hedge_status != "exhausted":
                     delta_hedge_status = "exhausted"
@@ -1176,19 +1185,45 @@ async def _run_session(
                         mode=delta_settings.hedge_qty_mode,
                     )
 
-                    # An undersized gap is a non-event: it neither consumes a
-                    # trigger nor disarms, and can persist for hours at a
-                    # 10-second poll. Record it once per episode, not per tick.
-                    if hedge_lots <= 0 and hedge_price is not None and hedge_strike is not None:
+                    # None of the three no-op paths below consume a trigger,
+                    # disarm, or set a cooldown, so the condition can persist for
+                    # the rest of the session. Each is recorded once per episode
+                    # rather than once per tick (~720 rows/hour at a 10s poll).
+                    if hedge_price is None or hedge_strike is None:
+                        if not wing_unavailable_logged:
+                            wing_unavailable_logged = True
+                            await _write_event(run_id, now, "DELTA_HEDGE", "DELTA_HEDGE_FAILED", payload={
+                                "net_delta": net_delta,
+                                "strike": hedge_strike,
+                                "option_type": tested_type,
+                                "reason": "WING_PRICE_UNAVAILABLE",
+                            })
+                        can_trigger = False
+                    elif hedge_lots <= 0:
+                        # Two very different causes, and the wrong label here sends
+                        # someone debugging in exactly the wrong direction.
+                        hedgeable = is_hedgeable_delta(hedge_unit_delta)
                         if not undersized_logged:
                             undersized_logged = True
+                            if hedgeable:
+                                code = "DELTA_HEDGE_SKIPPED_UNDERSIZED"
+                                text_delta = None
+                            else:
+                                code = "DELTA_HEDGE_SKIPPED_LOW_DELTA"
+                                text_delta = hedge_unit_delta
                             await _write_event(
-                                run_id, now, "DELTA_HEDGE", "DELTA_HEDGE_SKIPPED_UNDERSIZED",
+                                run_id, now, "DELTA_HEDGE", code,
                                 payload={
                                     "net_delta": net_delta,
                                     "strike": hedge_strike,
                                     "option_type": tested_type,
-                                    "unit_delta": hedge_unit_delta,
+                                    "unit_delta": text_delta if text_delta is not None else hedge_unit_delta,
+                                    "reason": (
+                                        "Imbalance smaller than one lot; hedging would overshoot."
+                                        if hedgeable else
+                                        f"{tested_type} {hedge_strike} has near-zero delta; "
+                                        f"hedging it could not close the gap."
+                                    ),
                                 },
                             )
                         can_trigger = False
@@ -1201,97 +1236,89 @@ async def _run_session(
                         "tested_side": tested_type,
                     })
 
-                    if hedge_price is None or hedge_strike is None:
-                        await _write_event(run_id, now, "DELTA_HEDGE", "DELTA_HEDGE_FAILED", payload={
-                            "net_delta": net_delta,
-                            "strike": hedge_strike,
-                            "option_type": tested_type,
-                            "reason": "WING_PRICE_UNAVAILABLE",
-                        })
-                    else:
-                        hedge_id = uuid.uuid4()
-                        hedge = {
-                            "id": hedge_id,
-                            "side": "BUY",
-                            "option_type": tested_type,
-                            "strike": hedge_strike,
-                            "entry_price": hedge_price,
-                            "last_price": hedge_price,
-                            "entry_ts": now,
-                            "stale": 0,
-                            "lots": hedge_lots,
-                        }
-                        delta_hedges.append(hedge)
-                        entry_charge = compute_leg_entry_charges(
-                            hedge_lots,
-                            lot_size,
-                            [("BUY", tested_type, hedge_strike)],
-                            [hedge_price],
-                        )
-                        delta_hedge_charges += entry_charge
-                        delta_hedge_count += 1
-                        delta_reentry_armed = False
-                        delta_hedge_status = "hedged"
-                        last_delta_hedge_ts = now
-                        net_delta = _compute_net_delta(now, spot, vix, straddle_cur, wing_cur) or net_delta
-                        last_net_delta = net_delta
+                    hedge_id = uuid.uuid4()
+                    hedge = {
+                        "id": hedge_id,
+                        "side": "BUY",
+                        "option_type": tested_type,
+                        "strike": hedge_strike,
+                        "entry_price": hedge_price,
+                        "last_price": hedge_price,
+                        "entry_ts": now,
+                        "stale": 0,
+                        "lots": hedge_lots,
+                    }
+                    delta_hedges.append(hedge)
+                    entry_charge = compute_leg_entry_charges(
+                        hedge_lots,
+                        lot_size,
+                        [("BUY", tested_type, hedge_strike)],
+                        [hedge_price],
+                    )
+                    delta_hedge_charges += entry_charge
+                    delta_hedge_count += 1
+                    delta_reentry_armed = False
+                    delta_hedge_status = "hedged"
+                    last_delta_hedge_ts = now
+                    net_delta = _compute_net_delta(now, spot, vix, straddle_cur, wing_cur) or net_delta
+                    last_net_delta = net_delta
 
-                        async with AsyncSessionLocal() as db:
-                            db.add(StrategyRunLeg(
-                                id=hedge_id,
-                                run_id=run_id,
-                                leg_index=4 + delta_hedge_count - 1,
-                                side="BUY",
-                                option_type=tested_type,
-                                strike=hedge_strike,
-                                expiry_date=expiry_date,
-                                quantity=lot_size * hedge_lots,
-                                entry_price=hedge_price,
-                                entry_timestamp=now.replace(tzinfo=None),
-                            ))
-                            await db.commit()
+                    async with AsyncSessionLocal() as db:
+                        db.add(StrategyRunLeg(
+                            id=hedge_id,
+                            run_id=run_id,
+                            leg_index=4 + delta_hedge_count - 1,
+                            side="BUY",
+                            option_type=tested_type,
+                            strike=hedge_strike,
+                            expiry_date=expiry_date,
+                            quantity=lot_size * hedge_lots,
+                            entry_price=hedge_price,
+                            entry_timestamp=now.replace(tzinfo=None),
+                        ))
+                        await db.commit()
 
-                        await _write_event(run_id, now, "DELTA_HEDGE", "DELTA_HEDGE_EXECUTED", payload={
-                            "net_delta": net_delta,
-                            "strike": hedge_strike,
-                            "option_type": tested_type,
-                            "price": hedge_price,
-                            "lots": hedge_lots,
-                            "quantity": lot_size * hedge_lots,
-                            "max_lots": approved_lots,
-                            "unit_delta": hedge_unit_delta,
-                            "entry_charges": entry_charge,
-                            "trigger_count": delta_hedge_count,
-                        })
-                        await _update_session(
-                            session_id,
-                            delta_hedge_status=delta_hedge_status,
-                            delta_hedge_count=delta_hedge_count,
-                            net_delta_latest=round(net_delta, 4),
-                        )
-                        await _broadcast(session_id, {
-                            "type": "DELTA_HEDGE",
-                            "timestamp": now.isoformat(),
-                            "net_delta": net_delta,
-                            "option_type": tested_type,
-                            "strike": hedge_strike,
-                            "price": hedge_price,
-                            "delta_hedge_count": delta_hedge_count,
-                            # The hedge may be smaller than the straddle; the
-                            # payoff chart needs its real size to draw the tail.
-                            "lots": hedge_lots,
-                            "quantity": lot_size * hedge_lots,
-                        })
+                    await _write_event(run_id, now, "DELTA_HEDGE", "DELTA_HEDGE_EXECUTED", payload={
+                        "net_delta": net_delta,
+                        "strike": hedge_strike,
+                        "option_type": tested_type,
+                        "price": hedge_price,
+                        "lots": hedge_lots,
+                        "quantity": lot_size * hedge_lots,
+                        "max_lots": approved_lots,
+                        "unit_delta": hedge_unit_delta,
+                        "entry_charges": entry_charge,
+                        "trigger_count": delta_hedge_count,
+                    })
+                    await _update_session(
+                        session_id,
+                        delta_hedge_status=delta_hedge_status,
+                        delta_hedge_count=delta_hedge_count,
+                        net_delta_latest=round(net_delta, 4),
+                    )
+                    await _broadcast(session_id, {
+                        "type": "DELTA_HEDGE",
+                        "timestamp": now.isoformat(),
+                        "net_delta": net_delta,
+                        "option_type": tested_type,
+                        "strike": hedge_strike,
+                        "price": hedge_price,
+                        "delta_hedge_count": delta_hedge_count,
+                        # The hedge may be smaller than the straddle; the
+                        # payoff chart needs its real size to draw the tail.
+                        "lots": hedge_lots,
+                        "quantity": lot_size * hedge_lots,
+                    })
 
-                        delta_hedge_gross = _hedge_gross(delta_hedges, lot_size, approved_lots)
-                        gross_mtm = straddle_gross + wing_gross + delta_hedge_gross
-                        active_legs = straddle_legs + (wing_legs if wings_locked else [])
-                        all_cur = list(straddle_cur) + (list(wing_cur) if wings_locked else [])
-                        est_exit = (
-                            compute_leg_exit_charges_estimate(approved_lots, lot_size, active_legs, all_cur)
-                            + _hedge_exit_charges(delta_hedges, lot_size, approved_lots)
-                        )
-                        net_mtm = gross_mtm - entry_charges - wing_entry_charges - delta_hedge_charges - est_exit
+                    delta_hedge_gross = _hedge_gross(delta_hedges, lot_size, approved_lots)
+                    gross_mtm = straddle_gross + wing_gross + delta_hedge_gross
+                    active_legs = straddle_legs + (wing_legs if wings_locked else [])
+                    all_cur = list(straddle_cur) + (list(wing_cur) if wings_locked else [])
+                    est_exit = (
+                        compute_leg_exit_charges_estimate(approved_lots, lot_size, active_legs, all_cur)
+                        + _hedge_exit_charges(delta_hedges, lot_size, approved_lots)
+                    )
+                    net_mtm = gross_mtm - entry_charges - wing_entry_charges - delta_hedge_charges - est_exit
 
             # ── Lock check (only if trade is still alive after stop check) ─────
             if not wings_locked and fired is None:

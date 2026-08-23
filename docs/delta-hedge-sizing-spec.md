@@ -55,17 +55,30 @@ FULL:     lots = approved_lots        (previous behaviour, retained)
 
 Applied to 12 Aug: implied per-unit delta −0.4569 → **4 lots**, residual delta **+14.98**, with 31% of the premium committed.
 
-## Undersized Gaps
+## No-Op Paths
 
-When the gap cannot fill even one lot, the hedge is skipped. The skip:
+Three conditions cause the hedge not to proceed. None of them consumes a trigger from `max_hedge_triggers`, disarms `delta_reentry_armed`, or sets a cooldown — so each can persist for the rest of the session, and each is recorded **once per episode**, not once per tick (~720 rows/hour at a 10-second poll).
 
-- does **not** consume a trigger from `max_hedge_triggers`
-- does **not** disarm `delta_reentry_armed`
-- emits `DELTA_HEDGE_SKIPPED_UNDERSIZED` **once per episode**, re-armed on `DELTA_NEUTRAL_RESTORED`
+| Condition | Reason code |
+|---|---|
+| Wing quote missing | `DELTA_HEDGE_FAILED` (`WING_PRICE_UNAVAILABLE`) |
+| Hedge instrument has near-zero delta | `DELTA_HEDGE_SKIPPED_LOW_DELTA` |
+| Imbalance smaller than one lot | `DELTA_HEDGE_SKIPPED_UNDERSIZED` |
 
-Rationale: the condition can persist for hours at a 10-second poll interval, and hedging anyway would overshoot — the exact failure this spec removes. Logging per tick would write unbounded event rows.
+The last two are opposite conditions and must not share a label: a near-zero-delta wing would *under*shoot by a wide margin (at `|d| = 0.009` and a 200 delta gap, neutrality needs ~297 lots), whereas a sub-one-lot gap would *over*shoot. `is_hedgeable_delta()` classifies which occurred so both engines emit the same code.
+
+**Episode boundary.** The once-per-episode counters reset whenever `|net_delta|` falls back to `safe_level`, deliberately **outside** the `not delta_reentry_armed` branch. A skip leaves the hedge armed by design, so a reset placed inside that branch would never run after a skip-only episode and the notes would silently degrade to once per session.
 
 `DELTA_HEDGE_TRIGGERED` is emitted only for hedges that actually proceed, so the event log no longer implies an action that never happened.
+
+### Reachability at shipped defaults
+
+Both zero-lot paths are effectively unreachable with the catalog defaults, and this is worth stating plainly rather than implying a live safety net.
+
+- **Sub-one-lot gap.** Since `|option_delta| <= 1`, `lots >= floor(delta_threshold / lot_size)`. At `delta_threshold = 150` and `lot_size = 75` that floor is 2, so the branch cannot be reached; it needs `delta_threshold < lot_size`.
+- **Near-zero delta.** The tested-side wing is by construction the one moving *toward* the money. At the default `wing_width_steps = 2` its delta measures ~0.73 in the integration fixture — comfortably hedgeable. Reaching the branch takes roughly a 20-step wing (~0.0009).
+
+Both remain as defensive guards for non-default configuration, and are covered by tests that configure their way into them.
 
 ## Per-Leg Quantity
 
@@ -134,10 +147,13 @@ The robust claim is the risk profile: comparable return at 2.8× the return-per-
 
 ## Testing
 
-`cd backend && python -m pytest tests/ -v` → **389 passing** (main: 387 passing, 1 failing).
+`cd backend && python -m pytest tests/ -v` → **550 passing** (main: 368 passing, 1 failing).
 
-- `test_delta_hedge.py` — 12 sizing cases, no mocks: the 12 Aug reconstruction, a parametrised no-sign-flip property across gaps 60→5,000, CE/PE symmetry, zero-lot skip, `max_lots` clamp, near-zero and `None` option delta, `FULL` passthrough, and unit-vs-position delta consistency.
-- `test_straddle_adjustment_executor_more.py` — 4 executor cases: hedge leg strictly smaller than the straddle, `FULL` still buys all 13, other strategies on this executor never hedge, and a regression pinning stop-before-hedge.
+- `test_delta_hedge.py` — sizing, no mocks. The no-sign-flip guarantee is parametrised across **all three** inputs (gap × `option_delta` × `lot_size`, 160 combinations) rather than one slice, since flooring is a property of all of them. Plus the 12 Aug reconstruction, CE/PE symmetry, `max_lots` clamp, `FULL` passthrough, unit-vs-position delta consistency, the `is_hedgeable_delta` classifier, and a proof that a sub-one-lot result is unreachable whenever `delta_threshold >= lot_size`.
+- `test_straddle_adjustment_executor_more.py` — 7 executor cases: hedge leg strictly smaller than the straddle, `FULL` still buys all 13, other strategies on this executor never hedge, a regression pinning stop-before-hedge, and three covering the no-op paths — that a skip consumes no trigger and does not disarm, that a missing wing quote is logged once rather than per candle, and that **two separate breach episodes produce two notes**.
+- Both engines are pinned to resolve to the same `hedge_lots_for_delta` and `is_hedgeable_delta`, so replays cannot silently diverge from live on sizing.
+
+The per-episode and throttling tests were **mutation-verified**: reverting each fix in turn makes the corresponding test fail, which an earlier draft of the per-episode test did not.
 - `test_strategy_replay_serializer.py` — leg `lots` derived from quantity, not run size.
 - `test_live_paper_engine.py` — its main end-to-end test pinned expiry to a fixed May-2026 date while the engine uses `date.today()`, so it had been failing on `main` every day since. Now relative.
 
@@ -168,6 +184,6 @@ Worst observed: 156 points off, three strikes away. 39 of 101 hedged sessions fi
 ## Open Questions for Review
 
 1. Should `PARTIAL` be forced on, or remain a per-slot choice? Leaving `FULL` selectable preserves the ability to reproduce historical behaviour, but also preserves the footgun.
-2. The undersized-skip currently logs once per episode. Is per-episode the right granularity, or should it be silent?
+2. Now genuinely once per episode, and split into `SKIPPED_LOW_DELTA` vs `SKIPPED_UNDERSIZED`. Both are unreachable at shipped defaults (see Reachability) — keep them as defensive guards, or drop the branch and let the sizing helper return zero silently?
 3. 17 Aug shows the accepted cost of smaller hedges. Is that trade-off acceptable as policy, or should the sizing floor be raised above one lot?
 4. Should the trigger threshold gain a buffer or dwell requirement? 12 Aug fired on a 2-point breach (152.05 vs 150) on a day whose entire range was 145 points; `reentry_buffer` governs only re-arming, never the first trigger.

@@ -187,6 +187,19 @@ def signed_position_delta(
 MIN_HEDGE_OPTION_DELTA = 0.01
 
 
+def is_hedgeable_delta(option_delta: Optional[float]) -> bool:
+    """Whether an instrument moves the book enough to hedge with at all.
+
+    A zero-lot sizing result has two very different causes, and callers must be
+    able to tell them apart: the wing is nearly delta-less (this returns False,
+    and hedging would *under*shoot by a mile), or the imbalance genuinely fits
+    in less than one lot (this returns True). Note the latter is unreachable
+    whenever `delta_threshold >= lot_size`, since |option_delta| <= 1 means
+    lots >= floor(threshold / lot_size) >= 1.
+    """
+    return option_delta is not None and abs(option_delta) >= MIN_HEDGE_OPTION_DELTA
+
+
 def unit_delta_for_option(
     *,
     option_type: str,
@@ -230,7 +243,7 @@ def hedge_lots_for_delta(
     if str(mode).upper() == "FULL":
         return max_lots
 
-    if option_delta is None or abs(option_delta) < MIN_HEDGE_OPTION_DELTA:
+    if not is_hedgeable_delta(option_delta):
         return 0
 
     delta_per_lot = abs(option_delta) * lot_size
