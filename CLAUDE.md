@@ -365,7 +365,7 @@ SELL ATM CE + SELL ATM PE at `entry_time`. Profits from premium decay when spot 
 | `delta_hedge_enabled` | `false` | Master switch — zero overhead when off |
 | `delta_threshold` | 150 | Absolute net position delta at which hedge fires |
 | `hedge_action` | `BUY_WING` | Buy OTM wing on tested side to cap directional loss |
-| `hedge_qty_mode` | `PARTIAL` | Full or partial imbalance hedge |
+| `hedge_qty_mode` | `PARTIAL` | `PARTIAL` sizes the hedge to the actual delta gap (rounded down to whole lots, capped at `approved_lots`); `FULL` buys the whole position size. Prior to Aug 2026 this flag was parsed but never read — every hedge was FULL regardless. |
 | `max_hedge_triggers` | 3 | Max hedge fires per session |
 | `reentry_buffer` | 50 | Delta must normalize below `threshold − buffer` before next trigger |
 | `cooldown_minutes` | 5 | Minimum minutes between consecutive triggers |
@@ -733,7 +733,12 @@ Self-driving intraday engine. Architecture decisions:
 - `ts.replace(tzinfo=None)` in `_write_event` / `_write_mtm` — `strategy_run_events`, `strategy_run_mtm`, `strategy_leg_mtm` timestamps are `timezone=False`; inserting aware datetimes raises a `DataError` from asyncpg.
 - `_sync_start_lock` in `live_data_sync.py` — single-process asyncio lock; serialises concurrent API calls within one uvicorn worker. The scheduler job routes through `create_started_live_data_sync_run()` (not `run_daily_live_data_sync()` directly) so both paths share the same guard. Do not call `run_daily_live_data_sync()` directly without first calling `create_started_live_data_sync_run()`.
 - `RISK_FREE_RATE = 0.065` in `delta_hedge.py` — calibrated for NSE options; changing shifts all delta values.
-- Delta hedge `can_trigger` guard order in `live_paper_engine.py` and `straddle_adjustment_executor.py` — `STOP_EXIT` is evaluated before the delta hedge block; do not move delta hedge evaluation above the stop check.
+- Delta hedge `can_trigger` guard order in `live_paper_engine.py` and `straddle_adjustment_executor.py` — `STOP_EXIT` is evaluated before the delta hedge block; do not move delta hedge evaluation above the stop check. (This was true only in the live engine until Aug 2026; the backtest computed `fired_event` *after* the hedge block and could buy a wing on the minute it stopped out. Both now compute `stop_threshold` before the hedge and gate on it.)
+- Delta hedge sizing lives in `delta_hedge.py::hedge_lots_for_delta` and is shared by both engines. `PARTIAL` rounds **down** deliberately: that is what guarantees the residual delta keeps its sign, so a hedge can never overshoot through zero and invert the book. Do not change it to round-to-nearest.
+- Delta hedge legs carry their own `lots`, which may be smaller than `approved_lots`. Anything that prices, charges, or marks a hedge leg must use `_hedge_lots(h, approved_lots)` — never `approved_lots` directly, or MTM and charges silently over-count.
+- The once-per-episode reset of `undersized_logged` / `wing_unavailable_logged` must stay **outside** the `not delta_reentry_armed` branch in both engines. A skip deliberately leaves the hedge armed, so a reset placed inside that branch never runs after a skip-only episode and the notes degrade to once per session.
+- `DELTA_HEDGE_SKIPPED_LOW_DELTA` and `DELTA_HEDGE_SKIPPED_UNDERSIZED` describe opposite causes (hedging would undershoot vs overshoot). Classify with `is_hedgeable_delta()`; do not collapse them into one code.
+- Delta hedging is scoped to `short_straddle_dual_lock` via `_DELTA_HEDGE_STRATEGY_ID` in both engines. `straddle_adjustment_v1` also runs `short_straddle_profit_lock`, which must never hedge.
 - `if not delta_settings.enabled: return None` guard in `_compute_net_delta` — ensures zero computation overhead when the feature is off; do not remove.
 
 ---

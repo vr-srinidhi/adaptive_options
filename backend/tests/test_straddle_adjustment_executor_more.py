@@ -201,3 +201,278 @@ async def test_execute_run_no_spot_data_returns_no_trade(monkeypatch):
     assert result.status == "no_trade"
     assert result.exit_reason == "NO_SPOT_DATA"
     assert result.realized_net_pnl is None
+
+
+# ── Delta hedge sizing ────────────────────────────────────────────────────────
+
+def _hedge_config(**overrides):
+    """Dual-lock config with the delta hedge armed and locks pushed out of reach,
+    so a test isolates hedge behaviour."""
+    values = _config(
+        delta_hedge_enabled=True,
+        delta_threshold=150,
+        lock_trigger=10_000_000,
+        loss_lock_trigger=10_000_000,
+        stop_capital_pct=0.9,
+    )
+    values.update(overrides)
+    return values
+
+
+def _hedge_market():
+    """Spot rallies hard after entry so the short straddle builds negative delta
+    and the CE side gets tested."""
+    spot = _spot((9, 50, 22500), (9, 55, 22800), (15, 25, 22800))
+    index = _index([
+        (22500, "CE", 9, 50, 100), (22500, "PE", 9, 50, 100),
+        (22600, "CE", 9, 50, 40),  (22400, "PE", 9, 50, 40),
+        (22500, "CE", 9, 55, 320), (22500, "PE", 9, 55, 15),
+        (22600, "CE", 9, 55, 240), (22400, "PE", 9, 55, 8),
+        (22500, "CE", 15, 25, 300), (22500, "PE", 15, 25, 10),
+        (22600, "CE", 15, 25, 210), (22400, "PE", 15, 25, 5),
+    ])
+    return spot, index
+
+
+@pytest.mark.asyncio
+async def test_delta_hedge_sizes_to_the_imbalance_not_full_position(monkeypatch):
+    db = _FakeDb()
+    spot, index = _hedge_market()
+    await _patch_common_loaders(monkeypatch, spot, index)
+
+    result = await executor.execute_run(
+        db, uuid.uuid4(), _strategy(), _hedge_config(),
+        _validation(approved_lots=13),
+    )
+
+    assert result.status == "completed"
+    hedge_legs = [
+        leg for leg in db.added
+        if isinstance(leg, StrategyRunLeg) and leg.side == "BUY" and leg.entry_timestamp is not None
+    ]
+    assert hedge_legs, "expected the delta hedge to fire on a 300-point rally"
+    hedge = hedge_legs[0]
+    # The whole point: strictly smaller than the 13-lot straddle it protects.
+    assert 0 < hedge.quantity < 13 * 75
+    assert hedge.quantity % 75 == 0
+    assert hedge.leg_index >= 4
+
+
+@pytest.mark.asyncio
+async def test_full_mode_still_hedges_with_the_whole_position(monkeypatch):
+    db = _FakeDb()
+    spot, index = _hedge_market()
+    await _patch_common_loaders(monkeypatch, spot, index)
+
+    result = await executor.execute_run(
+        db, uuid.uuid4(), _strategy(), _hedge_config(hedge_qty_mode="FULL"),
+        _validation(approved_lots=13),
+    )
+
+    assert result.status == "completed"
+    hedge_legs = [
+        leg for leg in db.added
+        if isinstance(leg, StrategyRunLeg) and leg.side == "BUY" and leg.entry_timestamp is not None
+    ]
+    assert hedge_legs
+    assert hedge_legs[0].quantity == 13 * 75
+
+
+@pytest.mark.asyncio
+async def test_delta_hedge_is_ignored_for_other_strategies_on_this_executor(monkeypatch):
+    """short_straddle_profit_lock shares this executor but never offers the hedge."""
+    db = _FakeDb()
+    spot, index = _hedge_market()
+    await _patch_common_loaders(monkeypatch, spot, index)
+
+    strategy = {**_strategy(), "id": "short_straddle_profit_lock"}
+    result = await executor.execute_run(
+        db, uuid.uuid4(), strategy, _hedge_config(), _validation(approved_lots=13),
+    )
+
+    assert result.status == "completed"
+    assert not [
+        leg for leg in db.added
+        if isinstance(leg, StrategyRunLeg) and leg.side == "BUY" and leg.entry_timestamp is not None
+    ]
+    assert not [
+        e for e in db.added
+        if isinstance(e, StrategyRunEvent) and e.event_type == "DELTA_HEDGE"
+    ]
+    # ...and the caller is told its config was ignored, rather than the run
+    # quietly looking like a normal unhedged result.
+    assert any("only supported on short_straddle_dual_lock" in w for w in result.warnings)
+
+
+@pytest.mark.asyncio
+async def test_stop_exit_wins_over_delta_hedge_on_the_same_minute(monkeypatch):
+    """Regression: the backtest used to buy a hedge wing on the minute it stopped
+    out, because STOP_EXIT was evaluated after the hedge block."""
+    db = _FakeDb()
+    spot, index = _hedge_market()
+    await _patch_common_loaders(monkeypatch, spot, index)
+
+    # 0.1% of 25L = Rs2,500 — the 22500 CE running 100 -> 320 blows through it.
+    result = await executor.execute_run(
+        db, uuid.uuid4(), _strategy(),
+        _hedge_config(stop_capital_pct=0.001),
+        _validation(approved_lots=13),
+    )
+
+    assert result.exit_reason == "STOP_EXIT"
+    assert not [
+        e for e in db.added
+        if isinstance(e, StrategyRunEvent) and e.reason_code == "DELTA_HEDGE_EXECUTED"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_low_delta_wing_skip_does_not_consume_a_trigger_or_disarm(monkeypatch):
+    """The three properties the spec claims for a skip: no trigger consumed, no
+    disarm, and the note logged once per episode rather than once per candle.
+
+    Needs a genuinely far-OTM wing: at the default 2-step width the tested wing
+    is at/in the money (delta ~0.73) and always hedgeable, so a wide wing is the
+    only way to reach the zero-lot branch at all.
+    """
+    db = _FakeDb()
+    # Spot rallies and stays there, so delta stays breached for many candles.
+    spot = _spot((9, 50, 22500), (9, 55, 22800), (10, 0, 22810), (10, 5, 22820),
+                 (10, 10, 22830), (15, 25, 22840))
+    ce_w, pe_w = 23500, 21500          # ATM +/- 20 steps
+    rows = []
+    for hh, mm, ce, pe in ((9, 50, 100, 100), (9, 55, 320, 15), (10, 0, 322, 14),
+                           (10, 5, 324, 13), (10, 10, 326, 12), (15, 25, 330, 10)):
+        rows += [(22500, "CE", hh, mm, ce), (22500, "PE", hh, mm, pe),
+                 (ce_w, "CE", hh, mm, 0.05), (pe_w, "PE", hh, mm, 0.05)]
+    await _patch_common_loaders(monkeypatch, spot, _index(rows))
+
+    result = await executor.execute_run(
+        db, uuid.uuid4(), _strategy(), _hedge_config(wing_width_steps=20),
+        _validation(approved_lots=13),
+    )
+
+    assert result.status == "completed"
+    events = [e for e in db.added if isinstance(e, StrategyRunEvent)]
+    codes = [e.reason_code for e in events]
+
+    # No hedge leg was ever bought.
+    assert not [l for l in db.added
+                if isinstance(l, StrategyRunLeg) and l.leg_index >= 4]
+    # A skip must not masquerade as a fired trigger.
+    assert "DELTA_HEDGE_EXECUTED" not in codes
+    assert "DELTA_HEDGE_TRIGGERED" not in codes
+    # Logged once, not once per candle, even though the breach persisted.
+    assert codes.count("DELTA_HEDGE_SKIPPED_LOW_DELTA") == 1
+    # And labelled by cause: near-zero delta, NOT "gap too small".
+    assert "DELTA_HEDGE_SKIPPED_UNDERSIZED" not in codes
+    assert "near-zero delta" in next(
+        e for e in events if e.reason_code == "DELTA_HEDGE_SKIPPED_LOW_DELTA").reason_text
+    # Skipping never burned the trigger budget.
+    assert "DELTA_HEDGE_EXHAUSTED" not in codes
+
+
+@pytest.mark.asyncio
+async def test_missing_wing_price_is_logged_once_not_every_candle(monkeypatch):
+    """The wing-unavailable branch consumes no trigger either, so without a
+    throttle it writes a TRIGGERED+FAILED pair on every tick for the rest of the
+    session (~720 rows/hour live at a 10s poll)."""
+    db = _FakeDb()
+    spot = _spot((9, 50, 22500), (9, 55, 22800), (10, 0, 22810), (10, 5, 22820), (15, 25, 22830))
+    # Straddle strikes priced; wing strikes entirely absent from the index.
+    index = _index([
+        (22500, "CE", 9, 50, 100), (22500, "PE", 9, 50, 100),
+        (22500, "CE", 9, 55, 320), (22500, "PE", 9, 55, 15),
+        (22500, "CE", 10, 0, 322), (22500, "PE", 10, 0, 14),
+        (22500, "CE", 10, 5, 324), (22500, "PE", 10, 5, 13),
+        (22500, "CE", 15, 25, 330), (22500, "PE", 15, 25, 10),
+    ])
+    await _patch_common_loaders(monkeypatch, spot, index)
+
+    result = await executor.execute_run(
+        db, uuid.uuid4(), _strategy(), _hedge_config(), _validation(approved_lots=13),
+    )
+
+    assert result.status == "completed"
+    codes = [e.reason_code for e in db.added if isinstance(e, StrategyRunEvent)]
+    assert codes.count("DELTA_HEDGE_FAILED") == 1
+    # TRIGGERED must not be emitted for a hedge that never happened.
+    assert "DELTA_HEDGE_TRIGGERED" not in codes
+
+
+@pytest.mark.asyncio
+async def test_skip_note_is_logged_once_per_episode_not_once_per_session(monkeypatch):
+    """Two separate breach episodes must produce two notes.
+
+    This is the test that pins "per episode". The reset has to live outside the
+    `not delta_reentry_armed` guard, because a skip deliberately leaves the hedge
+    armed -- so if the reset sits inside that guard it never runs and the note
+    silently degrades to once per session.
+    """
+    db = _FakeDb()
+    # breach -> back inside the safe band -> breach again
+    spot = _spot((9, 50, 22500), (9, 55, 22800), (10, 0, 22500),
+                 (10, 5, 22800), (15, 25, 22820))
+    ce_w, pe_w = 23500, 21500          # ATM +/- 20 steps, far OTM on purpose
+    rows = []
+    for hh, mm, ce, pe in ((9, 50, 100, 100), (9, 55, 320, 15), (10, 0, 100, 100),
+                           (10, 5, 320, 15), (15, 25, 330, 10)):
+        rows += [(22500, "CE", hh, mm, ce), (22500, "PE", hh, mm, pe),
+                 (ce_w, "CE", hh, mm, 0.05), (pe_w, "PE", hh, mm, 0.05)]
+    await _patch_common_loaders(monkeypatch, spot, _index(rows))
+
+    result = await executor.execute_run(
+        db, uuid.uuid4(), _strategy(), _hedge_config(wing_width_steps=20),
+        _validation(approved_lots=13),
+    )
+
+    assert result.status == "completed"
+    codes = [e.reason_code for e in db.added if isinstance(e, StrategyRunEvent)]
+    assert codes.count("DELTA_HEDGE_SKIPPED_LOW_DELTA") == 2, (
+        "expected one note per breach episode, got "
+        f"{codes.count('DELTA_HEDGE_SKIPPED_LOW_DELTA')} -- the re-arm reset is "
+        "probably trapped inside the `not delta_reentry_armed` guard"
+    )
+
+
+@pytest.mark.asyncio
+async def test_persisted_hedge_size_matches_the_sizing_helper(monkeypatch):
+    """Behavioural parity: the quantity the executor actually writes must equal
+    what `hedge_lots_for_delta` returns for the same inputs, recomputed here
+    independently from the events the engine itself recorded.
+
+    Asserting the two modules imported the same symbol is near-tautological; the
+    divergence that actually bit us last round was a caller passing different
+    arguments, which only a check at this level catches.
+    """
+    from app.services.delta_hedge import hedge_lots_for_delta
+
+    db = _FakeDb()
+    spot, index = _hedge_market()
+    await _patch_common_loaders(monkeypatch, spot, index)
+
+    result = await executor.execute_run(
+        db, uuid.uuid4(), _strategy(), _hedge_config(), _validation(approved_lots=13),
+    )
+    assert result.status == "completed"
+
+    events = [e for e in db.added if isinstance(e, StrategyRunEvent)]
+    triggered = next(e for e in events if e.reason_code == "DELTA_HEDGE_TRIGGERED")
+    executed  = next(e for e in events if e.reason_code == "DELTA_HEDGE_EXECUTED")
+    hedge_leg = next(l for l in db.added
+                     if isinstance(l, StrategyRunLeg) and l.leg_index >= 4)
+
+    # Pre-hedge delta comes from TRIGGERED; EXECUTED carries the post-hedge one.
+    expected_lots = hedge_lots_for_delta(
+        net_delta=triggered.payload_json["net_delta"],
+        option_delta=executed.payload_json["unit_delta"],
+        lot_size=75,
+        max_lots=13,
+        mode="PARTIAL",
+    )
+
+    assert expected_lots > 0, "fixture should breach hard enough to need a hedge"
+    assert executed.payload_json["lots"] == expected_lots
+    assert hedge_leg.quantity == 75 * expected_lots
+    # And the sizing genuinely did its job: strictly smaller than the straddle.
+    assert hedge_leg.quantity < 13 * 75

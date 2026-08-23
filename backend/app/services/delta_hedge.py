@@ -180,3 +180,74 @@ def signed_position_delta(
     delta = black_scholes_delta(spot, strike, years, sigma, option_type)
     multiplier = -1 if side.upper() == "SELL" else 1
     return multiplier * delta * quantity
+
+
+# Below this per-unit delta the hedge instrument barely moves the book, so the
+# lots required explode. Treat as un-hedgeable rather than dividing by ~zero.
+MIN_HEDGE_OPTION_DELTA = 0.01
+
+
+def is_hedgeable_delta(option_delta: Optional[float]) -> bool:
+    """Whether an instrument moves the book enough to hedge with at all.
+
+    A zero-lot sizing result has two very different causes, and callers must be
+    able to tell them apart: the wing is nearly delta-less (this returns False,
+    and hedging would *under*shoot by a mile), or the imbalance genuinely fits
+    in less than one lot (this returns True). Note the latter is unreachable
+    whenever `delta_threshold >= lot_size`, since |option_delta| <= 1 means
+    lots >= floor(threshold / lot_size) >= 1.
+    """
+    return option_delta is not None and abs(option_delta) >= MIN_HEDGE_OPTION_DELTA
+
+
+def unit_delta_for_option(
+    *,
+    option_type: str,
+    price: Optional[float],
+    spot: Optional[float],
+    strike: float,
+    timestamp: datetime,
+    expiry_date: date,
+    vix: Optional[float],
+    default_iv: float = DEFAULT_IV,
+) -> Optional[float]:
+    """Signed per-unit delta of a single option, independent of position size."""
+    if price is None or spot is None:
+        return None
+    years = years_to_expiry(timestamp, expiry_date)
+    sigma = volatility_for_delta(price, spot, strike, years, option_type, vix, default_iv)
+    return black_scholes_delta(spot, strike, years, sigma, option_type)
+
+
+def hedge_lots_for_delta(
+    *,
+    net_delta: float,
+    option_delta: Optional[float],
+    lot_size: int,
+    max_lots: int,
+    mode: str = "PARTIAL",
+) -> int:
+    """Lots of the hedge option needed to pull net delta toward zero.
+
+    FULL preserves the historical behaviour of hedging with the whole position
+    size. PARTIAL sizes to the actual imbalance and *rounds down*, so the
+    residual delta always keeps the sign it started with — the hedge can never
+    overshoot through zero and invert the book. Returns 0 when the gap is too
+    small for even one lot; callers should then skip the hedge without
+    consuming a trigger.
+    """
+    max_lots = max(0, int(max_lots))
+    if max_lots == 0 or lot_size <= 0:
+        return 0
+
+    if str(mode).upper() == "FULL":
+        return max_lots
+
+    if not is_hedgeable_delta(option_delta):
+        return 0
+
+    delta_per_lot = abs(option_delta) * lot_size
+    if delta_per_lot <= 0:
+        return 0
+
+    return max(0, min(max_lots, math.floor(abs(net_delta) / delta_per_lot)))
