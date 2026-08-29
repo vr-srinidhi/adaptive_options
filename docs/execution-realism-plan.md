@@ -70,10 +70,11 @@ Merged per the revised approach: the shadow fills from **live** depth, so it doe
 ### Phase A — Depth capture — **BUILT** *(29 Aug)*
 
 - `fetch_quote_with_depth()` in `zerodha_client` (additive; existing `fetch_live_quote` untouched).
-- Table `option_depth_snapshots`: `trade_date, timestamp, symbol, strike, option_type, last_price, bid, ask, bid_qty, ask_qty, depth_json, volume, open_interest, session_id`.
-  - `expiry_date` and `captured_by` from the v0.1 sketch were dropped: expiry is derivable from `symbol`, and `session_id` identifies the capturing slot more usefully than a free-text label. `volume`/`open_interest` were added since the payload already carries them.
-- Written from the existing poll, per §4(a), via `asyncio.create_task` — fire-and-forget, so capture can never delay the trading loop.
-- Every failure path in `depth_capture.py` swallows and returns `None`. Verified with a malformed payload.
+- Table `option_depth_snapshots`: `trade_date, timestamp, symbol, strike, option_type, expiry_date, last_price, bid, ask, bid_qty, ask_qty, depth_json, volume, open_interest, session_id`.
+  - `captured_by` from the v0.1 sketch was dropped — `session_id` identifies the capturing slot more usefully than a free-text label. `volume`/`open_interest` were added since the payload already carries them.
+- Written from the existing poll, per §4(a), through a **bounded queue drained by one background writer**. The trading loop only ever calls a non-blocking `put_nowait`; when the queue is full, snapshots are dropped. A task-per-poll design was rejected in review: writers could accumulate without limit and compete with hedge and square-off writes for the same connection pool.
+- **Strike and option type are passed in by the engine**, which already resolved them from the instruments master. Parsing them back out of the tradingsymbol is only a fallback, and must handle both NSE formats — the weekly form (`NIFTY2690124300CE`) runs the expiry straight into the strike, so a naive trailing-digit match yields `2690124300`: a wrong strike that also overflows `INTEGER`.
+- Rows are validated individually and bad ones skipped, so one malformed quote costs one row rather than the whole poll.
 - Retention: full depth is verbose — 4 symbols × 6/min × 375 min ≈ 9k rows/slot/day. Acceptable; revisit after a month.
 
 **Deliverable:** every trial session from Monday is retrospectively analysable. This was the only time-critical phase.

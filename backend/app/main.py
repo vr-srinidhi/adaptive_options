@@ -105,6 +105,10 @@ async def shutdown():
     from app.services.scheduler import shutdown_scheduler
     shutdown_scheduler()
 
+    # Flush any depth snapshots still queued for writing.
+    from app.services.depth_capture import stop_depth_writer
+    await stop_depth_writer()
+
 
 app.include_router(backtest.router, prefix="/api")
 app.include_router(auth.router, prefix="/api")

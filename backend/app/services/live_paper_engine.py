@@ -50,7 +50,7 @@ from app.services.delta_hedge import (
     signed_position_delta,
     unit_delta_for_option,
 )
-from app.services.depth_capture import persist_depth
+from app.services.depth_capture import capture_depth
 from app.services.token_store import get_broker_token
 from app.services.zerodha_client import (
     SPOT_SYMBOLS, VIX_SYMBOL, fetch_live_quote, fetch_quote_with_depth, find_option_symbol,
@@ -974,11 +974,24 @@ async def _run_session(
                 log.warning("Live paper: option fetch failed at %s: %s", t, exc)
                 opt_quotes, opt_raw = {}, {}
 
-            # Analytics only, and deliberately fire-and-forget: depth capture
-            # must never delay or break the trading loop.
+            # Analytics only. capture_depth() is non-blocking and drops on a
+            # full queue, so it can neither delay the loop nor accumulate
+            # writers competing for the connection pool.
             if opt_raw:
-                asyncio.create_task(
-                    persist_depth(opt_raw, now, trade_date, session_id=str(session_id))
+                capture_depth(
+                    opt_raw, now, trade_date,
+                    # We already resolved these from the instruments master;
+                    # passing them beats re-parsing the tradingsymbol.
+                    meta={
+                        s: (k, o) for s, k, o in (
+                            (ce_symbol, atm_strike, "CE"),
+                            (pe_symbol, atm_strike, "PE"),
+                            (wing_ce_symbol, wing_ce_strike, "CE"),
+                            (wing_pe_symbol, wing_pe_strike, "PE"),
+                        ) if s
+                    },
+                    expiry_date=expiry_date,
+                    session_id=str(session_id),
                 )
 
             s_ce_price = opt_quotes.get(ce_symbol)

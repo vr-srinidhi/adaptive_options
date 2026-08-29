@@ -473,13 +473,16 @@ async def test_run_session_resolves_enters_locks_and_time_exits(monkeypatch):
 
     captured: list = []
 
-    async def fake_persist_depth(raw, ts, trade_date, session_id=None):
-        captured.append((ts, sorted(raw)))
-        return len(raw)
+    def fake_capture_depth(raw, ts, trade_date, *, meta=None, expiry_date=None, session_id=None):
+        captured.append({
+            "ts": ts, "symbols": sorted(raw), "meta": meta,
+            "expiry_date": expiry_date, "session_id": session_id,
+        })
+        return True
 
     monkeypatch.setattr(live_paper_engine, "fetch_live_quote", fake_quote)
     monkeypatch.setattr(live_paper_engine, "fetch_quote_with_depth", fake_quote_with_depth)
-    monkeypatch.setattr(live_paper_engine, "persist_depth", fake_persist_depth)
+    monkeypatch.setattr(live_paper_engine, "capture_depth", fake_capture_depth)
 
     config = _make_config(
         user_id=uuid.uuid4(),
@@ -498,6 +501,18 @@ async def test_run_session_resolves_enters_locks_and_time_exits(monkeypatch):
     await live_paper_engine._run_session(session_id, config, "token")
 
     assert live_paper_engine.is_session_active(session_id) is False
+
+    # Depth capture actually ran, and carried the strikes the engine had already
+    # resolved rather than leaving them to be re-parsed from the symbol.
+    assert captured, "capture_depth was never called"
+    first = captured[0]
+    assert first["session_id"] == str(session_id)
+    assert first["symbols"], "no symbols captured"
+    for symbol, (strike, opt_type) in first["meta"].items():
+        assert symbol in first["symbols"]
+        assert isinstance(strike, int) and opt_type in ("CE", "PE")
+    assert {o for _, o in first["meta"].values()} == {"CE", "PE"}
+    assert first["expiry_date"] is not None
     assert any(isinstance(obj, StrategyRun) for obj in recording_session.added)
     assert len([obj for obj in recording_session.added if isinstance(obj, StrategyRunLeg)]) >= 2
     assert any(fields.get("status") == "entered" for _sid, fields in updates)

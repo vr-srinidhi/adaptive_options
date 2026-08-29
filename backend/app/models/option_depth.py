@@ -33,6 +33,9 @@ class OptionDepthSnapshot(Base):
     strike      = Column(Integer, nullable=True)
     option_type = Column(String(5), nullable=True)
 
+    # Passed in by the engine, which resolved it from the instruments master.
+    expiry_date = Column(Date, nullable=True)
+
     last_price = Column(Numeric(12, 2), nullable=True)
 
     # Top of book — the numbers a realistic fill actually uses.
