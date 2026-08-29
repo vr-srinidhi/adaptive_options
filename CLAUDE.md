@@ -6,7 +6,7 @@ This file gives Claude Code full context about the project so it can assist effe
 
 ## Project Summary
 
-**Adaptive Options** is a full-stack options backtesting + paper-trading platform for NSE index options (Nifty 50, Bank Nifty). It has nine modules:
+**Adaptive Options** is a full-stack options backtesting + paper-trading platform for NSE index options (Nifty 50, Bank Nifty). It has ten modules:
 
 1. **Synthetic Backtest** — simulates Iron Condor, Bull Put Spread, and Bear Call Spread strategies using deterministic synthetic candle data with auto-regime detection (EMA/RSI/IV Rank).
 2. **Paper Trading ORB Replay** — replays a real historical trading day using **live Zerodha market data**. Evaluates the Opening Range Breakout (ORB) strategy through a G1–G7 gate stack, records every minute decision, and produces full audit logs + candle data.
@@ -16,6 +16,7 @@ This file gives Claude Code full context about the project so it can assist effe
 6. **Live Paper Trading** — self-driving intraday engine that runs the Short Straddle Dual Lock strategy against live Zerodha market data every market day. APScheduler fires at 09:14 IST; UI (`/workbench/live`) is a read-only SSE viewer. Completed sessions write to the same `strategy_runs` tables so ReplayAnalyzer works unchanged. Flip to live execution via `execution_mode: live` config flag (currently paper only). **Live Payoff Chart** (`PayoffChart` component in `LivePaperMonitor.jsx`) renders a real-time at-expiry P&L curve across a spot range (ATM ± 500). Chart updates on every SSE MTM tick; automatically shifts from tent shape to Iron Butterfly shape when BUY_WING delta hedge legs are added. Wing/hedge BUY leg prices are also surfaced in the CE/PE Premium charts (fix: removed `side == "SELL"` filter from `_get_mtm_series()` in `live_paper.py`).
 7. **4PM Live Data Sync** — daily scheduled job (APScheduler, 16:00 IST weekdays) that fills the historical warehouse with today's live Zerodha candle data (spot, VIX, futures, options). Fill-missing-only — skips rows that already exist. Persists an audit row in `live_data_sync_runs`. Accessible via `GET/POST /api/v2/live-paper/data-sync/today`. UI status panel in `LivePaperMonitor.jsx`.
 8. **Delta Hedge Trigger** — opt-in per-slot feature for the Short Straddle live paper and backtest engines. Computes Black-Scholes net position delta every refresh cycle; when `|net_delta| > delta_threshold` buys the tested-side OTM wing (BUY_WING). Controlled by `delta_hedge_enabled` flag — zero overhead when OFF. Phase 1 only: BUY_WING action. REDUCE_LOTS / FUTURES_HEDGE / FULL_EXIT are Phase 2.
+10. **Execution Cost Report** — offline, read-only job that re-prices a session's recorded fills against the depth captured at that instant, answering how much the assumed-price P&L overstates reality. Reports a **range** (mid = optimistic, walked = pessimistic) plus coverage, never a point estimate. Run via `backend/execution_cost_report.py`. Requires captured depth, so it only works forward from the day capture shipped.
 9. **Option Depth Capture** — records the bid/ask ladder already present in every live `quote()` reply into `option_depth_snapshots`. Exists because all P&L in this system assumes we transact at the observed price, while real fills happen at the bid (selling) or ask (buying); Zerodha does **not** serve historical depth, so an uncaptured session can never be analysed later. Adds zero API calls. Analytics only — **no trading path reads this table**. See `docs/depth-capture-spec.md`.
 
 Scope: **backtesting and paper trading only** — no live order placement.
@@ -151,6 +152,7 @@ Adaptive_options/
 │           ├── live_ingestion.py         ← fill-missing-only Zerodha live candle ingestor
 │           ├── delta_hedge.py            ← Black-Scholes delta, IV inversion (Newton-Raphson), DeltaHedgeSettings, signed_position_delta, hedge_lots_for_delta
 │           ├── depth_capture.py          ← bounded-queue depth writer: capture_depth / persist_depth / stop_depth_writer
+│           ├── execution_cost.py        ← post-hoc fill re-pricing against captured depth (walk_book, cost_session)
 │           └── scheduler.py             ← APScheduler AsyncIOScheduler; 09:14 IST live paper job + 16:00 IST data sync job
 └── frontend/
     ├── Dockerfile

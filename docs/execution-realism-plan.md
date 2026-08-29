@@ -1,8 +1,8 @@
 # Plan: Execution Realism and the Virtual Broker
 
-Version: 0.2
+Version: 0.3
 Date: 29 August 2026
-Status: §4 decided, Phase A built. Phases B–E still proposal.
+Status: §4 decided. Phase A built. Phase B built (reshaped — see below). Phases C–E proposal.
 Scope: **Additive only.** No change to `short_straddle_dual_lock`, `live_paper_engine`, or the four A/B slots — with one exception called out in §4, which needs an explicit decision.
 
 ## 1. Problem
@@ -81,16 +81,41 @@ Merged per the revised approach: the shadow fills from **live** depth, so it doe
 
 **Not yet proven:** capture has been verified against a synthetic payload and the local DB, but has **never run against a live market session**. First real proof comes Monday; until then treat Phase B's inputs as unconfirmed.
 
-### Phase B — Measurement *(continuous, no build)*
+### Phase B — Measurement — **BUILT as a post-hoc report** *(29 Aug)*
 
-From captured data, answer:
-- Spread as % of premium at 09:50 / 10:15, and how it moves into 15:25.
-- Lots resting at the touch versus our 13.
-- Whether spread widens materially on the hedge strikes when they are moving.
+**Reshaped from the v0.1 sketch.** That version treated measurement as analysis to be done by hand, with the real re-pricing deferred to the Phase C shadow engine. Inspecting the data showed the shadow is not needed for measurement at all: sessions are already fully reconstructable.
 
-**Exit criterion:** a single number — expected execution cost per session. If that is small relative to typical P&L, Phase C is informational; if large, it is the most important work in the project.
+```
+ENTRY        09:50:00.342  legs[] with side, price, strike, option_type
+DELTA_HEDGE  09:50:12.048  lots 13, price 10.0, strike 24150, quantity 975, PE
+```
 
-### Phase C — Virtual broker + shadow engine
+Every simulated fill carries a sub-second timestamp, and depth is captured on the same poll cycle. So cost can be computed **offline, after the fact** — join what we did against what was on offer at that instant and walk the book for our size.
+
+This is strictly better than a live shadow as a first build: read-only, no API load, no coupling to `live_paper_engine`, and **the decision-mirroring problem in §7.2 does not arise** — we are replaying the real session's own decisions, not re-deriving them.
+
+Built as `app/services/execution_cost.py` + `execution_cost_report.py`:
+
+```
+python execution_cost_report.py 2026-09-01 2026-09-05 -v
+```
+
+Reports two bounds per session, never a point estimate:
+
+| Bound | Meaning |
+|---|---|
+| `mid` | fill at (bid+ask)/2 — optimistic |
+| `walked` | fill from the touch, consuming real resting size — pessimistic |
+
+Also reports **coverage** (fraction of fills that could be priced). A cost figure drawn from 30% coverage is not a session cost, and the report says so rather than extrapolating. Fills whose opening event cannot be identified are left unpriced rather than matched to an arbitrary book, and a session with no depth reports zero *coverage*, never zero *cost*.
+
+**Answers the original question directly:** "based on the price this is how the P&L looks; based on the depth available, this is how it actually looks."
+
+**Exit criterion unchanged:** expected execution cost per session. Small relative to typical P&L → Phase C is informational. Large → it is the most important work in the project.
+
+### Phase C — Virtual broker + shadow engine *(gated on Phase B's number)*
+
+**Do not start this until Phase B has produced a real figure.** Post-hoc costing measures the cost; a shadow engine is only required once execution differences would change *decisions* — a partial fill leaves different residual risk, which shifts when the hedge fires. That is a real effect, but it is second-order to the cost itself and should not be built on speculation.
 
 ```
 app/services/execution/
@@ -132,7 +157,7 @@ Until then, shadow output should be quoted as a **range**, never a point estimat
 ## 7. Open questions
 
 1. ~~**§4 decision**~~ — resolved: (a), built.
-2. **Decision mirroring** — how does the shadow guarantee identical decisions to the paper slot without coupling to it? Options: re-run the same logic from the same inputs, or have the paper slot emit a decision stream the shadow consumes. The latter is cleaner but touches the frozen file.
+2. ~~**Decision mirroring**~~ — dissolved for measurement: the post-hoc report replays the session's own recorded decisions, so there is nothing to mirror. It returns only if Phase C is built.
 3. **Confirm Kite's quote rate limit** before any design that increases call volume.
 4. **Retention policy** for depth snapshots beyond one month.
 5. Should the shadow also model **latency** — the gap between decision and fill? Real orders are not instantaneous, and on a fast move that gap can exceed the spread.
