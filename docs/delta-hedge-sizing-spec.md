@@ -2,7 +2,7 @@
 
 Version: 1.0
 Date: 23 August 2026
-Status: In Review (PR #65)
+Status: Merged (PR #65, 23 August 2026)
 Scope: `short_straddle_dual_lock` only
 Supersedes: sizing behaviour implied by `delta-hedge-trigger-prd.md` §Configuration
 
