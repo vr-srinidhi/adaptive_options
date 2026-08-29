@@ -14,5 +14,7 @@ RUN npm run build
 FROM nginx:1.25-alpine
 COPY --from=builder /app/dist /usr/share/nginx/html
 COPY nginx.conf /etc/nginx/conf.d/default.conf.template
+COPY docker-entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
 EXPOSE 80
-CMD ["/bin/sh", "-c", "PORT=${PORT:-80} BACKEND_URL=${BACKEND_URL:-http://backend:8000} envsubst '$PORT $BACKEND_URL' < /etc/nginx/conf.d/default.conf.template > /etc/nginx/conf.d/default.conf && nginx -g 'daemon off;'"]
+CMD ["/entrypoint.sh"]
