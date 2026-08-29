@@ -6,7 +6,7 @@ This file gives Claude Code full context about the project so it can assist effe
 
 ## Project Summary
 
-**Adaptive Options** is a full-stack options backtesting + paper-trading platform for NSE index options (Nifty 50, Bank Nifty). It has five modules:
+**Adaptive Options** is a full-stack options backtesting + paper-trading platform for NSE index options (Nifty 50, Bank Nifty). It has nine modules:
 
 1. **Synthetic Backtest** — simulates Iron Condor, Bull Put Spread, and Bear Call Spread strategies using deterministic synthetic candle data with auto-regime detection (EMA/RSI/IV Rank).
 2. **Paper Trading ORB Replay** — replays a real historical trading day using **live Zerodha market data**. Evaluates the Opening Range Breakout (ORB) strategy through a G1–G7 gate stack, records every minute decision, and produces full audit logs + candle data.
@@ -16,6 +16,7 @@ This file gives Claude Code full context about the project so it can assist effe
 6. **Live Paper Trading** — self-driving intraday engine that runs the Short Straddle Dual Lock strategy against live Zerodha market data every market day. APScheduler fires at 09:14 IST; UI (`/workbench/live`) is a read-only SSE viewer. Completed sessions write to the same `strategy_runs` tables so ReplayAnalyzer works unchanged. Flip to live execution via `execution_mode: live` config flag (currently paper only). **Live Payoff Chart** (`PayoffChart` component in `LivePaperMonitor.jsx`) renders a real-time at-expiry P&L curve across a spot range (ATM ± 500). Chart updates on every SSE MTM tick; automatically shifts from tent shape to Iron Butterfly shape when BUY_WING delta hedge legs are added. Wing/hedge BUY leg prices are also surfaced in the CE/PE Premium charts (fix: removed `side == "SELL"` filter from `_get_mtm_series()` in `live_paper.py`).
 7. **4PM Live Data Sync** — daily scheduled job (APScheduler, 16:00 IST weekdays) that fills the historical warehouse with today's live Zerodha candle data (spot, VIX, futures, options). Fill-missing-only — skips rows that already exist. Persists an audit row in `live_data_sync_runs`. Accessible via `GET/POST /api/v2/live-paper/data-sync/today`. UI status panel in `LivePaperMonitor.jsx`.
 8. **Delta Hedge Trigger** — opt-in per-slot feature for the Short Straddle live paper and backtest engines. Computes Black-Scholes net position delta every refresh cycle; when `|net_delta| > delta_threshold` buys the tested-side OTM wing (BUY_WING). Controlled by `delta_hedge_enabled` flag — zero overhead when OFF. Phase 1 only: BUY_WING action. REDUCE_LOTS / FUTURES_HEDGE / FULL_EXIT are Phase 2.
+9. **Option Depth Capture** — records the bid/ask ladder already present in every live `quote()` reply into `option_depth_snapshots`. Exists because all P&L in this system assumes we transact at the observed price, while real fills happen at the bid (selling) or ask (buying); Zerodha does **not** serve historical depth, so an uncaptured session can never be analysed later. Adds zero API calls. Analytics only — **no trading path reads this table**. See `docs/depth-capture-spec.md`.
 
 Scope: **backtesting and paper trading only** — no live order placement.
 
@@ -108,7 +109,8 @@ Adaptive_options/
 │       │   ├── user.py          ← User model
 │       │   ├── broker_token.py  ← encrypted Zerodha token storage
 │       │   ├── audit_log.py     ← security audit events
-│       │   └── live_data_sync.py ← LiveDataSyncRun ORM model
+│       │   ├── live_data_sync.py ← LiveDataSyncRun ORM model
+│       │   └── option_depth.py  ← OptionDepthSnapshot ORM model
 │       ├── routers/
 │       │   ├── live_paper.py    ← /api/v2/live-paper/* endpoints + SSE stream
 │       │   ├── backtest.py      ← synthetic backtest endpoints
@@ -147,7 +149,8 @@ Adaptive_options/
 │           ├── straddle_adjustment_executor.py ← Short Straddle backtest executor with dual-lock + delta hedge
 │           ├── live_data_sync.py         ← 4PM warehouse sync orchestrator (create_started_live_data_sync_run, run_daily_live_data_sync)
 │           ├── live_ingestion.py         ← fill-missing-only Zerodha live candle ingestor
-│           ├── delta_hedge.py            ← Black-Scholes delta, IV inversion (Newton-Raphson), DeltaHedgeSettings, signed_position_delta
+│           ├── delta_hedge.py            ← Black-Scholes delta, IV inversion (Newton-Raphson), DeltaHedgeSettings, signed_position_delta, hedge_lots_for_delta
+│           ├── depth_capture.py          ← bounded-queue depth writer: capture_depth / persist_depth / stop_depth_writer
 │           └── scheduler.py             ← APScheduler AsyncIOScheduler; 09:14 IST live paper job + 16:00 IST data sync job
 └── frontend/
     ├── Dockerfile
@@ -582,12 +585,13 @@ JSONB columns: `legs` (option leg objects), `min_data` (`{time, spot, pnl}` per 
 | `strategy_leg_mtm` | One row per leg per minute — individual leg price + stale_minutes (`timezone=False` columns) |
 | `strategy_run_events` | ENTRY, EXIT, HOLD, NO_TRADE events with payload JSON (`timezone=False` columns) |
 
-### Live Paper Trading (3 tables)
+### Live Paper Trading (4 tables)
 
 | Table | Description |
 |-------|-------------|
 | `live_paper_configs` | One row per user — strategy_id, instrument, capital, entry_time, params_json (JSONB, includes delta hedge settings), enabled, execution_mode |
 | `live_paper_sessions` | One row per trading day — status flow: `scheduled→waiting→entered→exited/no_trade/error`; holds ATM, symbols, lots, lock_status, strategy_run_id FK; `net_delta_latest`, `delta_hedge_status` (`off\|monitoring\|hedged\|exhausted`), `delta_hedge_count` |
+| `option_depth_snapshots` | One row per option per live poll — `trade_date`, `timestamp`, `symbol`, `strike`, `option_type`, `expiry_date`, `last_price`, `bid`/`ask`, `bid_qty`/`ask_qty`, `depth_json` (full 5-level ladder), `volume`, `open_interest`, `session_id`. ~9k rows/slot/day. Written best-effort by the live poll; **no trading path reads it**. `session_id` is deliberately not an FK so deleting a session never blocks on captured market data. |
 | `live_data_sync_runs` | One row per 4PM warehouse sync run — `trade_date`, `triggered_by` (`scheduler\|manual`), `token_status`, `status` (STARTED/SUCCESS/PARTIAL_SUCCESS/FAILED/SKIPPED_*), row counts per series, `expiries_json`, `failed_items_json`, `error_message` |
 
 ---
@@ -739,6 +743,11 @@ Self-driving intraday engine. Architecture decisions:
 - The once-per-episode reset of `undersized_logged` / `wing_unavailable_logged` must stay **outside** the `not delta_reentry_armed` branch in both engines. A skip deliberately leaves the hedge armed, so a reset placed inside that branch never runs after a skip-only episode and the notes degrade to once per session.
 - `DELTA_HEDGE_SKIPPED_LOW_DELTA` and `DELTA_HEDGE_SKIPPED_UNDERSIZED` describe opposite causes (hedging would undershoot vs overshoot). Classify with `is_hedgeable_delta()`; do not collapse them into one code.
 - Delta hedging is scoped to `short_straddle_dual_lock` via `_DELTA_HEDGE_STRATEGY_ID` in both engines. `straddle_adjustment_v1` also runs `short_straddle_profit_lock`, which must never hedge.
+- Depth capture must never affect trading. `capture_depth()` is **synchronous and non-blocking** — it enqueues and returns; the loop never awaits a database write. Do not replace it with `asyncio.create_task(persist_depth(...))`: task-per-poll is unbounded, and because those writers share the trading connection pool they can starve hedge and square-off writes under a slow DB. **One background writer is the load-bearing property** — it caps analytics at a single pooled connection however slow the database becomes.
+- A full depth queue **drops** the snapshot rather than blocking. Losing analytics is always preferable to delaying a trade. Do not change this to `await queue.put()`.
+- `option_depth_snapshots.strike` / `option_type` / `expiry_date` are **passed in** by the engine, which already resolved them from the instruments master. Symbol parsing in `depth_capture.parse_symbol` is only a fallback and must keep handling **both** NSE formats: monthly `NIFTY25AUG24300CE` and weekly `NIFTY2690124300CE` (`YY` + month + `DD` + strike, month codes 1-9 then O/N/D). A trailing-digit match reads the weekly strike as `2690124300` — wrong, and past `INTEGER`, so the insert fails. Try monthly first; the weekly pattern can mis-split a monthly symbol.
+- `depth_capture` validates rows individually and, if a batch commit still fails, retries them one at a time — so one malformed quote costs one row, not the whole poll. Do not collapse it back to a bare `add_all` + single commit.
+- `stop_depth_writer()` must stay wired into `main.py` shutdown, or queued snapshots are lost on restart.
 - `if not delta_settings.enabled: return None` guard in `_compute_net_delta` — ensures zero computation overhead when the feature is off; do not remove.
 
 ---
