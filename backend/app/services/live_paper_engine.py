@@ -50,9 +50,10 @@ from app.services.delta_hedge import (
     signed_position_delta,
     unit_delta_for_option,
 )
+from app.services.depth_capture import persist_depth
 from app.services.token_store import get_broker_token
 from app.services.zerodha_client import (
-    SPOT_SYMBOLS, VIX_SYMBOL, fetch_live_quote, find_option_symbol,
+    SPOT_SYMBOLS, VIX_SYMBOL, fetch_live_quote, fetch_quote_with_depth, find_option_symbol,
     get_instruments_with_token,
 )
 
@@ -963,12 +964,22 @@ async def _run_session(
             # ── Fetch option prices ────────────────────────────────────────────
             option_syms = [s for s in [ce_symbol, pe_symbol, wing_ce_symbol, wing_pe_symbol] if s]
             try:
-                opt_quotes = await asyncio.to_thread(
-                    fetch_live_quote, option_syms, access_token
+                # Same underlying quote() call as before; we now also keep the
+                # bid/ask ladder it already returns instead of discarding it.
+                # No extra Zerodha request is made.
+                opt_quotes, opt_raw = await asyncio.to_thread(
+                    fetch_quote_with_depth, option_syms, access_token
                 )
             except Exception as exc:
                 log.warning("Live paper: option fetch failed at %s: %s", t, exc)
-                opt_quotes = {}
+                opt_quotes, opt_raw = {}, {}
+
+            # Analytics only, and deliberately fire-and-forget: depth capture
+            # must never delay or break the trading loop.
+            if opt_raw:
+                asyncio.create_task(
+                    persist_depth(opt_raw, now, trade_date, session_id=str(session_id))
+                )
 
             s_ce_price = opt_quotes.get(ce_symbol)
             s_pe_price = opt_quotes.get(pe_symbol)

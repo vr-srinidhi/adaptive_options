@@ -37,6 +37,7 @@ async def init_db():
     from app.models import strategy_run as _sr  # noqa
     from app.models import live_paper as _lp  # noqa
     from app.models import live_data_sync as _lds  # noqa
+    from app.models import option_depth as _od  # noqa
 
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)

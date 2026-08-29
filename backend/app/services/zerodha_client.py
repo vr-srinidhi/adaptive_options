@@ -15,7 +15,7 @@ Access token lifecycle:
 import logging
 import os
 from datetime import date, datetime, time
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 from kiteconnect import KiteConnect
 
@@ -267,6 +267,32 @@ def fetch_live_quote(symbols: List[str], access_token: str) -> Dict[str, float]:
         return {sym: float(data[sym]["last_price"]) for sym in symbols if sym in data}
     except Exception as exc:
         log.warning("fetch_live_quote failed for %s: %s", symbols, exc)
+        raise
+
+
+def fetch_quote_with_depth(
+    symbols: List[str], access_token: str
+) -> Tuple[Dict[str, float], Dict[str, dict]]:
+    """
+    Same underlying call as fetch_live_quote, but also returns the full payload.
+
+    Zerodha's quote() already includes 5-level bid/ask depth; fetch_live_quote
+    discards it. This returns both so a caller can keep behaviour identical
+    (use the price map) while persisting what was on offer.
+
+    Returns (prices, raw) where prices matches fetch_live_quote exactly.
+    """
+    if not API_KEY:
+        raise RuntimeError("ZERODHA_API_KEY environment variable is not set.")
+    kite = KiteConnect(api_key=API_KEY)
+    kite.set_access_token(access_token)
+    try:
+        data = kite.quote(symbols)
+        prices = {sym: float(data[sym]["last_price"]) for sym in symbols if sym in data}
+        raw = {sym: data[sym] for sym in symbols if sym in data}
+        return prices, raw
+    except Exception as exc:
+        log.warning("fetch_quote_with_depth failed for %s: %s", symbols, exc)
         raise
 
 

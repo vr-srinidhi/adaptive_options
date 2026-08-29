@@ -454,7 +454,32 @@ async def test_run_session_resolves_enters_locks_and_time_exits(monkeypatch):
     monkeypatch.setattr(live_paper_engine, "get_contract_spec", fake_contract_spec)
     monkeypatch.setattr(live_paper_engine, "get_instruments_with_token", fake_instruments)
     monkeypatch.setattr(live_paper_engine, "find_option_symbol", fake_find_symbol)
+    def fake_quote_with_depth(symbols, _token):
+        """Engine now uses the depth-returning variant for option quotes.
+        Prices must match fake_quote exactly; the raw payload carries a
+        minimal ladder so depth capture has something to persist."""
+        prices = fake_quote(symbols, _token)
+        raw = {
+            sym: {
+                "last_price": px,
+                "depth": {
+                    "buy":  [{"price": px - 0.25, "quantity": 750, "orders": 3}],
+                    "sell": [{"price": px + 0.25, "quantity": 750, "orders": 3}],
+                },
+            }
+            for sym, px in prices.items()
+        }
+        return prices, raw
+
+    captured: list = []
+
+    async def fake_persist_depth(raw, ts, trade_date, session_id=None):
+        captured.append((ts, sorted(raw)))
+        return len(raw)
+
     monkeypatch.setattr(live_paper_engine, "fetch_live_quote", fake_quote)
+    monkeypatch.setattr(live_paper_engine, "fetch_quote_with_depth", fake_quote_with_depth)
+    monkeypatch.setattr(live_paper_engine, "persist_depth", fake_persist_depth)
 
     config = _make_config(
         user_id=uuid.uuid4(),
