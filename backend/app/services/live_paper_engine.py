@@ -44,6 +44,7 @@ from app.services.charges_service import (
 )
 from app.services.contract_spec_service import get_contract_spec, resolve_atm_strike
 from app.services.delta_hedge import (
+    wing_lots_after_hedges,
     hedge_lots_for_delta,
     is_hedgeable_delta,
     parse_delta_hedge_settings,
@@ -73,6 +74,14 @@ _DELTA_HEDGE_STRATEGY_ID = "short_straddle_dual_lock"
 def _hedge_lots(hedge: Dict[str, Any], default_lots: int) -> int:
     """Lots for one hedge leg. Legacy/resumed rows without a size are full-size."""
     return int(hedge.get("lots") or default_lots)
+
+
+def _wing_lots(wing_lots: Optional[List[int]], idx: int, default_lots: int) -> int:
+    """Lots for one wing leg. Sessions locked before wing netting shipped have
+    no per-wing size recorded, so they fall back to full size."""
+    if not wing_lots or idx >= len(wing_lots) or wing_lots[idx] is None:
+        return default_lots
+    return int(wing_lots[idx])
 
 
 def _hedge_gross(hedges: List[Dict[str, Any]], lot_size: int, default_lots: int) -> float:
@@ -421,23 +430,37 @@ async def _load_resume_state(
 
         wing_entry_prices: List[Optional[float]] = [None, None]
         wing_leg_ids      = [uuid.uuid4(), uuid.uuid4()]
+        wing_lots: Optional[List[int]] = None
         wings_locked      = False
         lock_reason: Optional[str] = None
         raw_lock = session.lock_status or "none"
+        # Wings are leg_index 2 (CE) and 3 (PE); delta hedges start at 4. Match
+        # on the index rather than option_type -- a hedge shares the option type
+        # of the wing it protects, so matching by type can pick up a hedge leg.
         ce_lock = pe_lock = None
         if raw_lock.endswith("_locked"):
-            ce_lock = next((l for l in buy_legs if l.option_type == "CE"), None)
-            pe_lock = next((l for l in buy_legs if l.option_type == "PE"), None)
+            ce_lock = next((l for l in buy_legs if l.leg_index == 2), None)
+            pe_lock = next((l for l in buy_legs if l.leg_index == 3), None)
         lock_leg_ids = {l.id for l in (ce_lock, pe_lock) if l is not None}
         delta_buy_legs = [l for l in buy_legs if l.id not in lock_leg_ids]
-        if ce_lock and pe_lock:
+        if raw_lock.endswith("_locked"):
+            # A wing fully covered by hedges writes no leg, so the lock is not
+            # conditional on both being present.
             wings_locked = True
+            lock_reason  = raw_lock.replace("_locked", "")
             wing_entry_prices = [
-                float(ce_lock.entry_price) if ce_lock.entry_price else None,
-                float(pe_lock.entry_price) if pe_lock.entry_price else None,
+                float(l.entry_price) if l is not None and l.entry_price else None
+                for l in (ce_lock, pe_lock)
             ]
-            wing_leg_ids = [ce_lock.id, pe_lock.id]
-            lock_reason = raw_lock.replace("_locked", "")
+            wing_leg_ids = [
+                l.id if l is not None else uuid.uuid4() for l in (ce_lock, pe_lock)
+            ]
+            # Recover each wing's size from the persisted quantity; a missing
+            # leg means that side was fully netted against hedges.
+            wing_lots = [
+                int(l.quantity // lot_size) if (l is not None and l.quantity and lot_size) else 0
+                for l in (ce_lock, pe_lock)
+            ]
 
         # Reconstruct strike tuples from leg data
         ce_sell = next((l for l in sell_legs if l.option_type == "CE"), None)
@@ -463,10 +486,14 @@ async def _load_resume_state(
             compute_leg_entry_charges(approved_lots, lot_size, straddle_legs, straddle_entry_prices)
             if all(p is not None for p in straddle_entry_prices) else 0.0
         )
-        wing_entry_charges = (
-            compute_leg_entry_charges(approved_lots, lot_size, wing_legs, wing_entry_prices)
-            if wings_locked and all(p is not None for p in wing_entry_prices) else 0.0
-        )
+        wing_entry_charges = 0.0
+        if wings_locked:
+            for i, leg in enumerate(wing_legs):
+                lots_i = wing_lots[i] if wing_lots else approved_lots
+                if lots_i > 0 and wing_entry_prices[i] is not None:
+                    wing_entry_charges += compute_leg_entry_charges(
+                        lots_i, lot_size, [leg], [wing_entry_prices[i]]
+                    )
         delta_hedges: List[Dict[str, Any]] = []
         delta_hedge_charges = 0.0
         for leg in delta_buy_legs:
@@ -568,6 +595,7 @@ async def _load_resume_state(
         "wing_leg_ids":         wing_leg_ids,
         "wing_legs":            wing_legs,
         "wings_locked":         wings_locked,
+        "wing_lots":            wing_lots,
         "lock_reason":          lock_reason,
         "wing_ce_strike":       wing_ce_strike,
         "wing_pe_strike":       wing_pe_strike,
@@ -661,6 +689,7 @@ async def _run_session(
         wing_legs: List       = []
         wing_leg_ids          = [uuid.uuid4(), uuid.uuid4()]
         wings_locked          = False
+        wing_lots: Optional[List[int]] = None
         lock_reason: Optional[str] = None
         wing_lock_ts: Optional[datetime] = None
         wing_entry_charges    = 0.0
@@ -734,6 +763,7 @@ async def _run_session(
                 wing_leg_ids          = saved["wing_leg_ids"]
                 wing_legs             = saved["wing_legs"]
                 wings_locked          = saved["wings_locked"]
+                wing_lots             = saved["wing_lots"]
                 lock_reason           = saved["lock_reason"]
                 wing_ce_strike        = saved["wing_ce_strike"]
                 wing_pe_strike        = saved["wing_pe_strike"]
@@ -1115,10 +1145,10 @@ async def _run_session(
                 wpe_for_mtm = w_pe_price if w_pe_price is not None else wing_last_prices[1]
                 wing_cur = [wce_for_mtm, wpe_for_mtm]
                 wing_gross = sum(
-                    (cp - ep)
-                    for ep, cp in zip(wing_entry_prices, wing_cur)
+                    (cp - ep) * lot_size * _wing_lots(wing_lots, i, approved_lots)
+                    for i, (ep, cp) in enumerate(zip(wing_entry_prices, wing_cur))
                     if ep is not None and cp is not None
-                ) * lot_size * approved_lots
+                )
             else:
                 wing_cur = [w_ce_price, w_pe_price]
 
@@ -1127,16 +1157,23 @@ async def _run_session(
             gross_mtm = straddle_gross + wing_gross + delta_hedge_gross
 
             # Hedge legs are charged separately; they carry their own lot count.
-            if wings_locked:
-                active_legs = straddle_legs + wing_legs
-                all_cur     = list(straddle_cur) + list(wing_cur)
-            else:
-                active_legs = list(straddle_legs)
-                all_cur     = list(straddle_cur)
             est_exit = (
-                compute_leg_exit_charges_estimate(approved_lots, lot_size, active_legs, all_cur)
+                compute_leg_exit_charges_estimate(
+                    approved_lots, lot_size, list(straddle_legs), list(straddle_cur)
+                )
                 + _hedge_exit_charges(delta_hedges, lot_size, approved_lots)
             )
+            if wings_locked:
+                # Summed per leg: wings can differ in size from each other once
+                # netted against hedges. Charges are additive across legs, so
+                # this matches a combined call whenever the sizes are equal.
+                for i, (leg, cur) in enumerate(zip(wing_legs, wing_cur)):
+                    lots_i = _wing_lots(wing_lots, i, approved_lots)
+                    if lots_i <= 0 or cur is None:
+                        continue
+                    est_exit += compute_leg_exit_charges_estimate(
+                        lots_i, lot_size, [leg], [cur]
+                    )
 
             net_mtm = gross_mtm - entry_charges - wing_entry_charges - delta_hedge_charges - est_exit
 
@@ -1365,19 +1402,42 @@ async def _run_session(
                     lock_reason       = "profit" if profit_lock_hit else "loss"
                     wing_entry_prices = [w_ce_price, w_pe_price]
                     wing_lock_ts      = now
-                    wing_entry_charges = compute_leg_entry_charges(
-                        approved_lots, lot_size, wing_legs, wing_entry_prices
+
+                    # Net each wing against protection the delta hedge already
+                    # bought on that same contract. Both are driven by the same
+                    # adverse move, so they often land on the same strike within
+                    # a minute or two; buying full size on top would double the
+                    # long exposure at the worse of the two prices.
+                    wing_strikes = [wing_ce_strike, wing_pe_strike]
+                    wing_lots = [
+                        wing_lots_after_hedges(
+                            wing_strike=wing_strikes[i],
+                            option_type=wing_legs[i][1],
+                            approved_lots=approved_lots,
+                            delta_hedges=delta_hedges,
+                        )
+                        for i in range(len(wing_legs))
+                    ]
+                    wing_entry_charges = sum(
+                        compute_leg_entry_charges(
+                            wing_lots[i], lot_size, [wing_legs[i]], [wing_entry_prices[i]]
+                        )
+                        for i in range(len(wing_legs))
+                        if wing_lots[i] > 0 and wing_entry_prices[i] is not None
                     )
                     net_mtm -= wing_entry_charges
 
-                    # Persist wing legs
+                    # Persist wing legs. A wing fully covered by hedges buys
+                    # nothing, so no leg is written for it.
                     async with AsyncSessionLocal() as db:
                         for i, ((side, opt_type, strike), leg_id) in enumerate(zip(wing_legs, wing_leg_ids)):
+                            if wing_lots[i] <= 0:
+                                continue
                             db.add(StrategyRunLeg(
                                 id=leg_id, run_id=run_id, leg_index=i + 2,
-                                side=side, option_type=opt_type, strike=[wing_ce_strike, wing_pe_strike][i],
+                                side=side, option_type=opt_type, strike=wing_strikes[i],
                                 expiry_date=expiry_date,
-                                quantity=lot_size * approved_lots,
+                                quantity=lot_size * wing_lots[i],
                                 entry_price=wing_entry_prices[i],
                             ))
                         await db.commit()
@@ -1386,8 +1446,15 @@ async def _run_session(
                     await _write_event(run_id, now, "HOLD", "WINGS_LOCKED", payload={
                         "lock_reason": lock_reason,
                         "net_mtm_at_lock": round(net_mtm, 2),
-                        "wing_ce": {"strike": wing_ce_strike, "price": w_ce_price},
-                        "wing_pe": {"strike": wing_pe_strike, "price": w_pe_price},
+                        "approved_lots": approved_lots,
+                        "wing_ce": {"strike": wing_ce_strike, "price": w_ce_price,
+                                    "lots": wing_lots[0]},
+                        "wing_pe": {"strike": wing_pe_strike, "price": w_pe_price,
+                                    "lots": wing_lots[1]},
+                        # Lots not re-bought because a hedge already held them.
+                        "netted_against_hedges": [
+                            approved_lots - wing_lots[0], approved_lots - wing_lots[1]
+                        ],
                     })
                     await _update_session(
                         session_id,
@@ -1430,7 +1497,7 @@ async def _run_session(
             active_sides      = ["SELL", "SELL"] + (["BUY", "BUY"] if wings_locked else []) + [h["side"] for h in delta_hedges]
             active_stale      = [ce_stale, pe_stale] + ([wce_stale, wpe_stale] if wings_locked else []) + [h.get("stale", 0) for h in delta_hedges]
             # Hedge legs may be smaller than the straddle; mark each at its own size.
-            active_lots       = [approved_lots, approved_lots] + ([approved_lots, approved_lots] if wings_locked else []) + [_hedge_lots(h, approved_lots) for h in delta_hedges]
+            active_lots       = [approved_lots, approved_lots] + ([_wing_lots(wing_lots, 0, approved_lots), _wing_lots(wing_lots, 1, approved_lots)] if wings_locked else []) + [_hedge_lots(h, approved_lots) for h in delta_hedges]
             _due_for_db_write = (
                 _last_db_ts is None or
                 (now - _last_db_ts).total_seconds() >= poll_interval or
@@ -1495,26 +1562,30 @@ async def _run_session(
             if wings_locked:
                 exit_w = list(wing_last_prices)
                 wing_gross_pnl = sum(
-                    (xp - ep) * lot_size * approved_lots
-                    for ep, xp in zip(wing_entry_prices, exit_w) if ep and xp
+                    (xp - ep) * lot_size * _wing_lots(wing_lots, i, approved_lots)
+                    for i, (ep, xp) in enumerate(zip(wing_entry_prices, exit_w)) if ep and xp
                 )
             delta_hedge_gross_pnl = _hedge_gross(delta_hedges, lot_size, approved_lots)
             gross_pnl = straddle_gross_pnl + wing_gross_pnl + delta_hedge_gross_pnl
 
             # Hedge legs are charged separately; they carry their own lot count.
-            if wings_locked:
-                all_exit_legs   = straddle_legs + wing_legs
-                all_entry_p     = straddle_entry_prices + wing_entry_prices
-                all_exit_p      = list(straddle_last_prices) + list(wing_last_prices)
-            else:
-                all_exit_legs   = list(straddle_legs)
-                all_entry_p     = list(straddle_entry_prices)
-                all_exit_p      = list(straddle_last_prices)
-
             total_charges = (
-                compute_leg_total_charges(approved_lots, lot_size, all_exit_legs, all_entry_p, all_exit_p)
+                compute_leg_total_charges(
+                    approved_lots, lot_size, list(straddle_legs),
+                    list(straddle_entry_prices), list(straddle_last_prices),
+                )
                 + wing_entry_charges
             )
+            if wings_locked:
+                # Per leg: each wing carries its own netted size.
+                for i, leg in enumerate(wing_legs):
+                    lots_i = _wing_lots(wing_lots, i, approved_lots)
+                    if lots_i <= 0:
+                        continue
+                    total_charges += compute_leg_total_charges(
+                        lots_i, lot_size, [leg],
+                        [wing_entry_prices[i]], [wing_last_prices[i]],
+                    )
             for h in delta_hedges:
                 if h.get("entry_price") is None or h.get("last_price") is None:
                     continue
