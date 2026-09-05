@@ -427,7 +427,7 @@ _STRATEGIES = [
         ],
         "exit_rule": {
             "stop_capital_pct":  0.015,
-            "time_exit":         "15:25",
+            "time_exit":         "15:10",
             "data_gap_exit":     True,
             "trail_trigger":     12000,
             "trail_pct":         0.50,
@@ -508,7 +508,7 @@ _STRATEGIES = [
             ),
             "shape": "tent",
             "expiry_label": "Weekly (auto)",
-            "exit_rule": "Profit lock ₹20k / Loss lock ₹25k → buy wings / Trail 50% of peak / Stop 1.5% / Time 15:25",
+            "exit_rule": "Profit lock ₹20k / Loss lock ₹25k → buy wings / Trail 50% of peak / Stop 1.5% / Time 15:10",
             "constraint_fields": [
                 {"label": "Profit lock",  "value": "₹20,000", "hint": "buy wings when MTM reaches"},
                 {"label": "Loss lock",    "value": "−₹25,000","hint": "buy wings when MTM drops to"},
@@ -516,7 +516,7 @@ _STRATEGIES = [
                 {"label": "Trail trigger","value": "₹12,000",  "hint": "activate trailing stop"},
                 {"label": "Trail %",      "value": "50%",      "hint": "lock in % of peak MTM"},
                 {"label": "Stop",         "value": "1.5%",     "hint": "of capital"},
-                {"label": "Time exit",    "value": "15:25",    "hint": ""},
+                {"label": "Time exit",    "value": "15:10",    "hint": ""},
             ],
             "legs": [
                 {"side": "SELL", "option_type": "CE", "strike": "ATM",       "expiry": "Weekly", "premium": "auto"},
