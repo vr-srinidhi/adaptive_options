@@ -5,7 +5,10 @@ import uuid
 import pytest
 
 import app.services.straddle_adjustment_executor as executor
-from app.models.strategy_run import StrategyRun, StrategyRunEvent, StrategyRunLeg, StrategyRunMtm
+from app.services import charges_service
+from app.models.strategy_run import (
+    StrategyLegMtm, StrategyRun, StrategyRunEvent, StrategyRunLeg, StrategyRunMtm,
+)
 from app.services.generic_executor import ValidationResult
 
 
@@ -476,3 +479,137 @@ async def test_persisted_hedge_size_matches_the_sizing_helper(monkeypatch):
     assert hedge_leg.quantity == 75 * expected_lots
     # And the sizing genuinely did its job: strictly smaller than the straddle.
     assert hedge_leg.quantity < 13 * 75
+
+
+# ── Wing netting: downstream invariants ──────────────────────────────────────
+# These drive a full hedge -> lock -> MTM -> finalization pass, because the
+# netting helper being correct in isolation says nothing about whether the
+# quantity survives into delta, charges, per-leg P&L and the MTM stream.
+
+def _netting_config(**overrides):
+    """Hedge armed and the loss lock reachable, so the lock fires *after* a
+    hedge has already bought the tested wing -- the production pattern."""
+    values = _config(
+        delta_hedge_enabled=True,
+        delta_threshold=150,
+        lock_trigger=10_000_000,     # profit lock out of reach
+        loss_lock_trigger=50_000,    # loss lock fires once the rally bites
+        stop_capital_pct=0.9,
+    )
+    values.update(overrides)
+    return values
+
+
+async def _run_netting(monkeypatch, mode):
+    db = _FakeDb()
+    spot, index = _hedge_market()
+    await _patch_common_loaders(monkeypatch, spot, index)
+    result = await executor.execute_run(
+        db, uuid.uuid4(), _strategy(), _netting_config(hedge_qty_mode=mode),
+        _validation(approved_lots=13),
+    )
+    legs = [o for o in db.added if isinstance(o, StrategyRunLeg)]
+    return db, result, {l.leg_index: l for l in legs}
+
+
+@pytest.mark.asyncio
+async def test_partially_netted_wing_conserves_total_protection(monkeypatch):
+    db, result, legs = await _run_netting(monkeypatch, "PARTIAL")
+    lot = 75
+
+    hedge = next(l for i, l in legs.items() if i >= 4 and l.option_type == "CE")
+    hedge_lots = hedge.quantity // lot
+    assert 0 < hedge_lots < 13, "PARTIAL should size below the full position"
+
+    # The lock buys only the balance on the hedged side...
+    wing_ce = legs[2]
+    assert wing_ce.quantity == lot * (13 - hedge_lots)
+    # ...and the untouched side is still bought in full.
+    assert legs[3].quantity == lot * 13
+
+    # Total long protection on the tested side is exactly approved_lots.
+    assert hedge.quantity + wing_ce.quantity == lot * 13
+
+
+@pytest.mark.asyncio
+async def test_fully_netted_wing_writes_no_leg_and_no_leg_mtm(monkeypatch):
+    db, result, legs = await _run_netting(monkeypatch, "FULL")
+    lot = 75
+
+    hedge = next(l for i, l in legs.items() if i >= 4 and l.option_type == "CE")
+    assert hedge.quantity == lot * 13, "FULL buys the whole position size"
+
+    # Wing 2 is entirely covered by the hedge, so nothing was bought for it.
+    assert 2 not in legs, "a fully netted wing must not persist a leg"
+    assert legs[3].quantity == lot * 13, "the other wing is unaffected"
+
+    # And it must not leave per-leg MTM rows behind pointing at no leg:
+    # StrategyLegMtm.leg_id has no enforced FK, so orphans commit silently.
+    persisted_leg_ids = {l.id for l in legs.values()}
+    leg_mtm = [o for o in db.added if isinstance(o, StrategyLegMtm)]
+    assert leg_mtm, "expected some per-leg MTM rows"
+    orphans = [m for m in leg_mtm if m.leg_id not in persisted_leg_ids]
+    assert not orphans, f"{len(orphans)} MTM rows reference no persisted leg"
+
+
+@pytest.mark.asyncio
+async def test_wing_entry_charges_are_not_counted_twice(monkeypatch):
+    """total_charges must equal the sum of each leg's own round trip.
+
+    compute_leg_total_charges covers entry *and* exit, so adding
+    wing_entry_charges alongside it double-counted every locked wing's entry.
+    """
+    db, result, legs = await _run_netting(monkeypatch, "PARTIAL")
+    run = next(o for o in db.added if isinstance(o, StrategyRun))
+
+    expected = 0.0
+    for leg in legs.values():
+        if leg.entry_price is None or leg.exit_price is None:
+            continue
+        expected += charges_service.compute_leg_total_charges(
+            leg.quantity // 75, 75,
+            [(leg.side, leg.option_type, leg.strike)],
+            [float(leg.entry_price)], [float(leg.exit_price)],
+        )
+    assert float(run.total_charges) == pytest.approx(expected, abs=1.0)
+
+
+@pytest.mark.asyncio
+async def test_netted_wing_is_not_double_counted_in_net_delta(monkeypatch):
+    """Post-lock delta must reflect hedge + netted wing, not hedge + full wing.
+
+    Modelling 13 wing lots on top of the 10 they were netted against implies
+    protection that was never bought and drives later hedge decisions off it.
+    Asserting leg quantities alone would not catch this: the delta calculation
+    is a separate code path that reads the same sizes, so this pins it by
+    forcing the pre-fix sizing back in and requiring the delta to change.
+    """
+    db, _result, legs = await _run_netting(monkeypatch, "PARTIAL")
+    lot = 75
+    hedge_lots = next(l for i, l in legs.items() if i >= 4 and l.option_type == "CE").quantity // lot
+    assert hedge_lots + legs[2].quantity // lot == 13
+
+    def _post_lock_deltas(rows):
+        return [float(r.net_delta) for r in rows
+                if isinstance(r, StrategyRunMtm) and r.net_delta is not None]
+
+    netted = _post_lock_deltas(db.added)
+    assert netted, "expected delta to be recorded"
+
+    # Re-run with the netting helper forced back to full-size wings.
+    db2 = _FakeDb()
+    spot, index = _hedge_market()
+    await _patch_common_loaders(monkeypatch, spot, index)
+    monkeypatch.setattr(executor, "wing_lots_after_hedges",
+                        lambda **kw: kw["approved_lots"])
+    await executor.execute_run(
+        db2, uuid.uuid4(), _strategy(), _netting_config(hedge_qty_mode="PARTIAL"),
+        _validation(approved_lots=13),
+    )
+    full = _post_lock_deltas(db2.added)
+
+    assert full and len(full) == len(netted)
+    assert netted != full, (
+        "net delta is identical with full-size wings, so the delta calculation "
+        "is not reading the netted quantity"
+    )

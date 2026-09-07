@@ -1115,10 +1115,16 @@ export default function LivePaperMonitor() {
           }}
         }
         case 'LOCK': {
+          // Wings are netted against protection the delta hedge already holds,
+          // so each carries its own quantity and one may be zero (fully
+          // covered — nothing was bought). Without this the payoff chart falls
+          // back to full straddle size and draws protection that isn't there.
           const wingLegs = [
-            { side: 'BUY', option_type: 'CE', strike: data.wing_ce_strike, entry_price: data.wing_ce_price },
-            { side: 'BUY', option_type: 'PE', strike: data.wing_pe_strike, entry_price: data.wing_pe_price },
-          ]
+            { side: 'BUY', option_type: 'CE', strike: data.wing_ce_strike,
+              entry_price: data.wing_ce_price, quantity: data.wing_ce_quantity ?? null },
+            { side: 'BUY', option_type: 'PE', strike: data.wing_pe_strike,
+              entry_price: data.wing_pe_price, quantity: data.wing_pe_quantity ?? null },
+          ].filter((leg) => leg.quantity === null || leg.quantity > 0)
           return { ...prev, [sessionId]: {
             ...existing,
             session: { ...(existing.session || {}), lock_status: `${data.lock_reason}_locked` },

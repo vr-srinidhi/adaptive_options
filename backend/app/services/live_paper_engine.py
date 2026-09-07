@@ -853,9 +853,15 @@ async def _run_session(
                 ("SELL", "PE", atm_strike, straddle_cur[1], qty),
             ]
             if wings_locked and wing_ce_strike is not None and wing_pe_strike is not None:
+                # Netted wings carry their own size. Using the full straddle
+                # quantity here would model 13 lots of wing on top of the 5
+                # hedge lots it was netted against -- 18 lots of protection that
+                # was never bought -- and skew every subsequent hedge decision.
                 legs_for_delta.extend([
-                    ("BUY", "CE", wing_ce_strike, wing_cur[0], qty),
-                    ("BUY", "PE", wing_pe_strike, wing_cur[1], qty),
+                    ("BUY", "CE", wing_ce_strike, wing_cur[0],
+                     lot_size * _wing_lots(wing_lots, 0, approved_lots)),
+                    ("BUY", "PE", wing_pe_strike, wing_cur[1],
+                     lot_size * _wing_lots(wing_lots, 1, approved_lots)),
                 ])
             legs_for_delta.extend(
                 (h["side"], h["option_type"], h["strike"], h["last_price"],
@@ -1469,6 +1475,10 @@ async def _run_session(
                         "wing_pe_price": w_pe_price,
                         "wing_ce_strike": wing_ce_strike,
                         "wing_pe_strike": wing_pe_strike,
+                        # Per-wing size, so the payoff chart draws what was
+                        # actually bought. 0 means fully covered by hedges.
+                        "wing_ce_quantity": lot_size * wing_lots[0],
+                        "wing_pe_quantity": lot_size * wing_lots[1],
                     })
                     log.info("Live paper: %s fired at %s net_mtm=%.0f", label, t, net_mtm)
 
@@ -1491,13 +1501,21 @@ async def _run_session(
                     fired = "TIME_EXIT"
 
             # ── Persist MTM row (once per minute; SSE broadcasts every tick) ──
-            active_leg_ids    = straddle_leg_ids + (wing_leg_ids if wings_locked else []) + [h["id"] for h in delta_hedges]
-            active_cur_prices = list(straddle_cur) + (list(wing_cur) if wings_locked else []) + [h.get("last_price") for h in delta_hedges]
-            active_entry_p    = straddle_entry_prices + (wing_entry_prices if wings_locked else []) + [h.get("entry_price") for h in delta_hedges]
-            active_sides      = ["SELL", "SELL"] + (["BUY", "BUY"] if wings_locked else []) + [h["side"] for h in delta_hedges]
-            active_stale      = [ce_stale, pe_stale] + ([wce_stale, wpe_stale] if wings_locked else []) + [h.get("stale", 0) for h in delta_hedges]
-            # Hedge legs may be smaller than the straddle; mark each at its own size.
-            active_lots       = [approved_lots, approved_lots] + ([_wing_lots(wing_lots, 0, approved_lots), _wing_lots(wing_lots, 1, approved_lots)] if wings_locked else []) + [_hedge_lots(h, approved_lots) for h in delta_hedges]
+            # A fully netted wing buys nothing and writes no StrategyRunLeg, so
+            # it must not contribute per-leg MTM rows either -- leg_id has no
+            # enforced FK, so those rows would commit against a leg that does
+            # not exist.
+            _wing_slots = [
+                i for i in (0, 1)
+                if wings_locked and _wing_lots(wing_lots, i, approved_lots) > 0
+            ]
+            active_leg_ids    = straddle_leg_ids + [wing_leg_ids[i] for i in _wing_slots] + [h["id"] for h in delta_hedges]
+            active_cur_prices = list(straddle_cur) + [wing_cur[i] for i in _wing_slots] + [h.get("last_price") for h in delta_hedges]
+            active_entry_p    = straddle_entry_prices + [wing_entry_prices[i] for i in _wing_slots] + [h.get("entry_price") for h in delta_hedges]
+            active_sides      = ["SELL", "SELL"] + ["BUY" for _ in _wing_slots] + [h["side"] for h in delta_hedges]
+            active_stale      = [ce_stale, pe_stale] + [[wce_stale, wpe_stale][i] for i in _wing_slots] + [h.get("stale", 0) for h in delta_hedges]
+            # Hedge and wing legs may be smaller than the straddle; mark each at its own size.
+            active_lots       = [approved_lots, approved_lots] + [_wing_lots(wing_lots, i, approved_lots) for i in _wing_slots] + [_hedge_lots(h, approved_lots) for h in delta_hedges]
             _due_for_db_write = (
                 _last_db_ts is None or
                 (now - _last_db_ts).total_seconds() >= poll_interval or
@@ -1569,12 +1587,13 @@ async def _run_session(
             gross_pnl = straddle_gross_pnl + wing_gross_pnl + delta_hedge_gross_pnl
 
             # Hedge legs are charged separately; they carry their own lot count.
-            total_charges = (
-                compute_leg_total_charges(
-                    approved_lots, lot_size, list(straddle_legs),
-                    list(straddle_entry_prices), list(straddle_last_prices),
-                )
-                + wing_entry_charges
+            # compute_leg_total_charges is a round trip (entry + exit), so the
+            # per-wing loop below already accounts for wing entry. Adding
+            # wing_entry_charges here as well double-counted it -- pre-existing,
+            # and worth roughly a hundred rupees a locked session.
+            total_charges = compute_leg_total_charges(
+                approved_lots, lot_size, list(straddle_legs),
+                list(straddle_entry_prices), list(straddle_last_prices),
             )
             if wings_locked:
                 # Per leg: each wing carries its own netted size.
@@ -1624,7 +1643,11 @@ async def _run_session(
                             .where(StrategyRunLeg.id == leg_id)
                             .values(
                                 exit_price=xp,
-                                gross_leg_pnl=round((xp - ep) * lot_size * approved_lots, 2) if ep and xp else None,
+                                gross_leg_pnl=(
+                                    round((xp - ep) * lot_size
+                                          * _wing_lots(wing_lots, i, approved_lots), 2)
+                                    if ep and xp else None
+                                ),
                             )
                         )
                 for hedge in delta_hedges:
