@@ -294,8 +294,11 @@ async def main():
         print(f"  reported net P&L        {gross:>12,.0f}")
         print(f"  realistic net P&L       {gross - c_walked:>12,.0f}  ..  {gross - c_mid:,.0f}")
     if partial:
-        print(f"\n  {len(partial)} session(s) only partially costed -- execution cost above is a")
-        print(f"  lower bound for those, and no realistic P&L is shown for them.")
+        # Not a "lower bound": execution cost can be negative -- a fill better
+        # than the observed price is a credit -- so the uncosted fills can move
+        # the eventual total in either direction.
+        print(f"\n  {len(partial)} session(s) only partially costed -- execution cost above is an")
+        print(f"  incomplete subtotal for those, and no realistic P&L is shown for them.")
     return 0
 
 
