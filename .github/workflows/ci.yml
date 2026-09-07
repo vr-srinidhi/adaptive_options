@@ -107,10 +107,17 @@ jobs:
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
     runs-on: ubuntu-latest
 
-    defaults:
-      run:
-        working-directory: frontend
-
+    # Deliberately NOT `working-directory: frontend`. `railway up` uploads the
+    # working directory as the project root, and this service's Railway root
+    # directory is /frontend, so it looks for /frontend/railway.toml inside the
+    # upload. Uploading frontend/ puts that file at the upload root instead,
+    # Railway reports `service config at '/frontend/railway.toml' not found`,
+    # falls back to Railpack instead of the Dockerfile, and the deploy fails
+    # before it builds. Uploading the repo root is what makes the path resolve.
+    #
+    # deploy-backend keeps its working-directory: that service's root is not
+    # /backend, so uploading backend/ resolves correctly there. The two services
+    # are configured differently on purpose -- do not "fix" them to match.
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
