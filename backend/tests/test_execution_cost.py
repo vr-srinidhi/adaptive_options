@@ -3,21 +3,22 @@
 The book math is where a wrong answer would quietly mis-state the strategy's
 edge, so it is tested directly rather than through the report.
 """
-from datetime import datetime
+from datetime import date, datetime
 
 import pytest
 
 from app.services.execution_cost import (
-    FillCost, cost_session, index_depth, mid_price, nearest_depth,
+    FillCost, contract_key, cost_session, index_depth, mid_price, nearest_depth,
     price_fill, slippage_per_unit, walk_book,
 )
 
 TS = datetime(2026, 9, 1, 9, 50, 10)
 
 
-def _depth(bid=65.40, ask=66.10, buy=None, sell=None, strike=24300, opt="CE", ts=TS):
+def _depth(bid=65.40, ask=66.10, buy=None, sell=None, strike=24300, opt="CE", ts=TS,
+           expiry=date(2026, 9, 1)):
     return {
-        "timestamp": ts, "strike": strike, "option_type": opt,
+        "timestamp": ts, "strike": strike, "option_type": opt, "expiry_date": expiry,
         "bid": bid, "ask": ask,
         "depth_json": {
             "buy": buy if buy is not None else [{"price": bid, "quantity": 1500}],
@@ -111,18 +112,11 @@ def test_missing_recorded_price_is_reported():
     assert f.priced is False and f.note == "no recorded price"
 
 
-def test_falls_back_to_touch_when_ladder_absent():
-    d = _depth(); d["depth_json"] = {}
-    f = price_fill(label="entry", side="SELL", option_type="CE", strike=24300,
-                   quantity=975, assumed_price=65.80, timestamp=TS, depth=d)
-    assert f.walked_price == 65.4 and "no ladder" in f.note
-
-
 def test_shortfall_is_surfaced():
     d = _depth(buy=[{"price": 65.4, "quantity": 300}])
     f = price_fill(label="entry", side="SELL", option_type="CE", strike=24300,
                    quantity=975, assumed_price=65.80, timestamp=TS, depth=d)
-    assert f.shortfall_qty == 675 and "book short by 675" in f.note
+    assert f.shortfall_qty == 675 and "book covered 300 of 975" in f.note
 
 
 # ── depth lookup ─────────────────────────────────────────────────────────────
@@ -140,14 +134,15 @@ def test_stale_depth_is_rejected_rather_than_used():
 
 
 def test_index_depth_groups_by_contract():
+    e = date(2026, 9, 1)
     idx = index_depth([_depth(strike=24300, opt="CE"), _depth(strike=24200, opt="PE")])
-    assert set(idx) == {(24300, "CE"), (24200, "PE")}
+    assert set(idx) == {(e, 24300, "CE"), (e, 24200, "PE")}
 
 
 # ── session roll-up ──────────────────────────────────────────────────────────
-def _fill(side, strike, opt, price, qty=975, ts=TS, label="x"):
+def _fill(side, strike, opt, price, qty=975, ts=TS, label="x", expiry=date(2026, 9, 1)):
     return {"label": label, "side": side, "option_type": opt, "strike": strike,
-            "quantity": qty, "price": price, "timestamp": ts}
+            "expiry_date": expiry, "quantity": qty, "price": price, "timestamp": ts}
 
 
 def test_session_totals_sum_both_bounds():
@@ -184,3 +179,77 @@ def test_session_with_no_depth_reports_zero_coverage_not_zero_cost():
 def test_empty_session_is_safe():
     sc = cost_session(run_id="r1", trade_date="2026-09-01", fills=[], depth_rows=[])
     assert sc.coverage == 0.0 and sc.summary()["fills_total"] == 0
+
+
+# ── Contract identity ────────────────────────────────────────────────────────
+def test_same_strike_on_a_different_expiry_is_a_different_contract():
+    """A 24300 CE exists on every expiry; matching on strike alone would let a
+    next-expiry book price a current-expiry fill."""
+    near = _depth(strike=24300, opt="CE", expiry=date(2026, 9, 1))
+    far = _depth(strike=24300, opt="CE", expiry=date(2026, 9, 8), bid=90.0, ask=91.0)
+    idx = index_depth([near, far])
+    assert len(idx) == 2
+    assert contract_key(near) != contract_key(far)
+
+
+def test_fill_is_not_priced_off_another_expirys_book():
+    store_only_far = [_depth(strike=24300, opt="CE", expiry=date(2026, 9, 8),
+                             bid=90.0, ask=91.0)]
+    sc = cost_session(run_id="r", trade_date="2026-09-01",
+                      fills=[_fill("SELL", 24300, "CE", 65.80, expiry=date(2026, 9, 1))],
+                      depth_rows=store_only_far)
+    assert sc.coverage == 0.0
+    assert sc.fills[0].note == "no depth captured"
+
+
+# ── Partial fills must not be imputed ────────────────────────────────────────
+def test_partial_fill_costs_only_the_visible_quantity():
+    """300 of 975 visible must not be charged as though all 975 filled."""
+    d = _depth(buy=[{"price": 65.4, "quantity": 300}])
+    f = price_fill(label="x", side="SELL", option_type="CE", strike=24300,
+                   quantity=975, assumed_price=65.80, timestamp=TS, depth=d)
+    assert f.filled_qty == 300 and f.shortfall_qty == 675
+    assert f.cost_walked == pytest.approx((65.80 - 65.40) * 300, abs=0.01)
+    assert f.priced is True and f.fully_priced is False
+
+
+def test_no_ladder_is_left_unpriced_rather_than_costed_at_the_touch():
+    """Costing a whole order at the touch assumes unlimited size there."""
+    d = _depth(); d["depth_json"] = {}
+    f = price_fill(label="x", side="SELL", option_type="CE", strike=24300,
+                   quantity=975, assumed_price=65.80, timestamp=TS, depth=d)
+    assert f.priced is False and f.cost_walked is None
+    assert f.note == "no ladder"
+
+
+def test_quantity_coverage_reports_the_shortfall():
+    sc = cost_session(run_id="r", trade_date="2026-09-01",
+                      fills=[_fill("SELL", 24300, "CE", 65.80, qty=975)],
+                      depth_rows=[_depth(buy=[{"price": 65.4, "quantity": 300}])])
+    assert sc.coverage == 1.0            # the fill was priced
+    assert sc.quantity_coverage == pytest.approx(300 / 975, abs=0.001)
+    assert sc.complete is False          # but not end to end
+
+
+# ── The midpoint bound must not be fabricated ────────────────────────────────
+def test_one_sided_book_withholds_the_midpoint_bound():
+    """A walked cost with no midpoint must not report cost_mid = 0."""
+    d = _depth(); d["ask"] = None; d["depth_json"]["sell"] = []
+    sc = cost_session(run_id="r", trade_date="2026-09-01",
+                      fills=[_fill("SELL", 24300, "CE", 65.80)], depth_rows=[d])
+    assert sc.cost_walked != 0
+    assert sc.cost_mid is None
+    assert sc.complete is False
+    assert sc.summary()["cost_mid"] is None
+
+
+def test_complete_only_when_every_fill_is_fully_priced_on_both_bounds():
+    sc = cost_session(run_id="r", trade_date="2026-09-01",
+                      fills=[_fill("SELL", 24300, "CE", 65.80)],
+                      depth_rows=[_depth()])
+    assert sc.complete is True
+    sc2 = cost_session(run_id="r", trade_date="2026-09-01",
+                       fills=[_fill("SELL", 24300, "CE", 65.80),
+                              _fill("SELL", 24200, "PE", 24.20)],
+                       depth_rows=[_depth()])
+    assert sc2.complete is False         # second fill has no depth

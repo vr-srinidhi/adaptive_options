@@ -104,6 +104,15 @@ class FillCost:
     def priced(self) -> bool:
         return self.cost_walked is not None
 
+    @property
+    def fully_priced(self) -> bool:
+        """Priced with the whole order absorbed by the visible book."""
+        return self.priced and self.shortfall_qty == 0
+
+    @property
+    def has_mid(self) -> bool:
+        return self.cost_mid is not None
+
 
 def price_fill(
     *,
@@ -138,21 +147,24 @@ def price_fill(
 
     walked, filled = walk_book(levels or [], quantity, buying=buying)
     if walked is None:
-        # No usable ladder. The touch alone still bounds the cost.
-        if out.touch_price is None:
-            out.note = "no bid/ask or ladder"
-            return out
-        walked, filled = float(out.touch_price), 0
-        out.note = "no ladder; priced at touch"
+        # Without a ladder we know the touch price but not the size behind it.
+        # Costing the whole order at the touch would assume unlimited depth
+        # there, which is exactly the flattering assumption this report exists
+        # to remove, so the walked bound is left unpriced.
+        out.note = "no ladder" if out.touch_price is not None else "no bid/ask or ladder"
+        return out
 
+    # Cost only what the visible book could actually absorb. The unfilled
+    # remainder is reported as a shortfall rather than imputed at the average
+    # of the filled portion, which would understate the pessimistic bound.
     out.walked_price = round(walked, 4)
     out.filled_qty = filled
-    out.shortfall_qty = max(0, quantity - filled) if filled else 0
-    out.cost_walked = round(slippage_per_unit(side, assumed_price, walked) * quantity, 2)
+    out.shortfall_qty = max(0, quantity - filled)
+    out.cost_walked = round(slippage_per_unit(side, assumed_price, walked) * filled, 2)
     if out.mid is not None:
-        out.cost_mid = round(slippage_per_unit(side, assumed_price, out.mid) * quantity, 2)
+        out.cost_mid = round(slippage_per_unit(side, assumed_price, out.mid) * filled, 2)
     if out.shortfall_qty:
-        note = f"book short by {out.shortfall_qty} of {quantity}"
+        note = f"book covered {filled} of {quantity}"
         out.note = f"{out.note}; {note}" if out.note else note
     return out
 
@@ -184,14 +196,31 @@ def nearest_depth(
     return best
 
 
-def index_depth(rows: Sequence[Dict[str, Any]]) -> Dict[Tuple[int, str], List[Dict[str, Any]]]:
-    """Group depth rows by (strike, option_type) for lookup."""
-    out: Dict[Tuple[int, str], List[Dict[str, Any]]] = {}
+def contract_key(row: Dict[str, Any]) -> Optional[Tuple[Any, int, str]]:
+    """Identity of the contract a depth row or fill refers to.
+
+    Strike and option type alone are not an identity: the same 24300 CE exists
+    on every expiry, so a current-expiry fill could otherwise be matched
+    against a next-expiry book that happens to sit nearer in time. Expiry is
+    the discriminator both depth rows and legs carry.
+    """
+    strike, opt, expiry = row.get("strike"), row.get("option_type"), row.get("expiry_date")
+    if strike is None or opt is None:
+        return None
+    try:
+        return (expiry, int(strike), str(opt))
+    except (TypeError, ValueError):
+        return None
+
+
+def index_depth(rows: Sequence[Dict[str, Any]]) -> Dict[Tuple[Any, int, str], List[Dict[str, Any]]]:
+    """Group depth rows by full contract identity for lookup."""
+    out: Dict[Tuple[Any, int, str], List[Dict[str, Any]]] = {}
     for row in rows:
-        strike, opt = row.get("strike"), row.get("option_type")
-        if strike is None or opt is None:
+        key = contract_key(row)
+        if key is None:
             continue
-        out.setdefault((int(strike), str(opt)), []).append(row)
+        out.setdefault(key, []).append(row)
     return out
 
 
@@ -215,14 +244,50 @@ class SessionCost:
         return round(sum(f.cost_walked or 0.0 for f in self.priced_fills), 2)
 
     @property
-    def cost_mid(self) -> float:
-        return round(sum(f.cost_mid or 0.0 for f in self.priced_fills if f.cost_mid is not None), 2)
+    def cost_mid(self) -> Optional[float]:
+        """Midpoint bound, or None when any priced fill has no midpoint.
+
+        A one-sided book yields a walked cost but no midpoint. Summing only the
+        fills that have one would report a confident optimistic bound built
+        from a subset of the position, so the bound is withheld instead.
+        """
+        priced = self.priced_fills
+        if not priced or any(not f.has_mid for f in priced):
+            return None
+        return round(sum(f.cost_mid or 0.0 for f in priced), 2)
 
     @property
     def coverage(self) -> float:
-        """Fraction of fills we could actually price. A cost figure from 30%
+        """Fraction of fills we could price at all. A cost figure from 30%
         coverage is not a session cost, and the report must say so."""
         return round(len(self.priced_fills) / len(self.fills), 3) if self.fills else 0.0
+
+    @property
+    def quantity_coverage(self) -> float:
+        """Fraction of total order quantity the visible book could absorb.
+
+        Distinct from `coverage`: every fill can be priced while the book still
+        covered only part of each order.
+        """
+        total = sum(f.quantity for f in self.fills)
+        if not total:
+            return 0.0
+        return round(sum(f.filled_qty for f in self.priced_fills) / total, 3)
+
+    @property
+    def complete(self) -> bool:
+        """True only if every fill was priced, in full, on both bounds.
+
+        Anything less means the cost total covers part of the session, and a
+        session-level P&L adjustment built on it would silently treat the rest
+        as costless.
+        """
+        return (
+            bool(self.fills)
+            and not self.unpriced_fills
+            and all(f.fully_priced for f in self.fills)
+            and self.cost_mid is not None
+        )
 
     def summary(self) -> Dict[str, Any]:
         return {
@@ -231,6 +296,8 @@ class SessionCost:
             "fills_total": len(self.fills),
             "fills_priced": len(self.priced_fills),
             "coverage": self.coverage,
+            "quantity_coverage": self.quantity_coverage,
+            "complete": self.complete,
             "cost_mid": self.cost_mid,
             "cost_walked": self.cost_walked,
             "shortfall_fills": sum(1 for f in self.priced_fills if f.shortfall_qty),
@@ -252,12 +319,11 @@ def cost_session(
     by_contract = index_depth(depth_rows)
     out = SessionCost(run_id=str(run_id), trade_date=trade_date)
     for fill in fills:
-        try:
-            strike = int(fill["strike"])
-            opt = str(fill["option_type"])
-        except (KeyError, TypeError, ValueError):
+        key = contract_key(fill)
+        if key is None:
             continue
-        snaps = by_contract.get((strike, opt), [])
+        _expiry, strike, opt = key
+        snaps = by_contract.get(key, [])
         depth = nearest_depth(snaps, fill.get("timestamp"), tolerance_seconds=tolerance_seconds)
         out.fills.append(price_fill(
             label=str(fill.get("label", "")),
