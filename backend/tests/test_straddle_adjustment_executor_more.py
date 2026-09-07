@@ -532,6 +532,31 @@ async def test_partially_netted_wing_conserves_total_protection(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_fully_netted_wing_still_reports_net_delta(monkeypatch):
+    """A zero-lot wing must not silence delta monitoring.
+
+    signed_position_delta() returns None for quantity <= 0 and the caller bails
+    on the first None, so passing a fully netted wing through at zero made every
+    post-lock net_delta None -- which stops all later hedging and blanks the
+    displayed value. The wing has to be skipped, not passed at zero.
+    """
+    db, result, legs = await _run_netting(monkeypatch, "FULL")
+    assert 2 not in legs, "fixture must actually produce a fully netted wing"
+
+    lock_evt = next(e for e in db.added
+                    if isinstance(e, StrategyRunEvent) and e.reason_code == "WINGS_LOCKED")
+    post_lock = [o for o in db.added
+                 if isinstance(o, StrategyRunMtm) and o.timestamp >= lock_evt.timestamp]
+    assert post_lock, "expected MTM rows after the lock"
+    assert all(r.net_delta is not None for r in post_lock), (
+        "net delta went None after a fully netted lock wing -- "
+        "delta monitoring and every later hedge are disabled"
+    )
+    run = next(o for o in db.added if isinstance(o, StrategyRun))
+    assert run.result_json.get("last_net_delta") is not None
+
+
+@pytest.mark.asyncio
 async def test_fully_netted_wing_writes_no_leg_and_no_leg_mtm(monkeypatch):
     db, result, legs = await _run_netting(monkeypatch, "FULL")
     lot = 75

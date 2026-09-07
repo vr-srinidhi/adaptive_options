@@ -90,6 +90,26 @@ def _wing_lots(wing_lots, idx: int, default_lots: int) -> int:
     return int(wing_lots[idx])
 
 
+def _wing_exit_charges(
+    wing_legs, wing_cur, wing_lots, lot_size: int, default_lots: int
+) -> float:
+    """Exit-charge estimate for the lock wings, each at its own netted size.
+
+    Summed per leg because netting can leave the two wings at different sizes,
+    or one at zero. Kept in one place deliberately: this was previously written
+    out at each call site, and a post-hedge refresh that recomputed both wings
+    at the full position size silently undid the netting for that tick.
+    """
+    total = 0.0
+    for i, leg in enumerate(wing_legs):
+        lots_i = _wing_lots(wing_lots, i, default_lots)
+        price = wing_cur[i] if i < len(wing_cur) else None
+        if lots_i <= 0 or price is None:
+            continue
+        total += compute_leg_exit_charges_estimate(lots_i, lot_size, [leg], [price])
+    return total
+
+
 def _hedge_gross(hedges: List[Dict[str, Any]], lot_size: int, default_lots: int) -> float:
     """Mark-to-market of the long hedge legs, each at its own size."""
     return sum(
@@ -258,12 +278,19 @@ async def execute_run(
             # Netted wings carry their own size; using the full straddle
             # quantity would model protection that was never bought and skew
             # every subsequent hedge decision.
-            legs_for_delta.extend([
-                ("BUY", "CE", wing_ce_strike, wing_cur[0],
-                 lot_size * _wing_lots(wing_lots, 0, approved_lots)),
-                ("BUY", "PE", wing_pe_strike, wing_cur[1],
-                 lot_size * _wing_lots(wing_lots, 1, approved_lots)),
-            ])
+            #
+            # A fully netted wing is skipped rather than passed at zero:
+            # signed_position_delta() returns None for quantity <= 0 and the
+            # loop below bails on the first None, which would silence net delta
+            # for the rest of the session and stop all later hedging.
+            for _i, (_ot, _strike) in enumerate(
+                (("CE", wing_ce_strike), ("PE", wing_pe_strike))
+            ):
+                _wl = _wing_lots(wing_lots, _i, approved_lots)
+                if _wl > 0:
+                    legs_for_delta.append(
+                        ("BUY", _ot, _strike, wing_cur[_i], lot_size * _wl)
+                    )
         legs_for_delta.extend(
             (h["side"], h["option_type"], h["strike"], h["last_price"],
              lot_size * _hedge_lots(h, approved_lots))
@@ -385,14 +412,9 @@ async def execute_run(
             + _hedge_exit_charges(delta_hedges, lot_size, approved_lots)
         )
         if wings_locked:
-            # Summed per leg so each wing uses its own netted size.
-            for i, (leg, cur) in enumerate(zip(wing_legs, [w_ce_price, w_pe_price])):
-                lots_i = _wing_lots(wing_lots, i, approved_lots)
-                if lots_i <= 0 or cur is None:
-                    continue
-                est_exit_charges += compute_leg_exit_charges_estimate(
-                    lots_i, lot_size, [leg], [cur]
-                )
+            est_exit_charges += _wing_exit_charges(
+                wing_legs, [w_ce_price, w_pe_price], wing_lots, lot_size, approved_lots
+            )
 
         net_mtm = gross_mtm_total - entry_charges - wing_entry_charges - delta_hedge_charges - est_exit_charges
 
@@ -599,16 +621,12 @@ async def execute_run(
             + _hedge_exit_charges(delta_hedges, lot_size, approved_lots)
         )
         if wings_locked:
-            # Per wing: this refresh previously recomputed with approved_lots
-            # for both wings, silently discarding the netted sizes used above
-            # and inflating the charges that stop and trail decisions read.
-            for i, (leg, cur) in enumerate(zip(wing_legs, wing_cur)):
-                lots_i = _wing_lots(wing_lots, i, approved_lots)
-                if lots_i <= 0 or cur is None:
-                    continue
-                est_exit_charges += compute_leg_exit_charges_estimate(
-                    lots_i, lot_size, [leg], [cur]
-                )
+            # Same helper as above. This refresh previously recomputed with
+            # approved_lots for both wings, silently discarding the netted
+            # sizes and inflating the charges stop and trail decisions read.
+            est_exit_charges += _wing_exit_charges(
+                wing_legs, wing_cur, wing_lots, lot_size, approved_lots
+            )
         net_mtm = gross_mtm_total - entry_charges - wing_entry_charges - delta_hedge_charges - est_exit_charges
 
         # ── Lock check: profit lock (up) or loss lock (down) ─────────────────
