@@ -3,7 +3,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 from datetime import date, datetime, time
-from typing import Optional
+from typing import Any, Dict, List, Optional
 
 RISK_FREE_RATE = 0.065
 DEFAULT_IV = 0.12
@@ -217,6 +217,44 @@ def unit_delta_for_option(
     years = years_to_expiry(timestamp, expiry_date)
     sigma = volatility_for_delta(price, spot, strike, years, option_type, vix, default_iv)
     return black_scholes_delta(spot, strike, years, sigma, option_type)
+
+
+def wing_lots_after_hedges(
+    *,
+    wing_strike: int,
+    option_type: str,
+    approved_lots: int,
+    delta_hedges: Optional[List[Dict[str, Any]]] = None,
+) -> int:
+    """Lots of protective wing still to buy once existing hedges are counted.
+
+    The delta hedge buys the tested-side OTM wing; the dual lock later buys
+    *both* wings. They frequently land on the same contract within a minute or
+    two of each other, because the same adverse move drives both. Without this
+    the lock re-buys protection the position already holds, at a price the
+    hedge itself has usually just pushed up.
+
+    Netting keeps total long protection at `approved_lots` per side, which is
+    what the lock was always meant to establish -- no less protection, just no
+    double purchase.
+
+    Returns 0 when hedges already cover the side, meaning no wing is needed.
+    """
+    if approved_lots <= 0:
+        return 0
+    held = 0
+    for hedge in delta_hedges or []:
+        if str(hedge.get("side", "BUY")).upper() != "BUY":
+            continue
+        if hedge.get("option_type") != option_type:
+            continue
+        if hedge.get("strike") != wing_strike:
+            continue
+        try:
+            held += int(hedge.get("lots") or 0)
+        except (TypeError, ValueError):
+            continue
+    return max(0, approved_lots - held)
 
 
 def hedge_lots_for_delta(
