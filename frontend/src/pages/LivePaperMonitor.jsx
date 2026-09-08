@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState, useCallback } from 'react'
 import { useNavigate } from 'react-router-dom'
 import {
-  LineChart, Line, AreaChart, Area, XAxis, YAxis, Tooltip, ReferenceLine,
+  LineChart, Line, AreaChart, Area, XAxis, YAxis, Tooltip, ReferenceLine, ReferenceDot,
   ResponsiveContainer, CartesianGrid,
 } from 'recharts'
 import { useAuth } from '../contexts/AuthContext'
@@ -185,13 +185,24 @@ function calcPayoffAtExpiry(legs, spot, qty) {
 
 function PayoffChart({ legs, atm, lotSize, lots, currentSpot, currentMtm, gradId }) {
   const [showStraddle, setShowStraddle] = useState(false)
+  // Default to the mid window. The payoff's whole structure — both break-evens
+  // and the peak — usually sits within a few hundred points of ATM, so the old
+  // fixed ±14% view compressed it into a few percent of the width.
+  const [rangeKey, setRangeKey] = useState('mid')
 
   if (!atm || !legs || legs.length === 0 || !lotSize || !lots) return null
 
   const qty = lotSize * lots
   const step = 50   // NIFTY strike step
-  const range = Math.ceil(atm * 0.14 / step) * step   // ±14% rounded to nearest step
-  const points = 80
+
+  // "Wide" keeps the original ±14% so nothing that used to be visible is lost.
+  const wideRange = Math.ceil(atm * 0.14 / step) * step
+  const RANGES = [
+    { key: 'near', label: '±250',  span: 250 },
+    { key: 'mid',  label: '±750',  span: 750 },
+    { key: 'wide', label: 'Wide',  span: wideRange },
+  ]
+  const range   = (RANGES.find(r => r.key === rangeKey) || RANGES[1]).span
   const spotMin = atm - range
   const spotMax = atm + range
 
@@ -199,13 +210,12 @@ function PayoffChart({ legs, atm, lotSize, lots, currentSpot, currentMtm, gradId
   const displayLegs  = showStraddle ? straddleLegs : legs
   const hasAdjustments = legs.some(l => l.side === 'BUY')
 
-  const data = Array.from({ length: points + 1 }, (_, i) => {
-    const s = spotMin + (i / points) * (spotMax - spotMin)
-    return {
-      spot: Math.round(s),
-      pnl:  Math.round(calcPayoffAtExpiry(displayLegs, s, qty)),
-    }
-  })
+  // Sample on the strike grid. A payoff only bends at a strike, so sampling at
+  // any other spacing cuts the corners off the shape it is meant to show.
+  const data = []
+  for (let s = spotMin; s <= spotMax + 1e-6; s += step) {
+    data.push({ spot: Math.round(s), pnl: Math.round(calcPayoffAtExpiry(displayLegs, s, qty)) })
+  }
 
   const pnlVals = data.map(d => d.pnl)
   const yMin    = Math.min(...pnlVals)
@@ -218,26 +228,41 @@ function PayoffChart({ legs, atm, lotSize, lots, currentSpot, currentMtm, gradId
   const zeroFrac  = totalSpan > 0 ? ((yDomain[1]) / totalSpan) : 0.5
   const zeroFracPct = `${Math.min(99, Math.max(1, zeroFrac * 100)).toFixed(1)}%`
 
-  // Break-even crossings
+  // Break-even crossings, kept at the interpolated value. Rounding these to the
+  // strike step threw away the precision the interpolation had just produced.
   const breakEvens = []
   for (let i = 1; i < data.length; i++) {
-    if (data[i - 1].pnl * data[i].pnl < 0) {
-      const be = data[i - 1].spot +
-        (data[i].spot - data[i - 1].spot) *
-        (-data[i - 1].pnl / (data[i].pnl - data[i - 1].pnl))
-      breakEvens.push(Math.round(be / step) * step)
+    const a = data[i - 1], b = data[i]
+    if (a.pnl === 0) breakEvens.push(a.spot)
+    else if (a.pnl * b.pnl < 0) {
+      breakEvens.push(Math.round(a.spot + (b.spot - a.spot) * (-a.pnl / (b.pnl - a.pnl))))
     }
   }
 
-  const fmtSpot = v => {
-    if (v >= 10000) return `${(v / 1000).toFixed(0)}k`
-    return String(Math.round(v))
-  }
+  const peak = data.reduce((best, d) => (d.pnl > best.pnl ? d : best), data[0])
+
+  const fmtSpot = v => Math.round(v).toLocaleString('en-IN')
   const fmtPnl = v => {
     const abs = Math.abs(v)
     const s = abs >= 100000 ? `${(abs / 100000).toFixed(1)}L` : `${(abs / 1000).toFixed(0)}k`
     return v < 0 ? `-${s}` : `+${s}`
   }
+  // Full precision for the readouts a trader acts on; the axis stays compact.
+  const fmtPnlFull = v =>
+    `${v < 0 ? '−' : '+'}₹${Math.round(Math.abs(v)).toLocaleString('en-IN')}`
+  const fmtAway = v => {
+    if (currentSpot == null) return ''
+    const d = Math.round(v - currentSpot)
+    return ` (${d >= 0 ? '+' : '−'}${Math.abs(d).toLocaleString('en-IN')} from now)`
+  }
+
+  const pillBtn = (active) => ({
+    fontSize: 10, padding: '3px 8px', borderRadius: 10, cursor: 'pointer',
+    border: `1px solid ${active ? '#818cf866' : 'var(--border)'}`,
+    background: active ? '#818cf822' : 'transparent',
+    color: active ? '#818cf8' : 'var(--text-secondary)',
+    fontWeight: active ? 700 : 400,
+  })
 
   return (
     <div style={{ marginTop: 20 }}>
@@ -246,6 +271,17 @@ function PayoffChart({ legs, atm, lotSize, lots, currentSpot, currentMtm, gradId
           Payoff at Expiry
         </div>
         <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', alignItems: 'center' }}>
+          {RANGES.map(r => (
+            <button
+              key={r.key}
+              onClick={() => setRangeKey(r.key)}
+              aria-pressed={rangeKey === r.key}
+              title={`Show ±${r.span.toLocaleString('en-IN')} points around ATM`}
+              style={pillBtn(rangeKey === r.key)}
+            >
+              {r.label}
+            </button>
+          ))}
           {hasAdjustments && (
             <button
               onClick={() => setShowStraddle(s => !s)}
@@ -262,9 +298,12 @@ function PayoffChart({ legs, atm, lotSize, lots, currentSpot, currentMtm, gradId
           )}
           {breakEvens.map((be, i) => (
             <span key={i} style={{ fontSize: 10, color: '#facc15', background: '#facc1511', border: '1px solid #facc1533', borderRadius: 8, padding: '2px 7px' }}>
-              BE {fmtSpot(be)}
+              BE {fmtSpot(be)}{fmtAway(be)}
             </span>
           ))}
+          <span style={{ fontSize: 10, color: '#818cf8', background: '#818cf811', border: '1px solid #818cf833', borderRadius: 8, padding: '2px 7px' }}>
+            Peak {fmtSpot(peak.spot)} · {fmtPnlFull(peak.pnl)}
+          </span>
         </div>
       </div>
 
@@ -285,7 +324,7 @@ function PayoffChart({ legs, atm, lotSize, lots, currentSpot, currentMtm, gradId
             domain={[spotMin, spotMax]}
             tickFormatter={fmtSpot}
             tick={{ fontSize: 10, fill: 'var(--text-secondary)' }}
-            minTickGap={55}
+            minTickGap={45}
           />
           <YAxis
             domain={yDomain}
@@ -294,8 +333,8 @@ function PayoffChart({ legs, atm, lotSize, lots, currentSpot, currentMtm, gradId
             width={48}
           />
           <Tooltip
-            formatter={(val) => [fmtPnl(val), 'P&L at expiry']}
-            labelFormatter={(s) => `Spot ${fmtSpot(s)}`}
+            formatter={(val) => [fmtPnlFull(val), 'P&L at expiry']}
+            labelFormatter={(s) => `Spot ${fmtSpot(s)}${fmtAway(s)}`}
             contentStyle={{ background: 'var(--surface-secondary)', border: '1px solid var(--border)', borderRadius: 6, fontSize: 11 }}
           />
           <ReferenceLine y={0} stroke="#475569" strokeWidth={1} />
@@ -311,8 +350,10 @@ function PayoffChart({ legs, atm, lotSize, lots, currentSpot, currentMtm, gradId
             <ReferenceLine y={Math.round(currentMtm)} stroke="#4ade80" strokeDasharray="4 2"
               label={{ value: `Live ${fmtPnl(currentMtm)}`, fill: '#4ade80', fontSize: 9, position: 'insideRight' }} />
           )}
+          <ReferenceDot x={peak.spot} y={peak.pnl} r={4}
+            fill="#818cf8" stroke="var(--surface-secondary)" strokeWidth={1.5} isFront />
           <Area
-            type="monotone"
+            type="linear"
             dataKey="pnl"
             stroke="#818cf8"
             strokeWidth={1.5}
