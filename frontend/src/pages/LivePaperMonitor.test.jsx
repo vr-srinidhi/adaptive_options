@@ -250,6 +250,24 @@ describe('LivePaperMonitor payoff chart', () => {
     expect(screen.getByText(/BE 23,450/)).toBeInTheDocument()
   })
 
+  it('keeps a break-even that falls exactly on the right edge of the window', async () => {
+    // ₹125 per side at 23,850 puts the break-evens exactly on the ±250
+    // boundaries. Scanning sample pairs and testing only the left one never
+    // examined the final sample, so the upper break-even vanished.
+    const edge = payoffSlot()
+    edge.run.legs = [
+      { side: 'SELL', option_type: 'CE', strike: 23850, quantity: 975, entry_price: 125 },
+      { side: 'SELL', option_type: 'PE', strike: 23850, quantity: 975, entry_price: 125 },
+    ]
+    mocks.getLivePaperToday.mockResolvedValue({
+      data: { slots: [edge], token_status: 'valid' },
+    })
+    render(<LivePaperMonitor />)
+    fireEvent.click(await screen.findByRole('button', { name: '±250' }))
+    expect(screen.getByText(/BE 23,600/)).toBeInTheDocument()   // left edge
+    expect(screen.getByText(/BE 24,100/)).toBeInTheDocument()   // right edge
+  })
+
   it('keeps the break-evens visible after zooming in', async () => {
     render(<LivePaperMonitor />)
     fireEvent.click(await screen.findByRole('button', { name: '±250' }))

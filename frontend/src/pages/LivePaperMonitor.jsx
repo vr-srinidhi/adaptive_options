@@ -230,12 +230,27 @@ function PayoffChart({ legs, atm, lotSize, lots, currentSpot, currentMtm, gradId
 
   // Break-even crossings, kept at the interpolated value. Rounding these to the
   // strike step threw away the precision the interpolation had just produced.
+  //
+  // Every sample is examined for an exact zero, including the last. Scanning
+  // pairs and testing only the left one skipped a break-even sitting exactly on
+  // the right edge of the window -- reachable in the ±250 view, where a ₹125
+  // per side straddle at 23,850 puts both break-evens precisely on the
+  // boundaries. Interpolation is only used between two non-zero samples of
+  // opposite sign, so an exact zero is never also counted as a crossing.
   const breakEvens = []
-  for (let i = 1; i < data.length; i++) {
-    const a = data[i - 1], b = data[i]
-    if (a.pnl === 0) breakEvens.push(a.spot)
-    else if (a.pnl * b.pnl < 0) {
-      breakEvens.push(Math.round(a.spot + (b.spot - a.spot) * (-a.pnl / (b.pnl - a.pnl))))
+  for (let i = 0; i < data.length; i++) {
+    const cur = data[i]
+    if (cur.pnl === 0) {
+      // A flat run sitting exactly on zero would otherwise emit a chip per
+      // sample; only its edges carry information.
+      const prevZero = i > 0 && data[i - 1].pnl === 0
+      const nextZero = i + 1 < data.length && data[i + 1].pnl === 0
+      if (!(prevZero && nextZero)) breakEvens.push(cur.spot)
+      continue
+    }
+    const next = data[i + 1]
+    if (next && next.pnl !== 0 && cur.pnl * next.pnl < 0) {
+      breakEvens.push(Math.round(cur.spot + (next.spot - cur.spot) * (-cur.pnl / (next.pnl - cur.pnl))))
     }
   }
 
