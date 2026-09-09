@@ -84,8 +84,7 @@ async def _get_owned_batch(
     b = result.scalar_one_or_none()
     if b is None:
         raise HTTPException(status_code=404, detail="Batch not found")
-    # Ownership: batches without created_by are accessible to any authenticated user
-    if b.created_by is not None and b.created_by != user.id:
+    if b.created_by != user.id:
         raise HTTPException(status_code=404, detail="Batch not found")
     return b
 
@@ -135,10 +134,7 @@ async def list_batches(
 ):
     q = (
         select(SessionBatch)
-        .where(
-            (SessionBatch.created_by == current_user.id)
-            | (SessionBatch.created_by.is_(None))
-        )
+        .where(SessionBatch.created_by == current_user.id)
         .order_by(SessionBatch.created_at.desc())
         .offset(offset)
         .limit(limit)
@@ -233,7 +229,7 @@ async def _get_hist_session(
         select(PaperSession).where(
             PaperSession.id == session_id,
             PaperSession.session_type == "historical_backtest",
-            (PaperSession.user_id == user.id) | (PaperSession.user_id.is_(None)),
+            PaperSession.user_id == user.id,
         )
     )
     s = result.scalar_one_or_none()
