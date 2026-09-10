@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 const mocks = vi.hoisted(() => ({
@@ -275,5 +275,101 @@ describe('LivePaperMonitor payoff chart', () => {
     // ±250 still spans both break-evens, so neither should disappear.
     expect(screen.getByText(/BE 23,750/)).toBeInTheDocument()
     expect(screen.getByText(/BE 23,950/)).toBeInTheDocument()
+  })
+})
+
+
+// ── Positions & MTM panel ────────────────────────────────────────────────────
+// Fixture is the real 9:50 session from 8 Sep: straddle +12,285, four hedges
+// -7,012, charges -498, net +4,775. The rows must reconcile to that.
+function positionsSlot() {
+  const sl = slot()
+  sl.session = { id: 'sess-p', status: 'entered', atm_strike: 23700,
+                 spot_latest: 23636, net_mtm_latest: 4775 }
+  sl.run = {
+    lot_size: 75, approved_lots: 13, total_charges: 498, realized_net_pnl: 4775,
+    legs: [
+      { leg_index: 0, side: 'SELL', option_type: 'CE', strike: 23700, quantity: 975,
+        entry_price: 48.35, exit_price: 18.25, gross_leg_pnl: 29348,
+        entry_timestamp: '2026-09-08T09:50:04' },
+      { leg_index: 1, side: 'SELL', option_type: 'PE', strike: 23700, quantity: 975,
+        entry_price: 46.25, exit_price: 63.75, gross_leg_pnl: -17063,
+        entry_timestamp: '2026-09-08T09:50:04' },
+      { leg_index: 4, side: 'BUY', option_type: 'PE', strike: 23600, quantity: 600,
+        entry_price: 16.05, exit_price: 15.50, gross_leg_pnl: -330,
+        entry_timestamp: '2026-09-08T09:53:12' },
+      { leg_index: 5, side: 'BUY', option_type: 'CE', strike: 23800, quantity: 600,
+        entry_price: 21.00, exit_price: 5.05, gross_leg_pnl: -9570,
+        entry_timestamp: '2026-09-08T10:14:56' },
+    ],
+  }
+  return sl
+}
+
+describe('LivePaperMonitor positions panel', () => {
+  beforeEach(() => {
+    globalThis.EventSource = class {
+      constructor() { this.readyState = 0 }
+      addEventListener() {} removeEventListener() {} close() {}
+    }
+    Object.values(mocks).forEach(m => { if (typeof m === 'function') m.mockReset() })
+    mocks.getLivePaperToday.mockResolvedValue({
+      data: { slots: [positionsSlot()], token_status: 'valid' },
+    })
+    mocks.getLivePaperHistory.mockResolvedValue({ data: [] })
+    mocks.getLiveDataSyncToday.mockResolvedValue({ data: null })
+  })
+
+  it('splits the P&L into straddle and adjustments with subtotals', async () => {
+    render(<LivePaperMonitor />)
+    expect(await screen.findByText('Positions & MTM')).toBeInTheDocument()
+    expect(screen.getByText('Straddle subtotal')).toBeInTheDocument()
+    expect(screen.getByText(/Adjustments · 2 legs/)).toBeInTheDocument()
+    // straddle 29,348 - 17,063 = +12,285 ; adjustments -330 - 9,570 = -9,900
+    expect(screen.getByText('+₹12,285')).toBeInTheDocument()
+    expect(screen.getByText('−₹9,900')).toBeInTheDocument()
+  })
+
+  it('shows each leg with its own quantity and entry time', async () => {
+    render(<LivePaperMonitor />)
+    await screen.findByText('Positions & MTM')
+    // The 23800 CE hedge: 600, not the straddle's 975.
+    expect(screen.getByText('10:14:56')).toBeInTheDocument()
+    expect(screen.getByText('−₹9,570')).toBeInTheDocument()
+    expect(screen.getAllByText('600').length).toBeGreaterThan(0)
+  })
+
+  it('labels adjustment legs so their origin is readable', async () => {
+    render(<LivePaperMonitor />)
+    await screen.findByText('Positions & MTM')
+    expect(screen.getByText(/hedge 1/)).toBeInTheDocument()
+    expect(screen.getByText(/hedge 2/)).toBeInTheDocument()
+  })
+
+  it('reconciles gross, charges and net', async () => {
+    render(<LivePaperMonitor />)
+    await screen.findByText('Positions & MTM')
+    // Scope to the panel's table: "Net MTM" also labels the stats tile above,
+    // which is intentional -- the two are meant to show the same figure.
+    const table = screen.getByText('Straddle subtotal').closest('table')
+    const t = within(table)
+    expect(t.getByText('Gross MTM')).toBeInTheDocument()
+    expect(t.getByText('+₹2,385')).toBeInTheDocument()   // 12,285 - 9,900
+    expect(t.getByText('−₹498')).toBeInTheDocument()
+    expect(t.getByText('Net MTM')).toBeInTheDocument()
+    expect(t.getByText('+₹4,775')).toBeInTheDocument()   // matches the header
+  })
+
+  it('omits the adjustments group entirely when there are none', async () => {
+    const plain = positionsSlot()
+    plain.run.legs = plain.run.legs.slice(0, 2)
+    mocks.getLivePaperToday.mockResolvedValue({
+      data: { slots: [plain], token_status: 'valid' },
+    })
+    render(<LivePaperMonitor />)
+    await screen.findByText('Positions & MTM')
+    expect(screen.getByText('Straddle subtotal')).toBeInTheDocument()
+    expect(screen.queryByText(/Adjustments ·/)).not.toBeInTheDocument()
+    expect(screen.queryByText('Adjustments subtotal')).not.toBeInTheDocument()
   })
 })

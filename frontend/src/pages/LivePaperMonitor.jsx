@@ -183,6 +183,125 @@ function calcPayoffAtExpiry(legs, spot, qty) {
   }, 0)
 }
 
+function PositionsPanel({ marks, legs, charges, netMtm }) {
+  // Live marks when the stream is running; fall back to the persisted legs so a
+  // reload or a finished session still shows the breakdown.
+  const rows = (marks && marks.length > 0)
+    ? marks
+    : (legs || []).map(l => ({
+        leg_index: l.leg_index, side: l.side, option_type: l.option_type,
+        strike: l.strike, quantity: l.quantity, entry_price: l.entry_price,
+        current_price: l.exit_price ?? null, pnl: l.gross_leg_pnl ?? null,
+        entry_timestamp: l.entry_timestamp ?? null,
+      }))
+
+  if (!rows.length) return null
+
+  const core = rows.filter(r => r.leg_index <= 1)
+  const adj  = rows.filter(r => r.leg_index >= 2)
+  const sum  = a => a.reduce((s, r) => s + (r.pnl ?? 0), 0)
+  const coreT = sum(core), adjT = sum(adj), gross = coreT + adjT
+  const ch = charges != null ? -Math.abs(charges) : null
+  const net = netMtm != null ? netMtm : (ch != null ? gross + ch : gross)
+  const maxAbs = Math.max(1, ...rows.map(r => Math.abs(r.pnl ?? 0)))
+
+  const money = v => v == null ? '—'
+    : `${v < 0 ? '−' : '+'}₹${Math.round(Math.abs(v)).toLocaleString('en-IN')}`
+  const tone = v => v == null ? 'var(--text-secondary)' : (v >= 0 ? '#4ade80' : '#f87171')
+  const hhmmss = ts => {
+    if (!ts) return '—'
+    const d = new Date(ts)
+    return Number.isNaN(d.getTime()) ? '—' : d.toTimeString().slice(0, 8)
+  }
+  // Adjustment legs are numbered for the order they fired; wings say what they are.
+  const label = r => r.leg_index === 2 ? 'lock wing'
+    : r.leg_index === 3 ? 'lock wing'
+    : r.leg_index >= 4 ? `hedge ${r.leg_index - 3}` : null
+
+  const td = { padding: '7px 12px', textAlign: 'right', borderBottom: '1px solid var(--border)', whiteSpace: 'nowrap' }
+  const tdL = { ...td, textAlign: 'left' }
+  const th = { ...td, fontSize: 9.5, letterSpacing: '.1em', textTransform: 'uppercase', color: 'var(--text-secondary)', fontWeight: 500 }
+  const grp = { ...tdL, fontSize: 9.5, letterSpacing: '.13em', textTransform: 'uppercase', color: 'var(--text-secondary)', background: 'var(--surface-secondary)' }
+  const subRow = { ...td, fontWeight: 700, background: 'var(--surface-secondary)' }
+
+  const legRows = list => list.map((r, i) => (
+    <tr key={`${r.leg_index}-${i}`}>
+      <td style={tdL}>
+        <span style={{
+          fontSize: 9.5, fontWeight: 700, padding: '1px 6px', borderRadius: 4, marginRight: 7,
+          border: `1px solid ${r.side === 'SELL' ? '#fbbf2455' : '#818cf855'}`,
+          background: r.side === 'SELL' ? '#fbbf2415' : '#818cf815',
+          color: r.side === 'SELL' ? '#fbbf24' : '#818cf8',
+        }}>{r.side}</span>
+        {r.strike} {r.option_type}
+        {label(r) && <span style={{ fontSize: 10, color: 'var(--text-secondary)' }}> · {label(r)}</span>}
+      </td>
+      <td style={{ ...td, color: 'var(--text-secondary)' }}>{r.quantity ?? '—'}</td>
+      <td style={{ ...td, color: 'var(--text-secondary)' }}>{hhmmss(r.entry_timestamp)}</td>
+      <td style={td}>{r.entry_price != null ? Number(r.entry_price).toFixed(2) : '—'}</td>
+      <td style={td}>{r.current_price != null ? Number(r.current_price).toFixed(2) : '—'}</td>
+      <td style={{ ...td, color: tone(r.pnl) }}>
+        {money(r.pnl)}
+        {r.pnl != null && (
+          <span style={{
+            display: 'inline-block', height: 3, borderRadius: 2, marginLeft: 7,
+            verticalAlign: 'middle', background: tone(r.pnl),
+            width: Math.max(2, Math.round(Math.abs(r.pnl) / maxAbs * 60)),
+          }} />
+        )}
+      </td>
+    </tr>
+  ))
+
+  return (
+    <div style={{ marginTop: 20 }}>
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', gap: 10, marginBottom: 8, flexWrap: 'wrap' }}>
+        <div style={{ fontSize: 12, fontWeight: 700, color: 'var(--text-primary)' }}>Positions &amp; MTM</div>
+        <div style={{ fontSize: 10.5, color: 'var(--text-secondary)' }}>
+          {rows.length} leg{rows.length === 1 ? '' : 's'}
+        </div>
+      </div>
+      <div style={{ overflowX: 'auto', border: '1px solid var(--border)', borderRadius: 8 }}>
+        <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 12.5, fontVariantNumeric: 'tabular-nums' }}>
+          <thead><tr>
+            <th style={{ ...th, textAlign: 'left' }}>Contract</th>
+            <th style={th}>Qty</th><th style={th}>Entered</th>
+            <th style={th}>Entry</th><th style={th}>Current</th><th style={th}>Leg P&amp;L</th>
+          </tr></thead>
+          <tbody>
+            <tr><td style={grp} colSpan={6}>Straddle</td></tr>
+            {legRows(core)}
+            <tr><td style={{ ...subRow, textAlign: 'left' }}>Straddle subtotal</td>
+                <td style={subRow} colSpan={4} />
+                <td style={{ ...subRow, color: tone(coreT) }}>{money(coreT)}</td></tr>
+            {adj.length > 0 && (
+              <>
+                <tr><td style={grp} colSpan={6}>Adjustments · {adj.length} leg{adj.length === 1 ? '' : 's'}</td></tr>
+                {legRows(adj)}
+                <tr><td style={{ ...subRow, textAlign: 'left' }}>Adjustments subtotal</td>
+                    <td style={subRow} colSpan={4} />
+                    <td style={{ ...subRow, color: tone(adjT) }}>{money(adjT)}</td></tr>
+              </>
+            )}
+            <tr><td style={{ ...tdL, color: 'var(--text-secondary)' }}>Gross MTM</td>
+                <td style={td} colSpan={4} />
+                <td style={{ ...td, color: tone(gross) }}>{money(gross)}</td></tr>
+            {ch != null && (
+              <tr><td style={{ ...tdL, color: 'var(--text-secondary)' }}>Charges</td>
+                  <td style={td} colSpan={4} />
+                  <td style={{ ...td, color: tone(ch) }}>{money(ch)}</td></tr>
+            )}
+            <tr><td style={{ ...tdL, fontSize: 14, fontWeight: 700, borderBottom: 'none' }}>Net MTM</td>
+                <td style={{ ...td, borderBottom: 'none' }} colSpan={4} />
+                <td style={{ ...td, borderBottom: 'none', fontSize: 14, fontWeight: 700, color: tone(net) }}>{money(net)}</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  )
+}
+
+
 function PayoffChart({ legs, atm, lotSize, lots, currentSpot, currentMtm, gradId }) {
   const [showStraddle, setShowStraddle] = useState(false)
   // Default to the mid window. The payoff's whole structure — both break-evens
@@ -872,6 +991,9 @@ function SlotDetail({ slot, liveSlotData, navigate }) {
   const run         = sd.run         || slot.run
   const entryPrices = sd.entryPrices || { ce: run?.ce_entry_price ?? null, pe: run?.pe_entry_price ?? null }
   const payoffLegs  = sd.legs?.length > 0 ? sd.legs : (run?.legs || [])
+  // Live marks while streaming; the persisted legs are the fallback so a
+  // reload or a completed session still shows the breakdown.
+  const legMarks    = sd.legMarks || []
 
   const entryEvent = events.find(e => e.event_type === 'ENTRY')
   const exitEvent  = events.find(e => ['STOP_EXIT', 'TRAIL_EXIT', 'TIME_EXIT', 'DATA_GAP_EXIT'].includes(e.event_type))
@@ -940,6 +1062,14 @@ function SlotDetail({ slot, liveSlotData, navigate }) {
           )}
         </div>
       )}
+
+      {/* Positions & MTM — explains the Net MTM shown in the stats row above */}
+      <PositionsPanel
+        marks={legMarks}
+        legs={run?.legs || payoffLegs}
+        charges={run?.total_charges ?? null}
+        netMtm={session?.net_mtm_latest ?? run?.realized_net_pnl ?? null}
+      />
 
       {/* MTM chart */}
       {chartData.length > 0 ? (
@@ -1150,6 +1280,7 @@ export default function LivePaperMonitor() {
       const existing = prev[sessionId] || {
         mtmData: [], ceData: [], peData: [], wingCeData: [], wingPeData: [],
         events: [], session: null, entryPrices: { ce: null, pe: null }, legs: [],
+        legMarks: [],
       }
       switch (data.type) {
         case 'SNAPSHOT':
@@ -1223,6 +1354,10 @@ export default function LivePaperMonitor() {
               delta_hedge_count: data.delta_hedge_count,
             },
             mtmData:    [...existing.mtmData, mtmRow],
+            // Latest mark for every open leg, used by the Positions & MTM
+            // panel. Replaced wholesale each tick rather than appended -- it
+            // is a snapshot of the book, not a series.
+            legMarks:   Array.isArray(data.legs) ? data.legs : existing.legMarks,
             ceData:     data.ce_price      != null ? [...existing.ceData,     { timestamp: data.timestamp, price: data.ce_price      }] : existing.ceData,
             peData:     data.pe_price      != null ? [...existing.peData,     { timestamp: data.timestamp, price: data.pe_price      }] : existing.peData,
             wingCeData: data.wing_ce_price != null ? [...existing.wingCeData, { timestamp: data.timestamp, price: data.wing_ce_price }] : existing.wingCeData,

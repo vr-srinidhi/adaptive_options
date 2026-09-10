@@ -275,6 +275,16 @@ async def _build_slot(db: AsyncSession, cfg: LivePaperConfig, session: Optional[
                         # Delta hedge legs can be smaller than the straddle, so the
                         # payoff chart must weight each leg by its own quantity.
                         "quantity":    int(l.quantity) if l.quantity else None,
+                        # When this leg was actually opened -- the straddle at
+                        # entry, each adjustment when it fired. Lets a reload
+                        # show the same per-leg detail the live stream does.
+                        "entry_timestamp": (
+                            l.entry_timestamp.isoformat() if l.entry_timestamp else None
+                        ),
+                        "exit_price":  float(l.exit_price) if l.exit_price else None,
+                        "gross_leg_pnl": (
+                            float(l.gross_leg_pnl) if l.gross_leg_pnl is not None else None
+                        ),
                     }
                     for l in all_legs if l.entry_price is not None
                 ],
