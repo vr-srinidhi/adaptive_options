@@ -994,6 +994,8 @@ function SlotDetail({ slot, liveSlotData, navigate }) {
   // Live marks while streaming; the persisted legs are the fallback so a
   // reload or a completed session still shows the breakdown.
   const legMarks    = sd.legMarks || []
+  // Live charges while streaming; the finalised total once the run closes.
+  const legCharges  = sd.legCharges ?? run?.total_charges ?? null
 
   const entryEvent = events.find(e => e.event_type === 'ENTRY')
   const exitEvent  = events.find(e => ['STOP_EXIT', 'TRAIL_EXIT', 'TIME_EXIT', 'DATA_GAP_EXIT'].includes(e.event_type))
@@ -1067,7 +1069,7 @@ function SlotDetail({ slot, liveSlotData, navigate }) {
       <PositionsPanel
         marks={legMarks}
         legs={run?.legs || payoffLegs}
-        charges={run?.total_charges ?? null}
+        charges={legCharges}
         netMtm={session?.net_mtm_latest ?? run?.realized_net_pnl ?? null}
       />
 
@@ -1280,7 +1282,7 @@ export default function LivePaperMonitor() {
       const existing = prev[sessionId] || {
         mtmData: [], ceData: [], peData: [], wingCeData: [], wingPeData: [],
         events: [], session: null, entryPrices: { ce: null, pe: null }, legs: [],
-        legMarks: [],
+        legMarks: [], legCharges: null,
       }
       switch (data.type) {
         case 'SNAPSHOT':
@@ -1358,6 +1360,9 @@ export default function LivePaperMonitor() {
             // panel. Replaced wholesale each tick rather than appended -- it
             // is a snapshot of the book, not a series.
             legMarks:   Array.isArray(data.legs) ? data.legs : existing.legMarks,
+            // run.total_charges is only written at finalisation, so during a
+            // live session this tick is the only source for the charges line.
+            legCharges: data.charges != null ? data.charges : existing.legCharges,
             ceData:     data.ce_price      != null ? [...existing.ceData,     { timestamp: data.timestamp, price: data.ce_price      }] : existing.ceData,
             peData:     data.pe_price      != null ? [...existing.peData,     { timestamp: data.timestamp, price: data.pe_price      }] : existing.peData,
             wingCeData: data.wing_ce_price != null ? [...existing.wingCeData, { timestamp: data.timestamp, price: data.wing_ce_price }] : existing.wingCeData,

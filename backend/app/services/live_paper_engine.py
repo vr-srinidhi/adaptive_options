@@ -105,8 +105,8 @@ def _wing_exit_charges(
 
 
 def _leg_marks(
-    straddle_leg_ids, straddle_entry_prices, straddle_cur, atm_strike,
-    wing_leg_ids, wing_entry_prices, wing_cur, wing_strikes,
+    straddle_leg_ids, straddle_entry_prices, straddle_cur, atm_strike, entry_ts,
+    wing_leg_ids, wing_entry_prices, wing_cur, wing_strikes, wing_lock_ts,
     wing_lots, wings_locked, delta_hedges, lot_size: int, approved_lots: int,
 ) -> List[Dict[str, Any]]:
     """Current price and P&L for every open leg, for the live per-leg view.
@@ -118,7 +118,7 @@ def _leg_marks(
     """
     out: List[Dict[str, Any]] = []
 
-    def mark(leg_id, idx, side, opt_type, strike, entry, cur, lots):
+    def mark(leg_id, idx, side, opt_type, strike, entry, cur, lots, opened):
         qty = lot_size * lots
         pnl = None
         if entry is not None and cur is not None:
@@ -128,11 +128,15 @@ def _leg_marks(
             "leg_id": str(leg_id), "leg_index": idx, "side": side,
             "option_type": opt_type, "strike": strike, "quantity": qty,
             "entry_price": entry, "current_price": cur, "pnl": pnl,
+            # When this leg was opened. Without it the panel's Entered column
+            # blanks out for the whole session the moment streaming starts,
+            # because live marks replace the persisted legs wholesale.
+            "entry_timestamp": opened.isoformat() if opened else None,
         })
 
     for i, leg_id in enumerate(straddle_leg_ids):
         mark(leg_id, i, "SELL", "CE" if i == 0 else "PE", atm_strike,
-             straddle_entry_prices[i], straddle_cur[i], approved_lots)
+             straddle_entry_prices[i], straddle_cur[i], approved_lots, entry_ts)
 
     if wings_locked:
         for i, leg_id in enumerate(wing_leg_ids):
@@ -140,12 +144,13 @@ def _leg_marks(
             if lots_i <= 0:
                 continue          # fully netted: no leg was bought
             mark(leg_id, i + 2, "BUY", "CE" if i == 0 else "PE",
-                 wing_strikes[i], wing_entry_prices[i], wing_cur[i], lots_i)
+                 wing_strikes[i], wing_entry_prices[i], wing_cur[i], lots_i,
+                 wing_lock_ts)
 
     for j, h in enumerate(delta_hedges):
         mark(h["id"], 4 + j, h["side"], h["option_type"], h["strike"],
              h.get("entry_price"), h.get("last_price"),
-             _hedge_lots(h, approved_lots))
+             _hedge_lots(h, approved_lots), h.get("entry_ts"))
 
     return out
 
@@ -1633,10 +1638,17 @@ async def _run_session(
                 # One entry per open leg so the UI can price each of them.
                 # leg_index matches StrategyRunLeg.leg_index: 0/1 straddle,
                 # 2/3 lock wings, 4+ delta hedges.
+                # Charges accrued so far, so the panel can reconcile gross to
+                # net while the session is live. total_charges on the run is
+                # only written at finalisation, so it is null until then.
+                "charges": round(
+                    entry_charges + wing_entry_charges + delta_hedge_charges + est_exit, 2
+                ),
                 "legs": _leg_marks(
                     straddle_leg_ids, straddle_entry_prices, straddle_cur, atm_strike,
+                    actual_entry_ts,
                     wing_leg_ids, wing_entry_prices, wing_cur,
-                    [wing_ce_strike, wing_pe_strike],
+                    [wing_ce_strike, wing_pe_strike], wing_lock_ts,
                     wing_lots, wings_locked, delta_hedges,
                     lot_size, approved_lots,
                 ),

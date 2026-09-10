@@ -263,6 +263,10 @@ async def _build_slot(db: AsyncSession, cfg: LivePaperConfig, session: Optional[
                 "entry_credit_total": float(run.entry_credit_total) if run.entry_credit_total else None,
                 "lot_size":           run.lot_size,
                 "approved_lots":      run.approved_lots,
+                # Needed by the per-leg panel so gross, charges and net
+                # reconcile on screen instead of leaving an unexplained gap.
+                "total_charges":      float(run.total_charges) if run.total_charges is not None else None,
+                "realized_net_pnl":   float(run.realized_net_pnl) if run.realized_net_pnl is not None else None,
                 "ce_entry_price":     leg_entry.get("CE"),
                 "pe_entry_price":     leg_entry.get("PE"),
                 "legs": [
