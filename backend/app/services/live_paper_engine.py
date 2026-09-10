@@ -642,9 +642,20 @@ async def _load_resume_state(
                 if row and row.price is not None:
                     wing_last_prices[i] = float(row.price)
 
-        # Recover entry timestamp
-        actual_entry_ts: Optional[datetime] = None
-        if existing_run.entry_time:
+        # Recover entry timestamps. The persisted legs hold the exact moment
+        # each was opened, so prefer those; entry_time on the run is only
+        # minute precision, and the wing lock time is not stored on the run at
+        # all. Without this a session that restarts after locking emits null
+        # timestamps for legs 2/3, and the panel -- which prefers live marks
+        # over the persisted legs -- blanks their Entered cells for good.
+        actual_entry_ts: Optional[datetime] = next(
+            (l.entry_timestamp for l in sell_legs if l.entry_timestamp is not None), None
+        )
+        wing_lock_ts: Optional[datetime] = next(
+            (l.entry_timestamp for l in (ce_lock, pe_lock)
+             if l is not None and l.entry_timestamp is not None), None
+        )
+        if actual_entry_ts is None and existing_run.entry_time:
             try:
                 h, m = existing_run.entry_time.split(":")
                 actual_entry_ts = datetime(
@@ -688,6 +699,7 @@ async def _load_resume_state(
         "trail_active":         trail_active,
         "trail_peak":           trail_peak,
         "actual_entry_ts":      actual_entry_ts,
+        "wing_lock_ts":         wing_lock_ts,
     }
 
 
@@ -857,6 +869,7 @@ async def _run_session(
                 trail_active          = saved["trail_active"]
                 trail_peak            = saved["trail_peak"]
                 actual_entry_ts       = saved["actual_entry_ts"]
+                wing_lock_ts          = saved["wing_lock_ts"]
                 log.info("Live paper: resumed session %s with existing run %s (trade_open=%s)",
                          session_id, run_id, trade_open)
 

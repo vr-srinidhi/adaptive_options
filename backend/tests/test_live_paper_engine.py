@@ -597,9 +597,11 @@ async def test_resume_reuses_existing_run_id():
     )
 
     sell_leg_ce = SimpleNamespace(id=uuid.uuid4(), side="SELL", option_type="CE",
-                                   strike=24200, entry_price=120.0, leg_index=0)
+                                   strike=24200, entry_price=120.0, leg_index=0,
+                                   entry_timestamp=datetime(2026, 5, 6, 9, 50, 3))
     sell_leg_pe = SimpleNamespace(id=uuid.uuid4(), side="SELL", option_type="PE",
-                                   strike=24200, entry_price=110.0, leg_index=1)
+                                   strike=24200, entry_price=110.0, leg_index=1,
+                                   entry_timestamp=datetime(2026, 5, 6, 9, 50, 3))
 
     class _FakeScalars:
         def __init__(self, rows): self._rows = rows
@@ -875,9 +877,11 @@ async def test_resume_seeds_straddle_last_prices_from_leg_mtm():
     )
 
     sell_ce = SimpleNamespace(id=leg_ce_id, side="SELL", option_type="CE",
-                               strike=24200, entry_price=120.0, leg_index=0)
+                               strike=24200, entry_price=120.0, leg_index=0,
+                               entry_timestamp=datetime(2026, 5, 6, 9, 50, 3))
     sell_pe = SimpleNamespace(id=leg_pe_id, side="SELL", option_type="PE",
-                               strike=24200, entry_price=110.0, leg_index=1)
+                               strike=24200, entry_price=110.0, leg_index=1,
+                               entry_timestamp=datetime(2026, 5, 6, 9, 50, 3))
 
     last_ce_mtm = SimpleNamespace(price=95.5)   # last known CE price
     last_pe_mtm = SimpleNamespace(price=102.0)  # last known PE price
@@ -917,3 +921,129 @@ async def test_resume_seeds_straddle_last_prices_from_leg_mtm():
     assert state["straddle_last_prices"] == [95.5, 102.0], (
         f"Expected last prices [95.5, 102.0] from StrategyLegMtm, got {state['straddle_last_prices']}"
     )
+
+
+@pytest.mark.asyncio
+async def test_resume_recovers_entry_and_wing_lock_timestamps():
+    """A session that restarts after locking must keep its leg entry times.
+
+    The live marks broadcast on every MTM tick carry these timestamps, and the
+    UI prefers marks over the persisted legs -- so if resume leaves wing_lock_ts
+    as None, the wing rows show no entry time for the rest of the session.
+    Recovered from the persisted legs, which hold the exact moment each opened;
+    the run's entry_time is only minute precision and has no wing time at all.
+    """
+    existing_run_id = uuid.uuid4()
+    trade_date = date(2026, 5, 6)
+    entry_ts = datetime(2026, 5, 6, 9, 50, 3)
+    lock_ts = datetime(2026, 5, 6, 11, 56, 15)
+
+    session = SimpleNamespace(
+        id=uuid.uuid4(), strategy_run_id=existing_run_id, status="entered",
+        atm_strike=24200, expiry_date=date(2026, 5, 12),
+        ce_symbol="CE", pe_symbol="PE", wing_ce_symbol="WCE", wing_pe_symbol="WPE",
+        approved_lots=13, lock_status="loss_locked",
+        net_delta_latest=None, delta_hedge_status="monitoring", delta_hedge_count=0,
+    )
+    existing_run = SimpleNamespace(
+        id=existing_run_id, entry_credit_per_unit=230.0, entry_credit_total=224250.0,
+        approved_lots=13, entry_time="09:50",
+    )
+    legs = [
+        SimpleNamespace(id=uuid.uuid4(), side="SELL", option_type="CE", strike=24200,
+                        entry_price=120.0, leg_index=0, entry_timestamp=entry_ts),
+        SimpleNamespace(id=uuid.uuid4(), side="SELL", option_type="PE", strike=24200,
+                        entry_price=110.0, leg_index=1, entry_timestamp=entry_ts),
+        SimpleNamespace(id=uuid.uuid4(), side="BUY", option_type="CE", strike=24300,
+                        entry_price=40.0, leg_index=2, quantity=975,
+                        entry_timestamp=lock_ts),
+        SimpleNamespace(id=uuid.uuid4(), side="BUY", option_type="PE", strike=24100,
+                        entry_price=35.0, leg_index=3, quantity=975,
+                        entry_timestamp=lock_ts),
+    ]
+
+    class _R:
+        def __init__(self, value=None, rows=None):
+            self._v, self._r = value, rows or []
+        def scalar_one_or_none(self): return self._v
+        def scalars(self):
+            rows = self._r
+            return SimpleNamespace(all=lambda: rows)
+
+    n = [0]
+
+    class _DB:
+        async def execute(self, stmt):
+            n[0] += 1
+            if n[0] == 1: return _R(value=session)
+            if n[0] == 2: return _R(value=existing_run)
+            if n[0] == 3: return _R(rows=legs)
+            return _R(value=None)
+        async def __aenter__(self): return self
+        async def __aexit__(self, *a): pass
+
+    with patch("app.services.live_paper_engine.AsyncSessionLocal", return_value=_DB()):
+        state = await _load_resume_state(
+            session_id=session.id, config=_make_config(), trade_date=trade_date,
+            lot_size=75, strike_step=50, wing_steps=2, trail_pct=0.5,
+        )
+
+    assert state is not None
+    assert state["wings_locked"] is True
+    # Exact leg timestamps, not the run's minute-precision entry_time.
+    assert state["actual_entry_ts"] == entry_ts
+    assert state["wing_lock_ts"] == lock_ts
+
+
+@pytest.mark.asyncio
+async def test_resume_falls_back_to_run_entry_time_when_legs_have_none():
+    """Sessions started before leg timestamps were recorded must still resume."""
+    existing_run_id = uuid.uuid4()
+    trade_date = date(2026, 5, 6)
+    session = SimpleNamespace(
+        id=uuid.uuid4(), strategy_run_id=existing_run_id, status="entered",
+        atm_strike=24200, expiry_date=date(2026, 5, 12),
+        ce_symbol="CE", pe_symbol="PE", wing_ce_symbol="WCE", wing_pe_symbol="WPE",
+        approved_lots=13, lock_status="none",
+        net_delta_latest=None, delta_hedge_status="monitoring", delta_hedge_count=0,
+    )
+    existing_run = SimpleNamespace(
+        id=existing_run_id, entry_credit_per_unit=230.0, entry_credit_total=224250.0,
+        approved_lots=13, entry_time="09:50",
+    )
+    legs = [
+        SimpleNamespace(id=uuid.uuid4(), side="SELL", option_type="CE", strike=24200,
+                        entry_price=120.0, leg_index=0, entry_timestamp=None),
+        SimpleNamespace(id=uuid.uuid4(), side="SELL", option_type="PE", strike=24200,
+                        entry_price=110.0, leg_index=1, entry_timestamp=None),
+    ]
+
+    class _R:
+        def __init__(self, value=None, rows=None):
+            self._v, self._r = value, rows or []
+        def scalar_one_or_none(self): return self._v
+        def scalars(self):
+            rows = self._r
+            return SimpleNamespace(all=lambda: rows)
+
+    n = [0]
+
+    class _DB:
+        async def execute(self, stmt):
+            n[0] += 1
+            if n[0] == 1: return _R(value=session)
+            if n[0] == 2: return _R(value=existing_run)
+            if n[0] == 3: return _R(rows=legs)
+            return _R(value=None)
+        async def __aenter__(self): return self
+        async def __aexit__(self, *a): pass
+
+    with patch("app.services.live_paper_engine.AsyncSessionLocal", return_value=_DB()):
+        state = await _load_resume_state(
+            session_id=session.id, config=_make_config(), trade_date=trade_date,
+            lot_size=75, strike_step=50, wing_steps=2, trail_pct=0.5,
+        )
+
+    assert state["actual_entry_ts"] is not None
+    assert state["actual_entry_ts"].hour == 9 and state["actual_entry_ts"].minute == 50
+    assert state["wing_lock_ts"] is None      # never locked
