@@ -104,6 +104,57 @@ def _wing_exit_charges(
     return total
 
 
+def _leg_marks(
+    straddle_leg_ids, straddle_entry_prices, straddle_cur, atm_strike, entry_ts,
+    wing_leg_ids, wing_entry_prices, wing_cur, wing_strikes, wing_lock_ts,
+    wing_lots, wings_locked, delta_hedges, lot_size: int, approved_lots: int,
+) -> List[Dict[str, Any]]:
+    """Current price and P&L for every open leg, for the live per-leg view.
+
+    Mirrors the MTM maths exactly -- SELL legs earn entry minus current, BUY
+    legs the reverse -- so the rows always sum to the same gross the header
+    reports. Sizes come from each leg's own lot count, never approved_lots,
+    because hedges and netted wings can be smaller.
+    """
+    out: List[Dict[str, Any]] = []
+
+    def mark(leg_id, idx, side, opt_type, strike, entry, cur, lots, opened):
+        qty = lot_size * lots
+        pnl = None
+        if entry is not None and cur is not None:
+            unit = (entry - cur) if side == "SELL" else (cur - entry)
+            pnl = round(unit * qty, 2)
+        out.append({
+            "leg_id": str(leg_id), "leg_index": idx, "side": side,
+            "option_type": opt_type, "strike": strike, "quantity": qty,
+            "entry_price": entry, "current_price": cur, "pnl": pnl,
+            # When this leg was opened. Without it the panel's Entered column
+            # blanks out for the whole session the moment streaming starts,
+            # because live marks replace the persisted legs wholesale.
+            "entry_timestamp": opened.isoformat() if opened else None,
+        })
+
+    for i, leg_id in enumerate(straddle_leg_ids):
+        mark(leg_id, i, "SELL", "CE" if i == 0 else "PE", atm_strike,
+             straddle_entry_prices[i], straddle_cur[i], approved_lots, entry_ts)
+
+    if wings_locked:
+        for i, leg_id in enumerate(wing_leg_ids):
+            lots_i = _wing_lots(wing_lots, i, approved_lots)
+            if lots_i <= 0:
+                continue          # fully netted: no leg was bought
+            mark(leg_id, i + 2, "BUY", "CE" if i == 0 else "PE",
+                 wing_strikes[i], wing_entry_prices[i], wing_cur[i], lots_i,
+                 wing_lock_ts)
+
+    for j, h in enumerate(delta_hedges):
+        mark(h["id"], 4 + j, h["side"], h["option_type"], h["strike"],
+             h.get("entry_price"), h.get("last_price"),
+             _hedge_lots(h, approved_lots), h.get("entry_ts"))
+
+    return out
+
+
 def _hedge_gross(hedges: List[Dict[str, Any]], lot_size: int, default_lots: int) -> float:
     """Mark-to-market of the long hedge legs, each at its own size."""
     return sum(
@@ -591,9 +642,20 @@ async def _load_resume_state(
                 if row and row.price is not None:
                     wing_last_prices[i] = float(row.price)
 
-        # Recover entry timestamp
-        actual_entry_ts: Optional[datetime] = None
-        if existing_run.entry_time:
+        # Recover entry timestamps. The persisted legs hold the exact moment
+        # each was opened, so prefer those; entry_time on the run is only
+        # minute precision, and the wing lock time is not stored on the run at
+        # all. Without this a session that restarts after locking emits null
+        # timestamps for legs 2/3, and the panel -- which prefers live marks
+        # over the persisted legs -- blanks their Entered cells for good.
+        actual_entry_ts: Optional[datetime] = next(
+            (l.entry_timestamp for l in sell_legs if l.entry_timestamp is not None), None
+        )
+        wing_lock_ts: Optional[datetime] = next(
+            (l.entry_timestamp for l in (ce_lock, pe_lock)
+             if l is not None and l.entry_timestamp is not None), None
+        )
+        if actual_entry_ts is None and existing_run.entry_time:
             try:
                 h, m = existing_run.entry_time.split(":")
                 actual_entry_ts = datetime(
@@ -637,6 +699,7 @@ async def _load_resume_state(
         "trail_active":         trail_active,
         "trail_peak":           trail_peak,
         "actual_entry_ts":      actual_entry_ts,
+        "wing_lock_ts":         wing_lock_ts,
     }
 
 
@@ -806,6 +869,7 @@ async def _run_session(
                 trail_active          = saved["trail_active"]
                 trail_peak            = saved["trail_peak"]
                 actual_entry_ts       = saved["actual_entry_ts"]
+                wing_lock_ts          = saved["wing_lock_ts"]
                 log.info("Live paper: resumed session %s with existing run %s (trade_open=%s)",
                          session_id, run_id, trade_open)
 
@@ -1119,6 +1183,7 @@ async def _run_session(
                             expiry_date=expiry_date,
                             quantity=lot_size * approved_lots,
                             entry_price=straddle_entry_prices[i],
+                            entry_timestamp=now.replace(tzinfo=None),
                         ))
                     await db.commit()
 
@@ -1475,6 +1540,7 @@ async def _run_session(
                                 expiry_date=expiry_date,
                                 quantity=lot_size * wing_lots[i],
                                 entry_price=wing_entry_prices[i],
+                                entry_timestamp=now.replace(tzinfo=None),
                             ))
                         await db.commit()
 
@@ -1582,6 +1648,23 @@ async def _run_session(
                 "delta_hedge_count": delta_hedge_count,
                 "wings_locked": wings_locked,
                 "lock_reason": lock_reason,
+                # One entry per open leg so the UI can price each of them.
+                # leg_index matches StrategyRunLeg.leg_index: 0/1 straddle,
+                # 2/3 lock wings, 4+ delta hedges.
+                # Charges accrued so far, so the panel can reconcile gross to
+                # net while the session is live. total_charges on the run is
+                # only written at finalisation, so it is null until then.
+                "charges": round(
+                    entry_charges + wing_entry_charges + delta_hedge_charges + est_exit, 2
+                ),
+                "legs": _leg_marks(
+                    straddle_leg_ids, straddle_entry_prices, straddle_cur, atm_strike,
+                    actual_entry_ts,
+                    wing_leg_ids, wing_entry_prices, wing_cur,
+                    [wing_ce_strike, wing_pe_strike], wing_lock_ts,
+                    wing_lots, wings_locked, delta_hedges,
+                    lot_size, approved_lots,
+                ),
             })
 
             if fired:
