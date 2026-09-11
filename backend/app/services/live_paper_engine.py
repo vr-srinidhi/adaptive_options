@@ -44,12 +44,15 @@ from app.services.charges_service import (
 )
 from app.services.contract_spec_service import get_contract_spec, resolve_atm_strike
 from app.services.delta_hedge import (
+    DEFAULT_IV,
     wing_lots_after_hedges,
     hedge_lots_for_delta,
     is_hedgeable_delta,
     parse_delta_hedge_settings,
     signed_position_delta,
     unit_delta_for_option,
+    volatility_for_delta,
+    years_to_expiry,
 )
 from app.services.depth_capture import capture_depth
 from app.services.token_store import get_broker_token
@@ -108,6 +111,7 @@ def _leg_marks(
     straddle_leg_ids, straddle_entry_prices, straddle_cur, atm_strike, entry_ts,
     wing_leg_ids, wing_entry_prices, wing_cur, wing_strikes, wing_lock_ts,
     wing_lots, wings_locked, delta_hedges, lot_size: int, approved_lots: int,
+    spot=None, vix=None, expiry_date=None, now=None, default_iv: float = DEFAULT_IV,
 ) -> List[Dict[str, Any]]:
     """Current price and P&L for every open leg, for the live per-leg view.
 
@@ -115,8 +119,27 @@ def _leg_marks(
     legs the reverse -- so the rows always sum to the same gross the header
     reports. Sizes come from each leg's own lot count, never approved_lots,
     because hedges and netted wings can be smaller.
+
+    Each leg also carries the implied volatility backed out of its current
+    price, which is what lets the UI reprice the book at other spots and draw
+    an intraday payoff curve rather than only the one at expiry.
     """
     out: List[Dict[str, Any]] = []
+    years = years_to_expiry(now, expiry_date) if (now and expiry_date) else None
+
+    def leg_iv(opt_type, strike, cur):
+        """IV backed out of this leg's live price.
+
+        volatility_for_delta already falls back to VIX and then default_iv, so
+        a leg only goes without an IV when there is no price or no expiry to
+        measure against -- in which case the UI simply omits it from the
+        intraday curve instead of pricing it off a guess.
+        """
+        if years is None or cur is None or spot is None or strike is None:
+            return None
+        return round(
+            volatility_for_delta(cur, spot, strike, years, opt_type, vix, default_iv), 6
+        )
 
     def mark(leg_id, idx, side, opt_type, strike, entry, cur, lots, opened):
         qty = lot_size * lots
@@ -132,6 +155,7 @@ def _leg_marks(
             # blanks out for the whole session the moment streaming starts,
             # because live marks replace the persisted legs wholesale.
             "entry_timestamp": opened.isoformat() if opened else None,
+            "iv": leg_iv(opt_type, strike, cur),
         })
 
     for i, leg_id in enumerate(straddle_leg_ids):
@@ -1657,6 +1681,14 @@ async def _run_session(
                 "charges": round(
                     entry_charges + wing_entry_charges + delta_hedge_charges + est_exit, 2
                 ),
+                # Time left to expiry, in years, on the same clock and
+                # convention the pricing helpers use. Sent once per tick so the
+                # UI reprices every leg off one consistent value rather than
+                # rebuilding the 15:30-expiry convention in JS.
+                "t_years": (
+                    round(years_to_expiry(now, expiry_date), 8)
+                    if expiry_date is not None else None
+                ),
                 "legs": _leg_marks(
                     straddle_leg_ids, straddle_entry_prices, straddle_cur, atm_strike,
                     actual_entry_ts,
@@ -1664,6 +1696,8 @@ async def _run_session(
                     [wing_ce_strike, wing_pe_strike], wing_lock_ts,
                     wing_lots, wings_locked, delta_hedges,
                     lot_size, approved_lots,
+                    spot=spot, vix=vix, expiry_date=expiry_date, now=now,
+                    default_iv=delta_settings.default_iv,
                 ),
             })
 

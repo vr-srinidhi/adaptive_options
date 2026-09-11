@@ -183,6 +183,65 @@ function calcPayoffAtExpiry(legs, spot, qty) {
   }, 0)
 }
 
+// Risk-free rate, matching RISK_FREE_RATE in backend/app/services/delta_hedge.py.
+// The intraday curve is only meaningful if it prices the way the engine does.
+const RISK_FREE_RATE = 0.065
+
+// Abramowitz & Stegun 26.2.17. Accurate to ~7.5e-8, which is far tighter than
+// the option prices this feeds are quoted to.
+function normCdf(x) {
+  const t = 1 / (1 + 0.2316419 * Math.abs(x))
+  const d = 0.3989422804014327 * Math.exp(-x * x / 2)
+  const p = d * t * (0.31938153 + t * (-0.356563782 + t * (1.781477937 + t * (-1.821255978 + t * 1.330274429))))
+  return x > 0 ? 1 - p : p
+}
+
+function blackScholesPrice(spot, strike, years, sigma, optionType) {
+  // At or past expiry, or with no volatility left, the option is worth its
+  // intrinsic value -- which is exactly the expiry payoff.
+  if (!(years > 0) || !(sigma > 0)) {
+    return optionType === 'CE' ? Math.max(0, spot - strike) : Math.max(0, strike - spot)
+  }
+  const sqrtT = Math.sqrt(years)
+  const d1 = (Math.log(spot / strike) + (RISK_FREE_RATE + sigma * sigma / 2) * years) / (sigma * sqrtT)
+  const d2 = d1 - sigma * sqrtT
+  const disc = strike * Math.exp(-RISK_FREE_RATE * years)
+  return optionType === 'CE'
+    ? spot * normCdf(d1) - disc * normCdf(d2)
+    : disc * normCdf(-d2) - spot * normCdf(-d1)
+}
+
+// What the book is worth *today* at a given spot, rather than at expiry.
+//
+// Every leg is repriced with Black-Scholes at the volatility backed out of its
+// own live price, holding that IV fixed as spot moves. That assumption is the
+// one simplification here: in reality IV rises as the market falls, so the true
+// curve is slightly kinder on the downside and harsher on the upside. Modelling
+// the skew would need a surface the platform does not capture, and pricing off
+// a guessed one would be worse than pricing off today's level and saying so.
+//
+// Callers must pass a book every leg of which can be priced -- see
+// canPriceIntraday. Pricing a subset would quietly drop a hedge from the curve
+// and overstate the position's exposure.
+function calcPayoffIntraday(legs, spot, qty, years) {
+  return legs.reduce((sum, leg) => {
+    const legQty = leg.quantity ?? qty
+    const value = blackScholesPrice(spot, leg.strike, years, leg.iv, leg.option_type)
+    return sum + (leg.side === 'SELL' ? leg.entry_price - value : value - leg.entry_price) * legQty
+  }, 0)
+}
+
+// Whether the live marks support an intraday curve at all.
+//
+// Every leg must be priceable, not merely some of them. A book where the
+// straddle carries an IV but a delta hedge does not would otherwise be drawn
+// as if the hedge were not there -- a curve showing more risk than the trader
+// actually holds, which is worse than showing no curve.
+export function canPriceIntraday(legs, years) {
+  if (!(years > 0) || !legs || legs.length === 0) return false
+  return legs.every(l => l.iv != null && l.entry_price != null && l.strike != null)
+}
+
 function PositionsPanel({ marks, legs, charges, netMtm }) {
   // Live marks when the stream is running; fall back to the persisted legs so a
   // reload or a finished session still shows the breakdown.
@@ -302,12 +361,121 @@ function PositionsPanel({ marks, legs, charges, netMtm }) {
 }
 
 
-function PayoffChart({ legs, atm, lotSize, lots, currentSpot, currentMtm, gradId }) {
+// Break-even crossings for one series, kept at the interpolated value. Rounding
+// these to the strike step threw away the precision the interpolation had just
+// produced.
+//
+// Every sample is examined for an exact zero, including the last. Scanning
+// pairs and testing only the left one skipped a break-even sitting exactly on
+// the right edge of the window -- reachable in the ±250 view, where a ₹125
+// per side straddle at 23,850 puts both break-evens precisely on the
+// boundaries. Interpolation is only used between two non-zero samples of
+// opposite sign, so an exact zero is never also counted as a crossing.
+function breakEvensFor(data, key) {
+  const out = []
+  for (let i = 0; i < data.length; i++) {
+    const cur = data[i][key]
+    if (cur == null) continue
+    if (cur === 0) {
+      // A flat run sitting exactly on zero would otherwise emit a chip per
+      // sample; only its edges carry information.
+      const prevZero = i > 0 && data[i - 1][key] === 0
+      const nextZero = i + 1 < data.length && data[i + 1][key] === 0
+      if (!(prevZero && nextZero)) out.push(data[i].spot)
+      continue
+    }
+    const next = data[i + 1]
+    const nxt = next ? next[key] : null
+    if (nxt != null && nxt !== 0 && cur * nxt < 0) {
+      out.push(Math.round(data[i].spot + (next.spot - data[i].spot) * (-cur / (nxt - cur))))
+    }
+  }
+  return out
+}
+
+const fmtSpotFull = v => Math.round(v).toLocaleString('en-IN')
+const fmtPnlFull = v =>
+  `${v < 0 ? '−' : '+'}₹${Math.round(Math.abs(v)).toLocaleString('en-IN')}`
+
+// Readout that follows the cursor across the payoff. Recharts hands it every
+// series at the hovered spot, so both lines are answered in one place: what the
+// position is worth there today, and what it would be worth at expiry.
+export function PayoffTooltip({ active, payload, label, currentSpot }) {
+  if (!active || !payload || payload.length === 0) return null
+  const rows = payload.filter(r => r.value != null)
+  if (rows.length === 0) return null
+  const away = currentSpot == null ? null : Math.round(label - currentSpot)
+  return (
+    <div style={{
+      background: 'var(--surface-secondary)', border: '1px solid var(--border)',
+      borderRadius: 6, padding: '7px 9px', fontSize: 11,
+      fontVariantNumeric: 'tabular-nums', minWidth: 150,
+    }}>
+      <div style={{ display: 'flex', justifyContent: 'space-between', gap: 12, alignItems: 'baseline' }}>
+        <span style={{ fontWeight: 700, color: 'var(--text-primary)', fontSize: 12 }}>
+          {fmtSpotFull(label)}
+        </span>
+        {away != null && (
+          <span style={{ color: 'var(--text-secondary)', fontSize: 10 }}>
+            {away >= 0 ? '+' : '−'}{Math.abs(away).toLocaleString('en-IN')} from now
+          </span>
+        )}
+      </div>
+      <div style={{ height: 1, background: 'var(--border)', margin: '5px 0' }} />
+      {rows.map(r => (
+        <div key={r.dataKey} style={{ display: 'flex', justifyContent: 'space-between', gap: 12, marginTop: 2 }}>
+          <span style={{ color: 'var(--text-secondary)' }}>
+            <span style={{ color: r.color }}>●</span> {r.name}
+          </span>
+          <span style={{ fontWeight: 600, color: r.value >= 0 ? '#4ade80' : '#f87171' }}>
+            {fmtPnlFull(r.value)}
+          </span>
+        </div>
+      ))}
+    </div>
+  )
+}
+
+// Y range for exactly the series on screen.
+//
+// Scaling to a hidden series is the failure this guards against: five days out
+// the expiry curve peaks at the full premium while today's peak is a small
+// fraction of it, so folding expiry into the domain while it is toggled off
+// would flatten the intraday line onto the zero axis -- the very squash that
+// makes the two curves unusable on one axis in the first place.
+export function payoffYDomain(data, { todayOn, expiryOn }) {
+  const keys = [...(todayOn ? ['today'] : []), ...(expiryOn ? ['pnl'] : [])]
+  const vals = data.flatMap(d => keys.map(k => d[k]).filter(v => v != null))
+  if (vals.length === 0) return [-5000, 5000]
+  const lo  = Math.min(...vals)
+  const hi  = Math.max(...vals)
+  const pad = Math.max(Math.abs(hi), Math.abs(lo)) * 0.12 || 5000
+  return [Math.floor((lo - pad) / 1000) * 1000, Math.ceil((hi + pad) / 1000) * 1000]
+}
+
+// Which curves are actually drawn, given what is available and what the user
+// has toggled.
+//
+// The invariant worth naming: the chart is never left blank. Today leads when
+// it can be priced, but switching it off falls back to the expiry curve rather
+// than clearing the panel, so there is always a line to read.
+export function visibleSeries({ canShowToday, showToday, showExpiry }) {
+  const todayOn = Boolean(canShowToday && showToday)
+  return { todayOn, expiryOn: Boolean(showExpiry) || !todayOn }
+}
+
+function PayoffChart({ legs, marks, tYears, atm, lotSize, lots, currentSpot, currentMtm, gradId }) {
   const [showStraddle, setShowStraddle] = useState(false)
   // Default to the mid window. The payoff's whole structure — both break-evens
   // and the peak — usually sits within a few hundred points of ATM, so the old
   // fixed ±14% view compressed it into a few percent of the width.
   const [rangeKey, setRangeKey] = useState('mid')
+  // Today is the line that matters on an intraday strategy, so it leads and the
+  // expiry curve is opt-in. They also cannot share a y-axis usefully: five days
+  // out, expiry peaks at the full premium while today's peak is a small
+  // fraction of it, which flattens the intraday line into the zero axis.
+  const [showToday, setShowToday] = useState(true)
+  const [showExpiry, setShowExpiry] = useState(false)
 
   if (!atm || !legs || legs.length === 0 || !lotSize || !lots) return null
 
@@ -325,65 +493,63 @@ function PayoffChart({ legs, atm, lotSize, lots, currentSpot, currentMtm, gradId
   const spotMin = atm - range
   const spotMax = atm + range
 
-  const straddleLegs = legs.filter(l => l.side === 'SELL')
-  const displayLegs  = showStraddle ? straddleLegs : legs
+  const straddleOnly = l => l.side === 'SELL'
+  const displayLegs  = showStraddle ? legs.filter(straddleOnly) : legs
   const hasAdjustments = legs.some(l => l.side === 'BUY')
 
-  // Sample on the strike grid. A payoff only bends at a strike, so sampling at
-  // any other spacing cuts the corners off the shape it is meant to show.
+  // The intraday curve prices off the live marks, which are the only source
+  // carrying each leg's implied volatility. Without a live tick -- a finished
+  // session, or a reload before the stream reconnects -- there is nothing to
+  // reprice from, so the chart falls back to the expiry-only view it has
+  // always shown rather than inventing a volatility.
+  const allMarks = marks || []
+  const intradayLegs = showStraddle ? allMarks.filter(straddleOnly) : allMarks
+  const canShowToday = canPriceIntraday(intradayLegs, tYears)
+  const { todayOn, expiryOn } = visibleSeries({ canShowToday, showToday, showExpiry })
+
+  // The expiry payoff is piecewise linear and only bends at a strike, so the
+  // strike grid captures it exactly and any finer spacing is wasted. Today's
+  // line is curved everywhere, though, and at 50 points it renders as a visible
+  // polygon in the zoomed-in view -- so it gets a finer grid. Both series stay
+  // on one set of x values, which is what lets the readout answer for both at
+  // the same spot. 10 divides 50, so every strike is still sampled and the
+  // expiry curve is unchanged.
+  const sampleStep = canShowToday ? 10 : step
   const data = []
-  for (let s = spotMin; s <= spotMax + 1e-6; s += step) {
-    data.push({ spot: Math.round(s), pnl: Math.round(calcPayoffAtExpiry(displayLegs, s, qty)) })
+  for (let s = spotMin; s <= spotMax + 1e-6; s += sampleStep) {
+    const spot = Math.round(s)
+    const row = { spot, pnl: Math.round(calcPayoffAtExpiry(displayLegs, s, qty)) }
+    if (canShowToday) row.today = Math.round(calcPayoffIntraday(intradayLegs, s, qty, tYears))
+    data.push(row)
   }
 
-  const pnlVals = data.map(d => d.pnl)
-  const yMin    = Math.min(...pnlVals)
-  const yMax    = Math.max(...pnlVals)
-  const yPad    = Math.max(Math.abs(yMax), Math.abs(yMin)) * 0.12 || 5000
-  const yDomain = [Math.floor((yMin - yPad) / 1000) * 1000, Math.ceil((yMax + yPad) / 1000) * 1000]
+  const yDomain = payoffYDomain(data, { todayOn, expiryOn })
 
   // Gradient zero-crossing fraction (SVG y goes top→bottom, yMax is top)
   const totalSpan = yDomain[1] - yDomain[0]
   const zeroFrac  = totalSpan > 0 ? ((yDomain[1]) / totalSpan) : 0.5
   const zeroFracPct = `${Math.min(99, Math.max(1, zeroFrac * 100)).toFixed(1)}%`
 
-  // Break-even crossings, kept at the interpolated value. Rounding these to the
-  // strike step threw away the precision the interpolation had just produced.
-  //
-  // Every sample is examined for an exact zero, including the last. Scanning
-  // pairs and testing only the left one skipped a break-even sitting exactly on
-  // the right edge of the window -- reachable in the ±250 view, where a ₹125
-  // per side straddle at 23,850 puts both break-evens precisely on the
-  // boundaries. Interpolation is only used between two non-zero samples of
-  // opposite sign, so an exact zero is never also counted as a crossing.
-  const breakEvens = []
-  for (let i = 0; i < data.length; i++) {
-    const cur = data[i]
-    if (cur.pnl === 0) {
-      // A flat run sitting exactly on zero would otherwise emit a chip per
-      // sample; only its edges carry information.
-      const prevZero = i > 0 && data[i - 1].pnl === 0
-      const nextZero = i + 1 < data.length && data[i + 1].pnl === 0
-      if (!(prevZero && nextZero)) breakEvens.push(cur.spot)
-      continue
-    }
-    const next = data[i + 1]
-    if (next && next.pnl !== 0 && cur.pnl * next.pnl < 0) {
-      breakEvens.push(Math.round(cur.spot + (next.spot - cur.spot) * (-cur.pnl / (next.pnl - cur.pnl))))
-    }
-  }
+  // Break-evens and the peak describe the line the trader is acting on. When
+  // today's line is up, the expiry figures are the wrong ones to quote: five
+  // days out they sit roughly three times further apart.
+  const primaryKey = todayOn ? 'today' : 'pnl'
+  const breakEvens = breakEvensFor(data, primaryKey)
+  // With both lines up, the expiry break-evens are worth showing precisely
+  // because they are so much wider -- that gap is the reason the intraday line
+  // exists. Muted, so they read as context rather than as the levels to act on.
+  const expiryBreakEvens = todayOn && expiryOn ? breakEvensFor(data, 'pnl') : []
+  const peak = data.reduce(
+    (best, d) => (d[primaryKey] != null && (best == null || d[primaryKey] > best[primaryKey]) ? d : best),
+    null,
+  )
 
-  const peak = data.reduce((best, d) => (d.pnl > best.pnl ? d : best), data[0])
-
-  const fmtSpot = v => Math.round(v).toLocaleString('en-IN')
+  const fmtSpot = fmtSpotFull
   const fmtPnl = v => {
     const abs = Math.abs(v)
     const s = abs >= 100000 ? `${(abs / 100000).toFixed(1)}L` : `${(abs / 1000).toFixed(0)}k`
     return v < 0 ? `-${s}` : `+${s}`
   }
-  // Full precision for the readouts a trader acts on; the axis stays compact.
-  const fmtPnlFull = v =>
-    `${v < 0 ? '−' : '+'}₹${Math.round(Math.abs(v)).toLocaleString('en-IN')}`
   const fmtAway = v => {
     if (currentSpot == null) return ''
     const d = Math.round(v - currentSpot)
@@ -397,12 +563,21 @@ function PayoffChart({ legs, atm, lotSize, lots, currentSpot, currentMtm, gradId
     color: active ? '#818cf8' : 'var(--text-secondary)',
     fontWeight: active ? 700 : 400,
   })
+  const seriesBtn = (active, hue) => ({
+    fontSize: 10, padding: '3px 8px', borderRadius: 10, cursor: 'pointer',
+    border: `1px solid ${active ? `${hue}66` : 'var(--border)'}`,
+    background: active ? `${hue}22` : 'transparent',
+    color: active ? hue : 'var(--text-secondary)',
+    fontWeight: active ? 700 : 400,
+  })
+
+  const daysLeft = tYears != null ? tYears * 365 : null
 
   return (
     <div style={{ marginTop: 20 }}>
       <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 8, gap: 8, flexWrap: 'wrap' }}>
         <div style={{ fontSize: 12, fontWeight: 700, color: 'var(--text-primary)' }}>
-          Payoff at Expiry
+          {canShowToday ? 'Payoff' : 'Payoff at Expiry'}
         </div>
         <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', alignItems: 'center' }}>
           {RANGES.map(r => (
@@ -416,6 +591,26 @@ function PayoffChart({ legs, atm, lotSize, lots, currentSpot, currentMtm, gradId
               {r.label}
             </button>
           ))}
+          {canShowToday && (
+            <>
+              <button
+                onClick={() => setShowToday(v => !v)}
+                aria-pressed={todayOn}
+                title="What the position is worth right now at each spot"
+                style={seriesBtn(todayOn, '#22d3ee')}
+              >
+                Today
+              </button>
+              <button
+                onClick={() => setShowExpiry(v => !v)}
+                aria-pressed={expiryOn}
+                title="What the position would be worth if held to expiry"
+                style={seriesBtn(expiryOn, '#818cf8')}
+              >
+                At expiry
+              </button>
+            </>
+          )}
           {hasAdjustments && (
             <button
               onClick={() => setShowStraddle(s => !s)}
@@ -435,9 +630,24 @@ function PayoffChart({ legs, atm, lotSize, lots, currentSpot, currentMtm, gradId
               BE {fmtSpot(be)}{fmtAway(be)}
             </span>
           ))}
-          <span style={{ fontSize: 10, color: '#818cf8', background: '#818cf811', border: '1px solid #818cf833', borderRadius: 8, padding: '2px 7px' }}>
-            Peak {fmtSpot(peak.spot)} · {fmtPnlFull(peak.pnl)}
-          </span>
+          {peak && (
+            <span style={{ fontSize: 10, color: '#818cf8', background: '#818cf811', border: '1px solid #818cf833', borderRadius: 8, padding: '2px 7px' }}>
+              Peak {fmtSpot(peak.spot)} · {fmtPnlFull(peak[primaryKey])}
+            </span>
+          )}
+          {expiryBreakEvens.length > 0 && (
+            <span style={{ fontSize: 10, color: 'var(--text-secondary)', border: '1px solid var(--border)', borderRadius: 8, padding: '2px 7px' }}>
+              At expiry BE {expiryBreakEvens.map(fmtSpot).join(' / ')}
+            </span>
+          )}
+          {todayOn && daysLeft != null && (
+            <span
+              style={{ fontSize: 10, color: 'var(--text-secondary)', border: '1px solid var(--border)', borderRadius: 8, padding: '2px 7px' }}
+              title="Today's line holds each leg's current implied volatility fixed as spot moves"
+            >
+              {daysLeft.toFixed(1)}d left · IV held flat
+            </span>
+          )}
         </div>
       </div>
 
@@ -467,9 +677,8 @@ function PayoffChart({ legs, atm, lotSize, lots, currentSpot, currentMtm, gradId
             width={48}
           />
           <Tooltip
-            formatter={(val) => [fmtPnlFull(val), 'P&L at expiry']}
-            labelFormatter={(s) => `Spot ${fmtSpot(s)}${fmtAway(s)}`}
-            contentStyle={{ background: 'var(--surface-secondary)', border: '1px solid var(--border)', borderRadius: 6, fontSize: 11 }}
+            content={<PayoffTooltip currentSpot={currentSpot} />}
+            cursor={{ stroke: 'var(--text-secondary)', strokeWidth: 1, strokeDasharray: '3 3' }}
           />
           <ReferenceLine y={0} stroke="#475569" strokeWidth={1} />
           {breakEvens.map((be, i) => (
@@ -484,18 +693,43 @@ function PayoffChart({ legs, atm, lotSize, lots, currentSpot, currentMtm, gradId
             <ReferenceLine y={Math.round(currentMtm)} stroke="#4ade80" strokeDasharray="4 2"
               label={{ value: `Live ${fmtPnl(currentMtm)}`, fill: '#4ade80', fontSize: 9, position: 'insideRight' }} />
           )}
-          <ReferenceDot x={peak.spot} y={peak.pnl} r={4}
-            fill="#818cf8" stroke="var(--surface-secondary)" strokeWidth={1.5} isFront />
-          <Area
-            type="linear"
-            dataKey="pnl"
-            stroke="#818cf8"
-            strokeWidth={1.5}
-            fill={`url(#${gradId})`}
-            dot={false}
-            activeDot={{ r: 3, fill: '#818cf8' }}
-            isAnimationActive={false}
-          />
+          {peak && (
+            <ReferenceDot x={peak.spot} y={peak[primaryKey]} r={4}
+              fill={todayOn ? '#22d3ee' : '#818cf8'} stroke="var(--surface-secondary)" strokeWidth={1.5} isFront />
+          )}
+          {/* Both series are Areas because AreaChart only renders Areas -- a
+              Line child is silently dropped. The secondary one just carries no
+              fill, so the profit/loss shading always reads against whichever
+              curve is leading. */}
+          {expiryOn && (
+            <Area
+              type="linear"
+              dataKey="pnl"
+              name="At expiry"
+              stroke="#818cf8"
+              strokeWidth={1.5}
+              strokeDasharray={todayOn ? '4 2' : undefined}
+              fill={todayOn ? 'none' : `url(#${gradId})`}
+              fillOpacity={todayOn ? 0 : 1}
+              dot={false}
+              activeDot={{ r: 3, fill: '#818cf8' }}
+              isAnimationActive={false}
+            />
+          )}
+          {todayOn && (
+            <Area
+              type="linear"
+              dataKey="today"
+              name="Today"
+              stroke="#22d3ee"
+              strokeWidth={2}
+              fill={`url(#${gradId})`}
+              dot={false}
+              activeDot={{ r: 3, fill: '#22d3ee' }}
+              connectNulls={false}
+              isAnimationActive={false}
+            />
+          )}
         </AreaChart>
       </ResponsiveContainer>
     </div>
@@ -1132,6 +1366,8 @@ function SlotDetail({ slot, liveSlotData, navigate }) {
       {payoffLegs.length > 0 && session?.atm_strike && (
         <PayoffChart
           legs={payoffLegs}
+          marks={legMarks}
+          tYears={sd.tYears ?? null}
           atm={session.atm_strike}
           lotSize={run?.lot_size ?? session?.lot_size ?? 75}
           lots={run?.approved_lots ?? session?.approved_lots ?? 1}
@@ -1282,7 +1518,7 @@ export default function LivePaperMonitor() {
       const existing = prev[sessionId] || {
         mtmData: [], ceData: [], peData: [], wingCeData: [], wingPeData: [],
         events: [], session: null, entryPrices: { ce: null, pe: null }, legs: [],
-        legMarks: [], legCharges: null,
+        legMarks: [], legCharges: null, tYears: null,
       }
       switch (data.type) {
         case 'SNAPSHOT':
@@ -1363,6 +1599,9 @@ export default function LivePaperMonitor() {
             // run.total_charges is only written at finalisation, so during a
             // live session this tick is the only source for the charges line.
             legCharges: data.charges != null ? data.charges : existing.legCharges,
+            // Time to expiry at this tick, used with each leg's iv to price
+            // the intraday payoff curve.
+            tYears:     data.t_years != null ? data.t_years : existing.tYears,
             ceData:     data.ce_price      != null ? [...existing.ceData,     { timestamp: data.timestamp, price: data.ce_price      }] : existing.ceData,
             peData:     data.pe_price      != null ? [...existing.peData,     { timestamp: data.timestamp, price: data.pe_price      }] : existing.peData,
             wingCeData: data.wing_ce_price != null ? [...existing.wingCeData, { timestamp: data.timestamp, price: data.wing_ce_price }] : existing.wingCeData,

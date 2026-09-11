@@ -41,7 +41,7 @@ vi.mock('../api/index.js', () => ({
   zerodhaSession: mocks.zerodhaSession,
 }))
 
-import LivePaperMonitor from './LivePaperMonitor'
+import LivePaperMonitor, { PayoffTooltip, payoffYDomain, canPriceIntraday, visibleSeries } from './LivePaperMonitor'
 
 function slot() {
   return {
@@ -435,5 +435,311 @@ describe('LivePaperMonitor positions panel', () => {
     expect(t.getByText('−₹9,458')).toBeInTheDocument()
     // The lone adjustment leg and the adjustments subtotal agree.
     expect(t.getAllByText('−₹2,850').length).toBe(2)
+  })
+})
+
+// ── Intraday payoff line ─────────────────────────────────────────────────────
+// Fixture is the real 10 Sep 9:50 position, snapshotted at 11:29: short 23,450
+// straddle, 13 lots, 5.2 days to expiry. The IVs are the ones backed out of the
+// live prices at that moment, which is what the engine now ships on the tick.
+//
+// Why this position: the two curves disagree enormously five days out. Today's
+// break-evens sit 163 points apart, at expiry 460 -- so a test that asserts one
+// set cannot accidentally pass while the code plots the other.
+const INTRADAY_TICK = {
+  type: 'MTM',
+  timestamp: '2026-09-10T11:29:00',
+  spot: 23429.05,
+  net_mtm: 8000,
+  gross_mtm: 8480,
+  charges: 480,
+  t_years: 0.01416,
+  legs: [
+    { leg_index: 0, side: 'SELL', option_type: 'CE', strike: 23450, quantity: 975,
+      entry_price: 133.40, current_price: 123.55, pnl: 9603.75, iv: 0.1108,
+      entry_timestamp: '2026-09-10T09:50:02' },
+    { leg_index: 1, side: 'SELL', option_type: 'PE', strike: 23450, quantity: 975,
+      entry_price: 96.20, current_price: 96.00, pnl: 195.00, iv: 0.0866,
+      entry_timestamp: '2026-09-10T09:50:02' },
+  ],
+}
+
+function intradaySlot() {
+  const sl = slot()
+  sl.session = { id: 'sess-i', status: 'entered', atm_strike: 23450,
+                 spot_latest: 23429.05, net_mtm_latest: 8000 }
+  sl.run = {
+    lot_size: 75, approved_lots: 13, total_charges: null, realized_net_pnl: null,
+    legs: [
+      { leg_index: 0, side: 'SELL', option_type: 'CE', strike: 23450, quantity: 975, entry_price: 133.40 },
+      { leg_index: 1, side: 'SELL', option_type: 'PE', strike: 23450, quantity: 975, entry_price: 96.20 },
+    ],
+  }
+  return sl
+}
+
+describe('LivePaperMonitor intraday payoff line', () => {
+  let streams
+  const push = async (tick) => {
+    await waitFor(() => expect(streams.length).toBeGreaterThan(0))
+    await act(async () => { streams[0].onmessage({ data: JSON.stringify(tick) }) })
+  }
+
+  beforeEach(() => {
+    streams = []
+    globalThis.EventSource = class {
+      constructor() { this.readyState = 1; this.onmessage = null; streams.push(this) }
+      addEventListener() {} removeEventListener() {}
+      close() {}
+    }
+    Object.values(mocks).forEach(m => { if (typeof m === 'function') m.mockReset() })
+    mocks.getLivePaperToday.mockResolvedValue({
+      data: { slots: [intradaySlot()], token_status: 'valid' },
+    })
+    mocks.getLivePaperHistory.mockResolvedValue({ data: [] })
+    mocks.getLiveDataSyncToday.mockResolvedValue({ data: null })
+  })
+
+  it('quotes today’s break-evens, not the far wider ones at expiry', async () => {
+    render(<LivePaperMonitor />)
+    await screen.findByText('Positions & MTM')
+    await push(INTRADAY_TICK)
+
+    // Priced off each leg's own IV with 5.2 days left: 163 points apart.
+    expect(screen.getByText(/BE 23,344 \(−85 from now\)/)).toBeInTheDocument()
+    expect(screen.getByText(/BE 23,510 \(\+81 from now\)/)).toBeInTheDocument()
+    // The expiry numbers are nearly three times wider. Seeing them here would
+    // mean the chart is still quoting the curve the trader is not trading.
+    expect(screen.queryByText(/BE 23,220/)).not.toBeInTheDocument()
+    expect(screen.queryByText(/BE 23,680/)).not.toBeInTheDocument()
+  })
+
+  it('scales the peak to what the position is worth today, not the full premium', async () => {
+    render(<LivePaperMonitor />)
+    await screen.findByText('Positions & MTM')
+    await push(INTRADAY_TICK)
+
+    // At the strike today: +₹9,035. Held to expiry: +₹2,23,860 -- the entire
+    // premium, and 25x larger, which is what flattens the intraday line if the
+    // two ever share a y-axis.
+    expect(screen.getByText(/Peak 23,430 · \+₹9,789/)).toBeInTheDocument()
+    expect(screen.queryByText(/₹2,23,860/)).not.toBeInTheDocument()
+    expect(screen.getByText(/5\.2d left · IV held flat/)).toBeInTheDocument()
+  })
+
+  it('switches the whole computation back to expiry when Today is turned off', async () => {
+    render(<LivePaperMonitor />)
+    await screen.findByText('Positions & MTM')
+    await push(INTRADAY_TICK)
+
+    fireEvent.click(screen.getByRole('button', { name: 'Today' }))
+
+    // Not just the button state: the chips are recomputed from the expiry
+    // series, so the break-evens widen and the peak becomes the full premium.
+    expect(screen.getByRole('button', { name: 'Today' })).toHaveAttribute('aria-pressed', 'false')
+    expect(screen.getByText(/BE 23,220 \(−209 from now\)/)).toBeInTheDocument()
+    expect(screen.getByText(/BE 23,680 \(\+251 from now\)/)).toBeInTheDocument()
+    expect(screen.getByText(/Peak 23,450 · \+₹2,23,860/)).toBeInTheDocument()
+    expect(screen.queryByText(/BE 23,344/)).not.toBeInTheDocument()
+  })
+
+  it('shows the expiry break-evens alongside today’s once that line is added', async () => {
+    render(<LivePaperMonitor />)
+    await screen.findByText('Positions & MTM')
+    await push(INTRADAY_TICK)
+
+    expect(screen.queryByText(/At expiry BE/)).not.toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: 'At expiry' }))
+
+    // Both sets now, and today's stay the ones marked as the live break-evens.
+    expect(screen.getByText('At expiry BE 23,220 / 23,680')).toBeInTheDocument()
+    expect(screen.getByText(/BE 23,344 \(−85 from now\)/)).toBeInTheDocument()
+    expect(screen.getByText(/Peak 23,430 · \+₹9,789/)).toBeInTheDocument()
+  })
+
+  it('drops the intraday line rather than draw a book missing one leg’s IV', async () => {
+    // A hedge whose IV could not be backed out. Pricing the straddle alone
+    // would draw unlimited downside that the hedge in fact caps.
+    render(<LivePaperMonitor />)
+    await screen.findByText('Positions & MTM')
+    await push({ ...INTRADAY_TICK, legs: [...INTRADAY_TICK.legs,
+      { leg_index: 4, side: 'BUY', option_type: 'PE', strike: 23350, quantity: 375,
+        entry_price: 40, current_price: 38, pnl: -750, iv: null,
+        entry_timestamp: '2026-09-10T10:40:00' }] })
+
+    expect(screen.getByText('Payoff at Expiry')).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Today' })).not.toBeInTheDocument()
+    expect(screen.queryByText(/BE 23,344/)).not.toBeInTheDocument()
+  })
+
+  it('prices each leg at its own size, not the full straddle quantity', async () => {
+    // A half-size delta hedge: 375 long puts against 975 short. Priced at its
+    // own size the downside stays open, so the curve has two break-evens; blown
+    // up to the full 975 the hedge would fully cover the short puts and the
+    // downside would go flat, leaving only one. The two are impossible to
+    // confuse, so this cannot pass while the quantity is being ignored.
+    render(<LivePaperMonitor />)
+    await screen.findByText('Positions & MTM')
+    await push({ ...INTRADAY_TICK, legs: [...INTRADAY_TICK.legs,
+      { leg_index: 4, side: 'BUY', option_type: 'PE', strike: 23350, quantity: 375,
+        entry_price: 52.30, current_price: 50.10, pnl: -825, iv: 0.1240,
+        entry_timestamp: '2026-09-10T10:40:00' }] })
+
+    expect(screen.getByText(/BE 23,202 \(−227 from now\)/)).toBeInTheDocument()
+    expect(screen.getByText(/BE 23,524 \(\+95 from now\)/)).toBeInTheDocument()
+    expect(screen.getByText(/Peak 23,370 · \+₹29,708/)).toBeInTheDocument()
+    // What the full-size misreading would have produced.
+    expect(screen.queryByText(/BE 23,534/)).not.toBeInTheDocument()
+    expect(screen.queryByText(/₹95,559/)).not.toBeInTheDocument()
+  })
+
+  it('keeps the expiry-only chart when no live mark carries an IV', async () => {
+    // A finished session, or a reload before the stream reconnects. There is
+    // nothing to reprice from, so the chart must stay exactly as it was rather
+    // than invent a volatility.
+    render(<LivePaperMonitor />)
+    await screen.findByText('Positions & MTM')
+    await push({ ...INTRADAY_TICK, t_years: null,
+                 legs: INTRADAY_TICK.legs.map(l => ({ ...l, iv: null })) })
+
+    expect(screen.getByText('Payoff at Expiry')).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Today' })).not.toBeInTheDocument()
+    expect(screen.getByText(/BE 23,220 \(−209 from now\)/)).toBeInTheDocument()
+    expect(screen.getByText(/Peak 23,450 · \+₹2,23,860/)).toBeInTheDocument()
+  })
+})
+
+describe('PayoffTooltip', () => {
+  const row = (dataKey, name, value, color) => ({ dataKey, name, value, color })
+
+  it('reads out every visible series at the hovered spot', () => {
+    render(<PayoffTooltip active label={23500} currentSpot={23429.05} payload={[
+      row('today', 'Today', -4820.5, '#22d3ee'),
+      row('pnl', 'At expiry', 198765, '#818cf8'),
+    ]} />)
+
+    expect(screen.getByText('23,500')).toBeInTheDocument()
+    // The distance is the point of sweeping across: how far NIFTY can run.
+    expect(screen.getByText('+71 from now')).toBeInTheDocument()
+    expect(screen.getByText('−₹4,821')).toBeInTheDocument()
+    expect(screen.getByText('+₹1,98,765')).toBeInTheDocument()
+    expect(screen.getByText(/Today/)).toBeInTheDocument()
+    expect(screen.getByText(/At expiry/)).toBeInTheDocument()
+  })
+
+  it('shows the distance below the current spot as negative', () => {
+    render(<PayoffTooltip active label={23300} currentSpot={23429.05} payload={[
+      row('today', 'Today', -12000, '#22d3ee'),
+    ]} />)
+    expect(screen.getByText('−129 from now')).toBeInTheDocument()
+  })
+
+  it('renders nothing when inactive, empty, or carrying only null values', () => {
+    const { container: a } = render(<PayoffTooltip active={false} label={23500} payload={[row('today', 'Today', 1, '#000')]} />)
+    expect(a).toBeEmptyDOMElement()
+    const { container: b } = render(<PayoffTooltip active label={23500} payload={[]} />)
+    expect(b).toBeEmptyDOMElement()
+    // A hover past the end of a series hands Recharts a null value; a row
+    // reading "+₹0" there would be a lie about the position.
+    const { container: c } = render(<PayoffTooltip active label={23500} payload={[row('today', 'Today', null, '#000')]} />)
+    expect(c).toBeEmptyDOMElement()
+  })
+
+  it('omits the distance when there is no live spot to compare against', () => {
+    render(<PayoffTooltip active label={23500} currentSpot={null} payload={[
+      row('pnl', 'At expiry', 5000, '#818cf8'),
+    ]} />)
+    expect(screen.getByText('23,500')).toBeInTheDocument()
+    expect(screen.queryByText(/from now/)).not.toBeInTheDocument()
+  })
+})
+
+describe('payoffYDomain', () => {
+  // The real 10 Sep shape, sampled coarsely: today peaks at +9,035 while the
+  // expiry curve peaks at +2,23,860 on the same spots.
+  const data = [
+    { spot: 23200, today: -88480, pnl: -20140 },
+    { spot: 23450, today: 9035,   pnl: 223860 },
+    { spot: 23700, today: -85000, pnl: -20140 },
+  ]
+
+  it('scales to the series on screen, not the ones toggled off', () => {
+    const [lo, hi] = payoffYDomain(data, { todayOn: true, expiryOn: false })
+    // The ceiling tracks today's own peak (+9,035) plus padding, nowhere near
+    // the 2.24L the expiry curve reaches on the same spot.
+    expect(hi).toBeLessThan(9035 * 3)
+    expect(lo).toBeLessThanOrEqual(-88480)
+
+    // Adding the expiry curve lifts the ceiling more than tenfold. That is the
+    // whole reason it is opt-in rather than always drawn.
+    const [, bothHi] = payoffYDomain(data, { todayOn: true, expiryOn: true })
+    expect(bothHi).toBeGreaterThan(hi * 10)
+  })
+
+  it('keeps today’s profitable zone readable when it is the only series', () => {
+    const height = ([lo, hi]) => hi - lo
+    const fraction = toggles => 9035 / height(payoffYDomain(data, toggles))
+
+    // Alone, today's entire profit region is a usable slice of the chart.
+    expect(fraction({ todayOn: true, expiryOn: false })).toBeGreaterThan(0.05)
+    // Folded in with expiry it collapses to a sliver -- visually flat, which is
+    // exactly what a trader must not be shown as "safe".
+    expect(fraction({ todayOn: true, expiryOn: true })).toBeLessThan(0.03)
+  })
+
+  it('ignores null samples and still returns a usable range when all are null', () => {
+    expect(payoffYDomain([{ spot: 1, today: null }], { todayOn: true, expiryOn: false })).toEqual([-5000, 5000])
+    const [lo, hi] = payoffYDomain([{ spot: 1, today: null }, { spot: 2, today: 4000 }], { todayOn: true, expiryOn: false })
+    expect(hi).toBeGreaterThanOrEqual(4000)
+    expect(Number.isFinite(lo)).toBe(true)
+  })
+})
+
+describe('canPriceIntraday', () => {
+  const straddle = [
+    { side: 'SELL', option_type: 'CE', strike: 23450, entry_price: 133.40, iv: 0.1108 },
+    { side: 'SELL', option_type: 'PE', strike: 23450, entry_price: 96.20,  iv: 0.0866 },
+  ]
+
+  it('accepts a book where every leg can be priced', () => {
+    expect(canPriceIntraday(straddle, 0.01416)).toBe(true)
+  })
+
+  it('refuses a book where only some legs carry an IV', () => {
+    // The dangerous case: the straddle prices but the hedge protecting it does
+    // not. Dropping that leg would draw a curve with more downside than the
+    // trader is actually carrying.
+    const withHedge = [...straddle,
+      { side: 'BUY', option_type: 'PE', strike: 23350, entry_price: 40, iv: null }]
+    expect(canPriceIntraday(withHedge, 0.01416)).toBe(false)
+  })
+
+  it('refuses an empty book or a missing time to expiry', () => {
+    expect(canPriceIntraday([], 0.01416)).toBe(false)
+    expect(canPriceIntraday(straddle, null)).toBe(false)
+    expect(canPriceIntraday(straddle, 0)).toBe(false)
+  })
+})
+
+describe('visibleSeries', () => {
+  it('leads with today when it can be priced', () => {
+    expect(visibleSeries({ canShowToday: true, showToday: true, showExpiry: false }))
+      .toEqual({ todayOn: true, expiryOn: false })
+  })
+
+  it('never leaves the chart blank', () => {
+    // Both switched off, and today unavailable — in every case something is
+    // still drawn, because a payoff panel with no curve tells a trader nothing.
+    expect(visibleSeries({ canShowToday: true, showToday: false, showExpiry: false }))
+      .toEqual({ todayOn: false, expiryOn: true })
+    expect(visibleSeries({ canShowToday: false, showToday: true, showExpiry: false }))
+      .toEqual({ todayOn: false, expiryOn: true })
+    expect(visibleSeries({ canShowToday: false, showToday: false, showExpiry: false }))
+      .toEqual({ todayOn: false, expiryOn: true })
+  })
+
+  it('shows both when expiry is added to today', () => {
+    expect(visibleSeries({ canShowToday: true, showToday: true, showExpiry: true }))
+      .toEqual({ todayOn: true, expiryOn: true })
   })
 })
