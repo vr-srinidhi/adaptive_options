@@ -49,16 +49,11 @@ async def _get_owned_session(
     user: User,
     db: AsyncSession,
 ) -> PaperSession:
-    """Load a PaperSession and enforce ownership. Raises 404 if not found or not owned.
-
-    user_id IS NULL: intentional migration bridge — sessions created before auth was
-    added have no owner and remain accessible to any authenticated user until they are
-    re-created or deleted.
-    """
+    """Load a PaperSession and enforce strict ownership."""
     s = (await db.execute(
         select(PaperSession).where(
             PaperSession.id == sid,
-            (PaperSession.user_id == user.id) | (PaperSession.user_id.is_(None)),
+            PaperSession.user_id == user.id,
         )
     )).scalar_one_or_none()
     if not s:
@@ -355,9 +350,7 @@ async def list_sessions(
     user: User = Depends(get_current_active_user),
 ):
     q = select(PaperSession).order_by(PaperSession.created_at.desc())
-    q = q.where(
-        (PaperSession.user_id == user.id) | (PaperSession.user_id.is_(None))
-    )
+    q = q.where(PaperSession.user_id == user.id)
     if instrument:
         q = q.where(PaperSession.instrument == instrument.strip().upper())
     q = q.limit(limit)
@@ -407,7 +400,7 @@ async def export_sessions_bundle(
     sessions = (await db.execute(
         select(PaperSession).where(
             PaperSession.id.in_(session_ids),
-            (PaperSession.user_id == user.id) | (PaperSession.user_id.is_(None)),
+            PaperSession.user_id == user.id,
         )
     )).scalars().all()
 
