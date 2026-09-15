@@ -1047,3 +1047,127 @@ async def test_resume_falls_back_to_run_entry_time_when_legs_have_none():
     assert state["actual_entry_ts"] is not None
     assert state["actual_entry_ts"].hour == 9 and state["actual_entry_ts"].minute == 50
     assert state["wing_lock_ts"] is None      # never locked
+
+
+# ── Resuming must not switch the delta hedge off ─────────────────────────────
+# Regression for 15 Sep 2026: a deploy restarted the backend during the waiting
+# window, all four slots resumed before their first MTM tick, and the re-arm flag
+# was derived from a session column still holding its default "off". The hedge
+# was disarmed for the whole session -- net delta ran 151 -> 329 between 09:52
+# and 09:57 with no DELTA_HEDGE event of any kind, and the loss lock fired
+# instead. The tell was DELTA_NEUTRAL_RESTORED appearing at 09:57:35: that event
+# only fires from inside `if not delta_reentry_armed`, so the flag had to have
+# been false the entire time.
+
+def test_resume_arms_a_session_that_has_not_hedged_yet():
+    """The exact 15 Sep case: status still 'off' because no tick has run."""
+    status, armed = live_paper_engine.resume_delta_state("off", hedge_enabled=True)
+    assert status == "monitoring"
+    assert armed is True, "a session that has never hedged must resume armed"
+
+
+def test_resume_keeps_a_mid_hedge_session_disarmed():
+    """Already hedged: stay disarmed until delta comes back inside the buffer."""
+    status, armed = live_paper_engine.resume_delta_state("hedged", hedge_enabled=True)
+    assert status == "hedged"
+    assert armed is False
+
+
+def test_resume_preserves_monitoring_and_exhausted():
+    assert live_paper_engine.resume_delta_state("monitoring", True) == ("monitoring", True)
+    # Exhausted stays armed here on purpose -- can_trigger tests the status
+    # directly, so encoding it twice would let the two drift apart.
+    assert live_paper_engine.resume_delta_state("exhausted", True) == ("exhausted", True)
+
+
+def test_resume_leaves_status_off_when_hedging_is_disabled():
+    status, armed = live_paper_engine.resume_delta_state("off", hedge_enabled=False)
+    assert status == "off"
+    assert armed is True
+
+
+def test_resume_handles_a_null_status_column():
+    """delta_hedge_status is nullable; a null must not disarm the hedge."""
+    assert live_paper_engine.resume_delta_state(None, True) == ("monitoring", True)
+
+
+@pytest.mark.asyncio
+async def test_waiting_resume_does_not_recreate_the_strategy_run(monkeypatch):
+    """A restart during the waiting window must not re-insert the run row.
+
+    Regression for 15 Sep 2026. The run row is written when a session first
+    reaches 'waiting', not at entry, so a waiting-phase resume has a saved state
+    with trade_open=False. The old guard (`not (resume and trade_open)`) read
+    that as "create", re-added a StrategyRun under an id that already existed,
+    and the UniqueViolation dropped the session to status='error' -- which the
+    resumer then refuses to touch. One deploy took out all four slots for the day.
+    """
+    from app.models.strategy_run import StrategyRun
+
+    session_id = uuid.uuid4()
+    existing_run_id = uuid.uuid4()
+    recording_session = _RecordingSession()
+    ticks = [datetime(2026, 5, 8, 15, 25, tzinfo=live_paper_engine.IST)] * 4
+
+    class _FakeDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            value = ticks.pop(0)
+            return value if tz else value.replace(tzinfo=None)
+
+    async def noop(*_a, **_k):
+        return None
+
+    async def fake_load_resume_state(*_a, **_k):
+        # Shape mirrors _load_resume_state's return for a session that reached
+        # 'waiting' and wrote its run row, but never entered.
+        return {
+            "run_id": existing_run_id, "trade_open": False,
+            "straddle_entry_prices": [None, None], "straddle_last_prices": [None, None],
+            "straddle_leg_ids": [None, None], "straddle_legs": [],
+            "wing_entry_prices": [None, None], "wing_last_prices": [None, None],
+            "wing_leg_ids": [None, None], "wing_legs": [],
+            "wings_locked": False, "wing_lots": None, "lock_reason": None,
+            "wing_ce_strike": None, "wing_pe_strike": None,
+            "atm_strike": None, "expiry_date": None,
+            "ce_symbol": None, "pe_symbol": None,
+            "wing_ce_symbol": None, "wing_pe_symbol": None,
+            "approved_lots": 13,
+            "entry_credit_per_unit": 0.0, "entry_credit_total": 0.0,
+            "entry_charges": 0.0, "wing_entry_charges": 0.0,
+            "delta_hedges": [], "delta_hedge_charges": 0.0,
+            "delta_hedge_status": "off", "delta_hedge_count": 0,
+            "trail_active": False, "trail_peak": 0.0,
+            "actual_entry_ts": None, "wing_lock_ts": None,
+        }
+
+    async def fake_contract_spec(_db, _instrument, _trade_date):
+        return SimpleNamespace(lot_size=75, strike_step=50, estimated_margin_per_lot=250000)
+
+    async def fake_stop(_sid):
+        return False
+
+    monkeypatch.setattr(live_paper_engine, "datetime", _FakeDateTime)
+    monkeypatch.setattr(live_paper_engine.asyncio, "sleep", noop)
+    monkeypatch.setattr(live_paper_engine, "AsyncSessionLocal", lambda: recording_session)
+    monkeypatch.setattr(live_paper_engine, "_load_resume_state", fake_load_resume_state)
+    monkeypatch.setattr(live_paper_engine, "_update_session", noop)
+    monkeypatch.setattr(live_paper_engine, "_broadcast", noop)
+    monkeypatch.setattr(live_paper_engine, "_append_waiting_spot", noop)
+    monkeypatch.setattr(live_paper_engine, "_write_event", noop)
+    monkeypatch.setattr(live_paper_engine, "_write_mtm", noop)
+    monkeypatch.setattr(live_paper_engine, "_stop_requested", fake_stop)
+    monkeypatch.setattr(live_paper_engine, "get_contract_spec", fake_contract_spec)
+    monkeypatch.setattr(live_paper_engine, "get_instruments_with_token", lambda _t: [])
+    monkeypatch.setattr(live_paper_engine, "fetch_live_quote", lambda _s, _t: {})
+
+    config = _make_config(user_id=uuid.uuid4(), capital=2_500_000, entry_time="09:50",
+                          params_json={"poll_interval_seconds": 3, "time_exit": "15:25"})
+
+    await live_paper_engine._run_session(session_id, config, "token", resume=True)
+
+    runs_added = [o for o in recording_session.added if isinstance(o, StrategyRun)]
+    assert runs_added == [], (
+        "a waiting-phase resume re-created the StrategyRun -- this is the "
+        "duplicate-key crash that errored every slot on 15 Sep"
+    )
