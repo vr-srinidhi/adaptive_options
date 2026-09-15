@@ -822,7 +822,11 @@ async def _run_session(
         trail_active   = False
         trail_peak     = 0.0
         trail_stop_at_exit: Optional[float] = None
-        approved_lots  = 1
+        # Sized from capital up front, not left at 1. The resolve block computes
+        # the same value, but only when atm_strike is still None -- so a resume
+        # in the window between ATM resolution and entry would otherwise carry
+        # this default into the trade and enter at a single lot.
+        approved_lots  = max(1, int(capital / margin_per_lot)) if margin_per_lot else 1
 
         atm_strike: Optional[int]     = None
         expiry_date: Optional[date]   = None
@@ -919,9 +923,16 @@ async def _run_session(
             await _update_session(session_id, status="waiting")
             await _broadcast(session_id, {"type": "STATUS", "status": "waiting"})
 
-        # ── Create StrategyRun if this is a fresh start or waiting-resume ──────
-        # Skip when resuming an already-open trade (saved already holds run_id).
-        if not (resume and trade_open):
+        # ── Create StrategyRun only when there isn't one already ───────────────
+        # `saved` is non-None whenever _load_resume_state found a run, which is
+        # true for a 'waiting' resume as well as an 'entered' one -- the run row
+        # is written when the session first reaches 'waiting', not at entry. The
+        # old guard keyed off trade_open, so a waiting-phase resume re-added a
+        # StrategyRun under an id that already existed, raised UniqueViolation,
+        # and dropped the session to status='error' -- which check_and_resume
+        # then refuses to touch. Every restart during the waiting window killed
+        # every slot for the day.
+        if saved is None:
             async with AsyncSessionLocal() as db:
                 db.add(StrategyRun(
                     id=run_id,
