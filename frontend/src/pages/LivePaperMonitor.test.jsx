@@ -41,7 +41,7 @@ vi.mock('../api/index.js', () => ({
   zerodhaSession: mocks.zerodhaSession,
 }))
 
-import LivePaperMonitor, { PayoffTooltip, payoffYDomain, canPriceIntraday, visibleSeries } from './LivePaperMonitor'
+import LivePaperMonitor, { PayoffTooltip, payoffYDomain, canPriceIntraday, visibleSeries, calcPayoffIntraday } from './LivePaperMonitor'
 
 function slot() {
   return {
@@ -450,9 +450,12 @@ const INTRADAY_TICK = {
   type: 'MTM',
   timestamp: '2026-09-10T11:29:00',
   spot: 23429.05,
-  net_mtm: 8000,
-  gross_mtm: 8480,
+  // Reconciles: the two leg marks below sum to +9,798.75 gross; charges 480
+  // leave 9,318.75 net. The Today curve at the current spot must reproduce the
+  // gross figure, which is what keeps the Live reference on the same basis.
+  gross_mtm: 9798.75,
   charges: 480,
+  net_mtm: 9318.75,
   t_years: 0.01416,
   legs: [
     { leg_index: 0, side: 'SELL', option_type: 'CE', strike: 23450, quantity: 975,
@@ -514,6 +517,19 @@ describe('LivePaperMonitor intraday payoff line', () => {
     expect(screen.queryByText(/BE 23,680/)).not.toBeInTheDocument()
   })
 
+  it('puts the Live reference on the curve\u2019s basis \u2014 gross, not net', async () => {
+    // The curves subtract no charges, so a Live line drawn from net_mtm sits
+    // below a curve it can never touch. The fixture separates the two by the
+    // 480 of charges precisely so this cannot pass on the wrong one.
+    render(<LivePaperMonitor />)
+    await screen.findByText('Positions & MTM')
+    await push(INTRADAY_TICK)
+
+    expect(screen.getByText(/Live \+\u20b99,799 gross/)).toBeInTheDocument()
+    expect(screen.queryByText(/Live \+\u20b99,319/)).not.toBeInTheDocument()
+    expect(screen.getByText('gross of charges')).toBeInTheDocument()
+  })
+
   it('scales the peak to what the position is worth today, not the full premium', async () => {
     render(<LivePaperMonitor />)
     await screen.findByText('Positions & MTM')
@@ -570,6 +586,11 @@ describe('LivePaperMonitor intraday payoff line', () => {
     expect(screen.getByText('Payoff at Expiry')).toBeInTheDocument()
     expect(screen.queryByRole('button', { name: 'Today' })).not.toBeInTheDocument()
     expect(screen.queryByText(/BE 23,344/)).not.toBeInTheDocument()
+    // The expiry curve still prices the whole book, hedge included -- 23,164 /
+    // 23,664 rather than the 23,220 / 23,680 of the straddle alone.
+    expect(screen.getByText(/BE 23,164/)).toBeInTheDocument()
+    expect(screen.getByText(/BE 23,664/)).toBeInTheDocument()
+    expect(screen.getByText(/Peak 23,450 · \+₹2,08,860/)).toBeInTheDocument()
   })
 
   it('prices each leg at its own size, not the full straddle quantity', async () => {
@@ -591,6 +612,16 @@ describe('LivePaperMonitor intraday payoff line', () => {
     // What the full-size misreading would have produced.
     expect(screen.queryByText(/BE 23,534/)).not.toBeInTheDocument()
     expect(screen.queryByText(/₹95,559/)).not.toBeInTheDocument()
+
+    // Both curves must describe the SAME position. The hedge arrives only on
+    // the marks, so if At expiry still read the event-built legs it would draw
+    // the bare straddle (23,220 / 23,680) against a Today line that includes
+    // the hedge -- two different books on one chart.
+    expect(screen.getByRole('button', { name: 'With adjustments' })).toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: 'At expiry' }))
+    expect(screen.getByText('At expiry BE 23,172 / 23,659')).toBeInTheDocument()
+    expect(screen.queryByText(/23,220/)).not.toBeInTheDocument()
+    expect(screen.queryByText(/23,680/)).not.toBeInTheDocument()
   })
 
   it('keeps the expiry-only chart when no live mark carries an IV', async () => {
@@ -741,5 +772,33 @@ describe('visibleSeries', () => {
   it('shows both when expiry is added to today', () => {
     expect(visibleSeries({ canShowToday: true, showToday: true, showExpiry: true }))
       .toEqual({ todayOn: true, expiryOn: true })
+  })
+})
+
+describe('payoff basis', () => {
+  // The curves sum gross per-leg P&L and subtract nothing, so the chart's Live
+  // reference has to be gross_mtm. Pointing it at net_mtm put the line below a
+  // curve it could never touch, and quoted break-evens on a basis the curve did
+  // not use.
+  const legs = [
+    { side: 'SELL', option_type: 'CE', strike: 23450, quantity: 975, entry_price: 133.40, iv: 0.1108 },
+    { side: 'SELL', option_type: 'PE', strike: 23450, quantity: 975, entry_price: 96.20,  iv: 0.0866 },
+  ]
+
+  it('reproduces gross MTM at the current spot', () => {
+    // Each leg's IV was inverted from its own live price, so Black-Scholes at
+    // that IV returns that price and the curve collapses to the gross sum.
+    // Tolerance covers the 6-decimal rounding the engine applies to iv.
+    const v = calcPayoffIntraday(legs, 23429.05, 975, 0.01416)
+    expect(v).toBeCloseTo(9798.75, -1)
+    expect(Math.abs(v - 9798.75)).toBeLessThan(10)
+  })
+
+  it('is gross, not net — it must not silently carry charges', () => {
+    // The 11 Sep fixture books 480 of charges. If the curve ever starts
+    // subtracting them, this pins the change rather than letting the Live line
+    // and the curve drift onto different bases again.
+    const v = calcPayoffIntraday(legs, 23429.05, 975, 0.01416)
+    expect(v).toBeGreaterThan(9318.75 + 400)
   })
 })

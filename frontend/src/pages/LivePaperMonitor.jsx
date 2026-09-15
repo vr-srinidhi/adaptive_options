@@ -223,7 +223,7 @@ function blackScholesPrice(spot, strike, years, sigma, optionType) {
 // Callers must pass a book every leg of which can be priced -- see
 // canPriceIntraday. Pricing a subset would quietly drop a hedge from the curve
 // and overstate the position's exposure.
-function calcPayoffIntraday(legs, spot, qty, years) {
+export function calcPayoffIntraday(legs, spot, qty, years) {
   return legs.reduce((sum, leg) => {
     const legQty = leg.quantity ?? qty
     const value = blackScholesPrice(spot, leg.strike, years, leg.iv, leg.option_type)
@@ -464,7 +464,7 @@ export function visibleSeries({ canShowToday, showToday, showExpiry }) {
   return { todayOn, expiryOn: Boolean(showExpiry) || !todayOn }
 }
 
-function PayoffChart({ legs, marks, tYears, atm, lotSize, lots, currentSpot, currentMtm, gradId }) {
+function PayoffChart({ legs, marks, tYears, atm, lotSize, lots, currentSpot, currentGrossMtm, gradId }) {
   const [showStraddle, setShowStraddle] = useState(false)
   // Default to the mid window. The payoff's whole structure — both break-evens
   // and the peak — usually sits within a few hundred points of ATM, so the old
@@ -477,7 +477,14 @@ function PayoffChart({ legs, marks, tYears, atm, lotSize, lots, currentSpot, cur
   const [showToday, setShowToday] = useState(true)
   const [showExpiry, setShowExpiry] = useState(false)
 
-  if (!atm || !legs || legs.length === 0 || !lotSize || !lots) return null
+  // One book, both curves. `marks` is the engine's view of what is actually
+  // open; `legs` is event-built and the MTM handler never updates it, so the
+  // two drift the moment a hedge fires. Drawing Today from one and At expiry
+  // from the other compares two different positions. Marks win when present,
+  // matching what PositionsPanel already does.
+  const book = (marks && marks.length > 0) ? marks : (legs || [])
+
+  if (!atm || book.length === 0 || !lotSize || !lots) return null
 
   const qty = lotSize * lots
   const step = 50   // NIFTY strike step
@@ -494,17 +501,14 @@ function PayoffChart({ legs, marks, tYears, atm, lotSize, lots, currentSpot, cur
   const spotMax = atm + range
 
   const straddleOnly = l => l.side === 'SELL'
-  const displayLegs  = showStraddle ? legs.filter(straddleOnly) : legs
-  const hasAdjustments = legs.some(l => l.side === 'BUY')
+  const displayLegs  = showStraddle ? book.filter(straddleOnly) : book
+  const hasAdjustments = book.some(l => l.side === 'BUY')
 
-  // The intraday curve prices off the live marks, which are the only source
-  // carrying each leg's implied volatility. Without a live tick -- a finished
-  // session, or a reload before the stream reconnects -- there is nothing to
-  // reprice from, so the chart falls back to the expiry-only view it has
-  // always shown rather than inventing a volatility.
-  const allMarks = marks || []
-  const intradayLegs = showStraddle ? allMarks.filter(straddleOnly) : allMarks
-  const canShowToday = canPriceIntraday(intradayLegs, tYears)
+  // Today additionally needs an implied volatility on every leg, which only the
+  // live marks carry. Without a tick -- a finished session, or a reload before
+  // the stream reconnects -- there is nothing to reprice from, so the chart
+  // falls back to the expiry-only view it has always shown.
+  const canShowToday = canPriceIntraday(displayLegs, tYears)
   const { todayOn, expiryOn } = visibleSeries({ canShowToday, showToday, showExpiry })
 
   // The expiry payoff is piecewise linear and only bends at a strike, so the
@@ -519,7 +523,7 @@ function PayoffChart({ legs, marks, tYears, atm, lotSize, lots, currentSpot, cur
   for (let s = spotMin; s <= spotMax + 1e-6; s += sampleStep) {
     const spot = Math.round(s)
     const row = { spot, pnl: Math.round(calcPayoffAtExpiry(displayLegs, s, qty)) }
-    if (canShowToday) row.today = Math.round(calcPayoffIntraday(intradayLegs, s, qty, tYears))
+    if (canShowToday) row.today = Math.round(calcPayoffIntraday(displayLegs, s, qty, tYears))
     data.push(row)
   }
 
@@ -640,6 +644,20 @@ function PayoffChart({ legs, marks, tYears, atm, lotSize, lots, currentSpot, cur
               At expiry BE {expiryBreakEvens.map(fmtSpot).join(' / ')}
             </span>
           )}
+          {/* The Live figure as a chip, not only as a label buried in the SVG.
+              It is the one number that has to sit on the curve's own basis, so
+              it is worth showing where it can be read -- and checked. */}
+          {currentGrossMtm != null && (
+            <span style={{ fontSize: 10, color: '#4ade80', background: '#4ade8011', border: '1px solid #4ade8033', borderRadius: 8, padding: '2px 7px' }}>
+              Live {fmtPnlFull(currentGrossMtm)} gross
+            </span>
+          )}
+          <span
+            style={{ fontSize: 10, color: 'var(--text-secondary)', border: '1px solid var(--border)', borderRadius: 8, padding: '2px 7px' }}
+            title="Curves, break-evens and the Live line are all gross per-leg P&L. Charges are shown in the Positions panel."
+          >
+            gross of charges
+          </span>
           {todayOn && daysLeft != null && (
             <span
               style={{ fontSize: 10, color: 'var(--text-secondary)', border: '1px solid var(--border)', borderRadius: 8, padding: '2px 7px' }}
@@ -689,9 +707,9 @@ function PayoffChart({ legs, marks, tYears, atm, lotSize, lots, currentSpot, cur
             <ReferenceLine x={Math.round(currentSpot)} stroke="#94a3b8" strokeWidth={1.5}
               label={{ value: 'NOW', fill: '#94a3b8', fontSize: 9, position: 'insideTopRight' }} />
           )}
-          {currentMtm != null && (
-            <ReferenceLine y={Math.round(currentMtm)} stroke="#4ade80" strokeDasharray="4 2"
-              label={{ value: `Live ${fmtPnl(currentMtm)}`, fill: '#4ade80', fontSize: 9, position: 'insideRight' }} />
+          {currentGrossMtm != null && (
+            <ReferenceLine y={Math.round(currentGrossMtm)} stroke="#4ade80" strokeDasharray="4 2"
+              label={{ value: `Live ${fmtPnl(currentGrossMtm)}`, fill: '#4ade80', fontSize: 9, position: 'insideRight' }} />
           )}
           {peak && (
             <ReferenceDot x={peak.spot} y={peak[primaryKey]} r={4}
@@ -1372,7 +1390,7 @@ function SlotDetail({ slot, liveSlotData, navigate }) {
           lotSize={run?.lot_size ?? session?.lot_size ?? 75}
           lots={run?.approved_lots ?? session?.approved_lots ?? 1}
           currentSpot={session?.spot_latest ?? null}
-          currentMtm={session?.net_mtm_latest ?? null}
+          currentGrossMtm={session?.gross_mtm_latest ?? null}
           gradId={`payoffGrad-${session?.id ?? session?.atm_strike}`}
         />
       )}
@@ -1586,6 +1604,10 @@ export default function LivePaperMonitor() {
             session: {
               ...(existing.session || {}),
               net_mtm_latest: data.net_mtm,
+              // The payoff curves sum gross per-leg P&L and subtract no
+              // charges, so the chart's Live reference must be gross too or it
+              // can never touch the curve it is drawn against.
+              gross_mtm_latest: data.gross_mtm,
               spot_latest: data.spot,
               net_delta_latest: data.net_delta,
               delta_hedge_status: data.delta_hedge_status,
