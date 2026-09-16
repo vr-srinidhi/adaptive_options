@@ -179,6 +179,25 @@ def _leg_marks(
     return out
 
 
+def resume_delta_state(saved_status: Optional[str], hedge_enabled: bool):
+    """Delta-hedge status and re-arm flag for a resumed session.
+
+    The flag used to be `saved_status == "monitoring"`, which silently disarmed
+    hedging for any session resumed *before* its first MTM tick: until then the
+    session row still carries the column default "off", so a restart during the
+    waiting window switched the hedge off for the whole day. On 15 Sep 2026 that
+    is exactly what happened -- net delta ran 151 -> 329 untouched from 09:52 to
+    09:57 while the flag sat false, and the loss lock ended up doing the job.
+
+    A session is armed unless it is mid-hedge waiting for delta to normalise.
+    "exhausted" needs no special case here; the trigger guard tests it directly.
+    """
+    status = saved_status or "off"
+    if status == "off" and hedge_enabled:
+        status = "monitoring"
+    return status, status != "hedged"
+
+
 def _hedge_gross(hedges: List[Dict[str, Any]], lot_size: int, default_lots: int) -> float:
     """Mark-to-market of the long hedge legs, each at its own size."""
     return sum(
@@ -891,9 +910,10 @@ async def _run_session(
                 wing_entry_charges    = saved["wing_entry_charges"]
                 delta_hedges          = saved["delta_hedges"]
                 delta_hedge_charges   = saved["delta_hedge_charges"]
-                delta_hedge_status    = saved["delta_hedge_status"]
                 delta_hedge_count     = saved["delta_hedge_count"]
-                delta_reentry_armed   = delta_hedge_status == "monitoring"
+                delta_hedge_status, delta_reentry_armed = resume_delta_state(
+                    saved["delta_hedge_status"], delta_settings.enabled
+                )
                 trail_active          = saved["trail_active"]
                 trail_peak            = saved["trail_peak"]
                 actual_entry_ts       = saved["actual_entry_ts"]
