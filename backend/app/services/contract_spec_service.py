@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+import math
 from datetime import date as date_type, datetime, time
 from typing import List, Optional, Tuple
 
@@ -85,8 +86,22 @@ async def get_contract_spec(
     )
 
 
-def resolve_atm_strike(spot_close: float, strike_step: int) -> int:
-    """Round spot to nearest valid strike step."""
+ATM_SNAP_NEAREST_50  = "NEAREST_50"
+ATM_SNAP_NEAREST_100 = "NEAREST_100"
+
+
+def resolve_atm_strike(spot_close: float, strike_step: int,
+                       snap: "str | None" = None) -> int:
+    """Round spot to the strike the straddle is sold at.
+
+    Default is the nearest valid strike step. `NEAREST_100` coarsens that to
+    round-100s, with **ties going down**: 23,250 resolves to 23,200 and 23,251
+    to 23,300. The asymmetry is deliberate -- it is the rule the slot config
+    describes. Plain rounding would split midpoints inconsistently (Python
+    rounds halves to even, so 23,250 would go down but 23,350 up).
+    """
+    if snap and str(snap).upper() == ATM_SNAP_NEAREST_100:
+        return int(math.ceil((spot_close - 50) / 100.0) * 100)
     return int(round(spot_close / strike_step) * strike_step)
 
 

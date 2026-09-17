@@ -465,6 +465,7 @@ _STRATEGIES = [
             {"key": "delta_threshold", "label": "Delta Threshold", "type": "number", "required": False, "default": 150, "min": 1},
             {"key": "hedge_action", "label": "Hedge Action", "type": "select", "required": False, "default": "BUY_WING", "options": ["BUY_WING"]},
             {"key": "hedge_qty_mode", "label": "Hedge Qty Mode", "type": "select", "required": False, "default": "PARTIAL", "options": ["PARTIAL", "FULL"]},
+            {"key": "atm_snap", "label": "ATM Snap", "type": "select", "required": False, "default": "NEAREST_50", "options": ["NEAREST_50", "NEAREST_100"]},
             {"key": "max_hedge_triggers", "label": "Max Hedge Triggers", "type": "number", "required": False, "default": 3, "min": 0, "max": 10},
             {"key": "reentry_buffer", "label": "Delta Re-entry Buffer", "type": "number", "required": False, "default": 50, "min": 0},
             {"key": "default_iv", "label": "Fallback IV", "type": "number", "required": False, "default": 0.12, "min": 0.01, "max": 3},

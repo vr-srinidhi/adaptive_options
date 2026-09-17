@@ -1080,7 +1080,7 @@ async def _run_session(
 
             # ── Resolve instruments at 09:49 ──────────────────────────────────
             if t >= _RESOLVE_TIME and atm_strike is None and spot is not None:
-                atm_strike  = resolve_atm_strike(spot, strike_step)
+                atm_strike  = resolve_atm_strike(spot, strike_step, params.get("atm_snap"))
                 wing_ce_strike = atm_strike + wing_steps * strike_step
                 wing_pe_strike = atm_strike - wing_steps * strike_step
 
