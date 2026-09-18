@@ -8,7 +8,7 @@ midpoint would fall down at 23,250 and up at 23,350.
 """
 import pytest
 
-from app.services.contract_spec_service import resolve_atm_strike
+from app.services.contract_spec_service import resolve_atm_strike, snaps_to_100
 
 
 def test_default_is_unchanged_by_the_new_argument():
@@ -62,3 +62,28 @@ def test_wings_stay_on_hundreds_when_atm_does():
     atm = resolve_atm_strike(23_251, 50, "NEAREST_100")
     assert (atm + 2 * 50) % 100 == 0
     assert (atm - 2 * 50) % 100 == 0
+
+
+# ── snaps_to_100: the opt-in predicate both engines gate on ───────────────────
+# It exists so no caller tests the raw param for truthiness. NEAREST_50 is a
+# non-empty string, so truthiness would treat a normally-configured slot as
+# opting in -- which is how the live resolver briefly started moving every
+# slot's spot source off 09:49.
+
+@pytest.mark.parametrize("value", ["NEAREST_100", "nearest_100", "Nearest_100", " NEAREST_100 "])
+def test_snaps_to_100_accepts_the_opt_in_normalized(value):
+    assert snaps_to_100(value) is True
+
+
+@pytest.mark.parametrize("value", [
+    None, "", "   ", "NEAREST_50", "nearest_50", "NEAREST_200", "100", "true", "NEAREST100",
+])
+def test_snaps_to_100_rejects_everything_else(value):
+    assert snaps_to_100(value) is False, f"{value!r} must not opt a slot into 100-snapping"
+
+
+def test_predicate_and_resolver_agree():
+    """The resolver is defined in terms of the predicate, so they cannot drift."""
+    for value in [None, "", "NEAREST_50", "nearest_100", "NEAREST_100", "WAT"]:
+        coarsened = resolve_atm_strike(23_260.0, 50, value) == 23_300
+        assert coarsened is snaps_to_100(value), value

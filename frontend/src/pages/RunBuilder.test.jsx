@@ -104,7 +104,7 @@ describe('RunBuilder', () => {
     // nearest-50 gives 23,250 and nearest-100 gives 23,300.
     validateWorkbenchRun.mockImplementation(({ config }) => {
       const spot = 23260
-      const atm = String(config.atm_snap).toUpperCase() === 'NEAREST_100'
+      const atm = String(config.atm_snap).trim().toUpperCase() === 'NEAREST_100'
         ? Math.ceil((spot - 50) / 100) * 100
         : Math.round(spot / 50) * 50
       return Promise.resolve({

@@ -42,7 +42,11 @@ from app.services.charges_service import (
     compute_leg_exit_charges_estimate,
     compute_leg_total_charges,
 )
-from app.services.contract_spec_service import get_contract_spec, resolve_atm_strike
+from app.services.contract_spec_service import (
+    get_contract_spec,
+    resolve_atm_strike,
+    snaps_to_100,
+)
 from app.services.delta_hedge import (
     DEFAULT_IV,
     wing_lots_after_hedges,
@@ -765,9 +769,12 @@ async def _run_session(
     capital      = float(config.capital)
     entry_time   = _parse_time(config.entry_time, default=time(9, 50))
     params       = dict(config.params_json or {})
-    # See the resolve block below: a slot that opts into snapping resolves its
-    # strike at its own entry time, so the live arm and a replay agree.
-    _resolve_at  = max(_RESOLVE_TIME, entry_time) if params.get("atm_snap") else _RESOLVE_TIME
+    # See the resolve block below: only a slot that explicitly opts into
+    # NEAREST_100 resolves at its own entry time, so the live arm and a replay
+    # agree. NEAREST_100 is the sole opt-in -- NEAREST_100 alone, not any
+    # non-empty atm_snap, since NEAREST_50 is the documented default and would
+    # otherwise move every slot's spot source off 09:49.
+    _resolve_at  = max(_RESOLVE_TIME, entry_time) if snaps_to_100(params.get("atm_snap")) else _RESOLVE_TIME
 
     stop_capital_pct  = float(params.get("stop_capital_pct", 0.015))
     trail_trigger     = float(params.get("trail_trigger", 12_000))
@@ -1092,7 +1099,8 @@ async def _run_session(
             # arm would snap off the 09:49 spot while generic_executor resolves
             # from the entry-time candle, so live and replay could land on
             # different strikes and the A/B would not be isolating one variable.
-            # A slot that opts into snapping therefore resolves at its own entry.
+            # A slot on NEAREST_100 therefore resolves at its own entry; every
+            # other slot, NEAREST_50 included, still resolves at 09:49.
             if t >= _resolve_at and atm_strike is None and spot is not None:
                 atm_strike  = resolve_atm_strike(spot, strike_step, params.get("atm_snap"))
                 wing_ce_strike = atm_strike + wing_steps * strike_step

@@ -1241,23 +1241,37 @@ async def _false():
 
 
 @pytest.mark.asyncio
-async def test_snapping_slot_resolves_atm_from_its_own_entry_spot(monkeypatch):
+@pytest.mark.parametrize("snap", ["NEAREST_100", "nearest_100", " NEAREST_100 "])
+async def test_snapping_slot_resolves_atm_from_its_own_entry_spot(monkeypatch, snap):
     """10:15 slot, NEAREST_100: must snap off the 10:15 spot, not the 09:49 one."""
     atm = await _drive_resolve(
         monkeypatch, entry_time="10:15",
         params_json={"poll_interval_seconds": 3, "time_exit": "15:25",
-                     "atm_snap": "NEAREST_100"},
+                     "atm_snap": snap},
         spot_at=[23_240.0, 23_260.0])
     assert atm == 23_300, (
         "snapped off the stale 09:49 spot (23,240 -> 23,200) instead of the "
         "10:15 entry spot (23,260 -> 23,300); live and replay would disagree")
 
 
+# NEAREST_50 is the documented default and ships in the catalog defaults, so it
+# reaches the engine as an explicit value on ordinary slots -- not just as a
+# missing key. Every one of these must keep resolving from the 09:49 spot, or
+# live slots silently start trading a different strike than they did before.
 @pytest.mark.asyncio
-async def test_non_snapping_slot_keeps_resolving_at_0949(monkeypatch):
-    """No atm_snap: behaviour is exactly as before -- 09:49 spot, nearest 50."""
+@pytest.mark.parametrize("params_extra", [
+    {},                                # key absent
+    {"atm_snap": "NEAREST_50"},        # explicit default, as the catalog sends it
+    {"atm_snap": "nearest_50"},        # case variation
+    {"atm_snap": "SOMETHING_ELSE"},    # unknown value must not opt in
+    {"atm_snap": ""},                  # blank
+], ids=["absent", "explicit_50", "lowercase_50", "unknown", "blank"])
+async def test_non_snapping_slot_keeps_resolving_at_0949(monkeypatch, params_extra):
+    """Behaviour is exactly as before: 09:49 spot, nearest 50."""
     atm = await _drive_resolve(
         monkeypatch, entry_time="10:15",
-        params_json={"poll_interval_seconds": 3, "time_exit": "15:25"},
+        params_json={"poll_interval_seconds": 3, "time_exit": "15:25", **params_extra},
         spot_at=[23_240.0, 23_260.0])
-    assert atm == 23_250, "existing slots must still resolve from the 09:49 spot"
+    assert atm == 23_250, (
+        "resolved from the 10:15 entry spot instead of 09:49 -- this slot does "
+        "not use 100-snapping, so its spot source must not have moved")

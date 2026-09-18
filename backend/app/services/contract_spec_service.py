@@ -90,6 +90,17 @@ ATM_SNAP_NEAREST_50  = "NEAREST_50"
 ATM_SNAP_NEAREST_100 = "NEAREST_100"
 
 
+def snaps_to_100(snap: "str | None") -> bool:
+    """True only for an explicit NEAREST_100 request.
+
+    Callers must not test the raw param for truthiness: `NEAREST_50` is the
+    documented default and is a non-empty string, so truthiness would treat a
+    normally-configured slot as opting in. Unknown values fall back to the
+    default step rather than silently coarsening.
+    """
+    return bool(snap) and str(snap).strip().upper() == ATM_SNAP_NEAREST_100
+
+
 def resolve_atm_strike(spot_close: float, strike_step: int,
                        snap: "str | None" = None) -> int:
     """Round spot to the strike the straddle is sold at.
@@ -100,7 +111,7 @@ def resolve_atm_strike(spot_close: float, strike_step: int,
     describes. Plain rounding would split midpoints inconsistently (Python
     rounds halves to even, so 23,250 would go down but 23,350 up).
     """
-    if snap and str(snap).upper() == ATM_SNAP_NEAREST_100:
+    if snaps_to_100(snap):
         return int(math.ceil((spot_close - 50) / 100.0) * 100)
     return int(round(spot_close / strike_step) * strike_step)
 
