@@ -491,6 +491,7 @@ _STRATEGIES = [
                 "delta_threshold":    150,
                 "hedge_action":       "BUY_WING",
                 "hedge_qty_mode":     "PARTIAL",
+                "atm_snap":           "NEAREST_50",
                 "max_hedge_triggers": 3,
                 "reentry_buffer":     50,
                 "default_iv":         0.12,
