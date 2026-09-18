@@ -248,7 +248,7 @@ async def validate_run(
             trade_date=trade_date_str, entry_time=entry_time_str,
             error=f"No spot candle for {instrument} at {entry_time_str} on {trade_date}.",
         )
-    atm_strike = resolve_atm_strike(spot, spec.strike_step)
+    atm_strike = resolve_atm_strike(spot, spec.strike_step, config.get("atm_snap"))
 
     # 4. Expiry resolution
     try:

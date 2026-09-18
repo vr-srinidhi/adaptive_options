@@ -1171,3 +1171,107 @@ async def test_waiting_resume_does_not_recreate_the_strategy_run(monkeypatch):
         "a waiting-phase resume re-created the StrategyRun -- this is the "
         "duplicate-key crash that errored every slot on 15 Sep"
     )
+
+
+# ── ATM snap must use the slot's own entry spot ──────────────────────────────
+# The resolver fires at 09:49 for every slot, so a 10:15 slot would otherwise
+# snap off a spot 26 minutes stale while the backtest snaps off the 10:15 candle.
+# With 100-point snapping the two can land on different strikes entirely, and the
+# A/B stops isolating one variable. These two tests put the 09:49 and 10:15 spots
+# on opposite sides of a 100 boundary so the difference is unmissable.
+
+async def _drive_resolve(monkeypatch, *, entry_time, params_json, spot_at):
+    """Run _run_session far enough to resolve ATM; return the atm_strike written."""
+    session_id = uuid.uuid4()
+    recording = _RecordingSession()
+    updates = []
+    ticks = [datetime(2026, 5, 8, 9, 49, tzinfo=live_paper_engine.IST),
+             datetime(2026, 5, 8, 10, 15, tzinfo=live_paper_engine.IST),
+             datetime(2026, 5, 8, 15, 25, tzinfo=live_paper_engine.IST)]
+
+    class _FakeDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            # Exhausting the ticks raises, which ends the run -- same convention
+            # as the other clock-driven tests in this file.
+            value = ticks.pop(0)
+            return value if tz else value.replace(tzinfo=None)
+
+    async def noop(*_a, **_k):
+        return None
+
+    async def fake_update(sid, **fields):
+        updates.append(fields)
+
+    async def fake_spec(_db, _i, _d):
+        return SimpleNamespace(lot_size=75, strike_step=50, estimated_margin_per_lot=250000)
+
+    def fake_instruments(_t):
+        return [{"name": "NIFTY", "instrument_type": "CE", "expiry": date.today() + timedelta(days=6)}]
+
+    def fake_quote(symbols, _t):
+        if symbols == ["NSE:NIFTY 50"]:
+            # 09:49 and 10:15 sit on opposite sides of the 23,250 boundary
+            return {"NSE:NIFTY 50": spot_at.pop(0) if spot_at else 23_260.0}
+        return {s: 50.0 for s in symbols}
+
+    monkeypatch.setattr(live_paper_engine, "datetime", _FakeDateTime)
+    monkeypatch.setattr(live_paper_engine.asyncio, "sleep", noop)
+    monkeypatch.setattr(live_paper_engine, "AsyncSessionLocal", lambda: recording)
+    monkeypatch.setattr(live_paper_engine, "_update_session", fake_update)
+    monkeypatch.setattr(live_paper_engine, "_broadcast", noop)
+    monkeypatch.setattr(live_paper_engine, "_append_waiting_spot", noop)
+    monkeypatch.setattr(live_paper_engine, "_write_event", noop)
+    monkeypatch.setattr(live_paper_engine, "_write_mtm", noop)
+    monkeypatch.setattr(live_paper_engine, "_stop_requested", lambda _s: _false())
+    monkeypatch.setattr(live_paper_engine, "get_contract_spec", fake_spec)
+    monkeypatch.setattr(live_paper_engine, "get_instruments_with_token", fake_instruments)
+    monkeypatch.setattr(live_paper_engine, "find_option_symbol",
+                        lambda _i, inst, e, ot, k: f"{inst}:{e}:{k}:{ot}")
+    monkeypatch.setattr(live_paper_engine, "fetch_live_quote", fake_quote)
+
+    config = _make_config(user_id=uuid.uuid4(), capital=2_500_000,
+                          entry_time=entry_time, params_json=params_json)
+    await live_paper_engine._run_session(session_id, config, "token")
+    return next((f["atm_strike"] for f in updates if f.get("atm_strike")), None)
+
+
+async def _false():
+    return False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("snap", ["NEAREST_100", "nearest_100", " NEAREST_100 "])
+async def test_snapping_slot_resolves_atm_from_its_own_entry_spot(monkeypatch, snap):
+    """10:15 slot, NEAREST_100: must snap off the 10:15 spot, not the 09:49 one."""
+    atm = await _drive_resolve(
+        monkeypatch, entry_time="10:15",
+        params_json={"poll_interval_seconds": 3, "time_exit": "15:25",
+                     "atm_snap": snap},
+        spot_at=[23_240.0, 23_260.0])
+    assert atm == 23_300, (
+        "snapped off the stale 09:49 spot (23,240 -> 23,200) instead of the "
+        "10:15 entry spot (23,260 -> 23,300); live and replay would disagree")
+
+
+# NEAREST_50 is the documented default and ships in the catalog defaults, so it
+# reaches the engine as an explicit value on ordinary slots -- not just as a
+# missing key. Every one of these must keep resolving from the 09:49 spot, or
+# live slots silently start trading a different strike than they did before.
+@pytest.mark.asyncio
+@pytest.mark.parametrize("params_extra", [
+    {},                                # key absent
+    {"atm_snap": "NEAREST_50"},        # explicit default, as the catalog sends it
+    {"atm_snap": "nearest_50"},        # case variation
+    {"atm_snap": "SOMETHING_ELSE"},    # unknown value must not opt in
+    {"atm_snap": ""},                  # blank
+], ids=["absent", "explicit_50", "lowercase_50", "unknown", "blank"])
+async def test_non_snapping_slot_keeps_resolving_at_0949(monkeypatch, params_extra):
+    """Behaviour is exactly as before: 09:49 spot, nearest 50."""
+    atm = await _drive_resolve(
+        monkeypatch, entry_time="10:15",
+        params_json={"poll_interval_seconds": 3, "time_exit": "15:25", **params_extra},
+        spot_at=[23_240.0, 23_260.0])
+    assert atm == 23_250, (
+        "resolved from the 10:15 entry spot instead of 09:49 -- this slot does "
+        "not use 100-snapping, so its spot source must not have moved")
